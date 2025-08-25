@@ -28,9 +28,10 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.layer = layer
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -41,7 +42,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.decay_raw = nn.Parameter(torch.full((self.n_head,),0.0))
+        self.beta_raw = nn.Parameter(torch.zeros(self.n_head))
+        self.tau_raw  = nn.Parameter(torch.zeros(self.n_head))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -52,17 +54,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # learnable positive parameter per head
-        decay = F.softplus(self.decay_raw) + 1.0   # (H,), add 1 to keep >1 and avoid ln<=0
-        # build distance matrix: (T,T), dist[i,j] = i-j+1 if i>=j else 0
-        idx = torch.arange(T, device=x.device)
-        dist = (idx[None, :] - idx[:, None]) + 1   # (T,T), >=1 on/below diag, <=0 above diag
-        # safe mask: set invalid distances to 1 (placeholder, will get -inf anyway)
-        dist = dist.clamp_min(1)
-        # log weights per head
-        # logw[h,i,j] = -log( log(c[h]*dist[i,j]) )
-        dist = dist.to(torch.float32)
-        logw = -torch.log(torch.log(decay[:, None, None] * dist[None, :, :]))   # (H,T,T)
+        beta = F.softplus(self.beta_raw)   # >= 0
+        tau  = F.softplus(self.tau_raw) + 1e-3
+        # dist[i,j] = max(i-j, 0)  (use +1 if you want self to be dist=1)
+        idx  = torch.arange(T, device=x.device)
+        dist = (idx[:, None] - idx[None, :]).clamp_min(0).to(torch.float32)  # (T,T)
+        logw = -(beta[:, None, None]) * torch.log1p(dist[None, :, :] / tau[:, None, None]) 
         # causal -inf above diagonal
         neg_inf = torch.finfo(torch.float32).min
         causal = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)
@@ -101,10 +98,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, layer)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -135,7 +132,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
