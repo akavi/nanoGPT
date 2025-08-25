@@ -52,17 +52,21 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # per-head nonnegative decay rates
-        decay = F.softplus(self.decay_raw).to(q.dtype)  # (H,)
-        # steps_from_latest: j=T-1 -> 0, j=0 -> T-1
-        steps_from_latest = (T - 1) - torch.arange(T, device=x.device, dtype=q.dtype)  # (T,)
-        logw = (-decay[:, None]) * steps_from_latest[None, :]                          # (H,T)
-        # causal additive mask (0 on/below diag, -inf above), keep in fp32
+        # learnable positive parameter per head
+        decay = F.softplus(self.decay_raw) + 1.0   # (H,), add 1 to keep >1 and avoid ln<=0
+        # build distance matrix: (T,T), dist[i,j] = i-j+1 if i>=j else 0
+        idx = torch.arange(T, device=x.device)
+        dist = (idx[None, :] - idx[:, None]) + 1   # (T,T), >=1 on/below diag, <=0 above diag
+        # safe mask: set invalid distances to 1 (placeholder, will get -inf anyway)
+        dist = dist.clamp_min(1)
+        # log weights per head
+        # logw[h,i,j] = -log( log(c[h]*dist[i,j]) )
+        dist = dist.to(torch.float32)
+        logw = -torch.log(torch.log(decay[:, None, None] * dist[None, :, :]))   # (H,T,T)
+        # causal -inf above diagonal
         neg_inf = torch.finfo(torch.float32).min
-        causal = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)  # (T,T)
-        # per-head decay bias, same for all queries; add causal; expand over batch
-        bias = logw[:, None, :].expand(self.n_head, T, T).to(torch.float32)  # (H,T,T), view -> will materialize next line
-        attn_mask = (bias + causal).unsqueeze(0).expand(B, self.n_head, T, T).contiguous() 
+        causal = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)
+        attn_mask = logw + causal
 
         # efficient attention using Flash Attention CUDA kernels
         y = torch.nn.functional.scaled_dot_product_attention(
