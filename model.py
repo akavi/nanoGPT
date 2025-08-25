@@ -41,6 +41,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.decay_raw = nn.Parameter(torch.full((self.n_head,),0.0))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -51,8 +52,27 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # per-head nonnegative decay rates
+        decay = F.softplus(self.decay_raw).to(q.dtype)  # (H,)
+        # steps_from_latest: j=T-1 -> 0, j=0 -> T-1
+        steps_from_latest = (T - 1) - torch.arange(T, device=x.device, dtype=q.dtype)  # (T,)
+        logw = (-decay[:, None]) * steps_from_latest[None, :]                          # (H,T)
+        # causal additive mask (0 on/below diag, -inf above), keep in fp32
+        neg_inf = torch.finfo(torch.float32).min
+        causal = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)  # (T,T)
+        # per-head decay bias, same for all queries; add causal; expand over batch
+        bias = logw[:, None, :].expand(self.n_head, T, T).to(torch.float32)  # (H,T,T), view -> will materialize next line
+        attn_mask = (bias + causal).unsqueeze(0).expand(B, self.n_head, T, T).contiguous() 
+
         # efficient attention using Flash Attention CUDA kernels
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0, 
+            is_causal=False
+        )
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
