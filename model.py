@@ -28,10 +28,14 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, layer):
+    def __init__(self, config, layer_idx):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.layer = layer
+        self.layer_idx = layer_idx
+        self.mode = config.mode
+        self.attn_sums = {}
+        self.attn_counts = {}
+
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -64,15 +68,36 @@ class CausalSelfAttention(nn.Module):
         causal = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)
         attn_mask = logw + causal
 
-        # efficient attention using Flash Attention CUDA kernels
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0, 
-            is_causal=False
-        )
+        if self.mode == 'train':
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0, 
+                is_causal=False
+            )
+        else: 
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att + attn_mask
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+
+            att_sum = att.detach().to(torch.float32).sum(dim=0)  # (nh, T, T), sum over batch
+            if T not in self.attn_sums:
+                self.attn_sums[T] = torch.zeros(
+                    self.n_head, T, T, dtype=torch.float32, device=att_sum.device
+                )
+                self.attn_counts[T] = torch.zeros(
+                    self.n_head, dtype=torch.float32, device=att_sum.device
+                )
+            self.attn_sums[T] += att_sum
+            # each head gets +B examples
+            self.attn_counts[T] += float(B)
+
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -111,6 +136,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    mode: str = "train"
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -126,6 +152,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        print(config)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
