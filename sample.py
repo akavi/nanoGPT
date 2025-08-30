@@ -7,6 +7,9 @@ from contextlib import nullcontext
 import torch
 import tiktoken
 from model import GPTConfig, GPT
+import math
+import matplotlib.pyplot as plt
+import os
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -36,7 +39,7 @@ if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
+    gptconf = GPTConfig(**{**checkpoint['model_args'], "mode": "sample"})
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
@@ -87,3 +90,94 @@ with torch.no_grad():
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
             print('---------------')
+
+
+# ---- aggregate and display averaged attention maps ----
+def _safe_div(a, b):
+    # a: (..., T, T), b: (...,)
+    return a / (b.clamp_min(1e-8)[..., None, None])
+
+out_dir_imgs = os.path.join(out_dir, "attn_maps")
+os.makedirs(out_dir_imgs, exist_ok=True)
+
+def _collect_all_T(model):
+    """
+    Returns a dict: T -> (avg[L,H,T,T]) averaged over batch for each layer/head at that T.
+    """
+    # Find all distinct T present across layers
+    Ts = set()
+    for blk in model.transformer.h:
+        Ts.update(blk.attn.attn_sums.keys())
+    out = {}
+    L = len(model.transformer.h)
+    # For each T, stack (layer, head, T, T)
+    for T in sorted(Ts):
+        per_layer = []
+        for blk in model.transformer.h:
+            if T in blk.attn.attn_sums:
+                sums = blk.attn.attn_sums[T]        # (H, T, T)
+                cnts = blk.attn.attn_counts[T]      # (H,)
+                avg  = _safe_div(sums, cnts)        # (H, T, T)
+            else:
+                # layer never saw this T; fill NaNs to make it obvious
+                H = blk.attn.n_head
+                avg = torch.full(
+                    (H, T, T), float('nan'),
+                    device=(sums.device if hasattr(blk.attn, 'attn_sums') and blk.attn.attn_sums else model.lm_head.weight.device),
+                    dtype=torch.float32
+                )
+            per_layer.append(avg)
+        # stack into (L, H, T, T)
+        out[T] = torch.stack(per_layer, dim=0)
+    return out
+
+all_T_avgs = _collect_all_T(model)
+
+if all_T_avgs:
+    print("Rendering averaged attention maps...")
+    for T, avg in all_T_avgs.items():
+        L, H = avg.shape[:2]
+        # Make a grid: rows = layers, cols = heads
+        fig, axes = plt.subplots(L, H, figsize=(1.8*H, 1.8*L), squeeze=False)
+        fig.suptitle(f"Averaged attention — context length T={T}")
+        for li in range(L):
+            for hi in range(H):
+                ax = axes[li][hi]
+                ax.imshow(avg[li, hi].cpu().numpy(), aspect='auto', origin='lower')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                if hi == 0:
+                    ax.set_ylabel(f"L{li}", rotation=0, ha='right', va='center')
+                if li == 0:
+                    ax.set_title(f"H{hi}", fontsize=8)
+        plt.tight_layout()
+        path = os.path.join(out_dir_imgs, f"attn_avg_T{T}.png")
+        plt.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"saved {path}")
+
+# --- Show just the T=256 map interactively (if present) ---
+target_T = 256
+if target_T in all_T_avgs:
+    avg = all_T_avgs[target_T]
+    L, H = avg.shape[:2]
+
+    fig, axes = plt.subplots(L, H, figsize=(1.8*H, 1.8*L), squeeze=False)
+    fig.suptitle(f"Averaged attention — context length T={target_T}")
+    for li in range(L):
+        for hi in range(H):
+            ax = axes[li][hi]
+            ax.imshow(avg[li, hi].cpu().numpy(), aspect='auto', origin='lower')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if hi == 0:
+                ax.set_ylabel(f"L{li}", rotation=0, ha='right', va='center')
+            if li == 0:
+                ax.set_title(f"H{hi}", fontsize=8)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No attention maps collected for context length 256.")
+
+if not all_T_avgs:
+    print("No attention maps collected (nothing to render).")
