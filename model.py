@@ -42,8 +42,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.beta_raw = nn.Parameter(torch.zeros(self.n_head))
-        self.tau_raw  = nn.Parameter(torch.zeros(self.n_head))
+        self.decay_raw = nn.Parameter(torch.zeros(self.n_head))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -54,13 +53,13 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        beta = F.softplus(self.beta_raw)   # >= 0
-        tau  = F.softplus(self.tau_raw) + 1e-3
-        # dist[i,j] = max(i-j, 0)  (use +1 if you want self to be dist=1)
+        decay = F.softplus(self.decay_raw).to(q.dtype)                 # (nh,)
+        # dist[i,j] = max(i-j, 0)  
         idx  = torch.arange(T, device=x.device)
         dist = (idx[:, None] - idx[None, :]).clamp_min(0).to(torch.float32)  # (T,T)
-        logw = -(beta[:, None, None]) * torch.log1p(dist[None, :, :] / tau[:, None, None]) 
-        # causal -inf above diagonal
+        log1p_dist = torch.log1p(dist)                         # (T,T)
+        logw = -torch.log1p(decay.view(self.n_head, 1, 1) * log1p_dist)   
+
         neg_inf = torch.finfo(torch.float32).min
         causal = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)
         attn_mask = logw + causal
