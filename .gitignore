@@ -10,4 +10,4 @@ __pycache__/
 input.txt
 env/
 venv/
-out-shakespeare-char-decayed/
+out-*
