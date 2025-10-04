@@ -221,8 +221,9 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
+            initial_state = model.initial_state()
             with ctx:
-                logits, loss = model(X, Y)
+                logits, state, loss = model(X, initial_state, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -298,7 +299,8 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            state = model.initial_state()
+            logits, _state, loss = model(X, state, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

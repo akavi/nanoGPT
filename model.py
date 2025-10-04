@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch import LongTensor, Tensor, nn
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -36,6 +37,10 @@ class CausalSelfAttention(nn.Module):
         self.attn_sums = {}
         self.attn_counts = {}
         self.use_decay = config.use_decay
+        self.dropout = config.dropout
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
 
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -44,9 +49,6 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
         self.decay_raw = nn.Parameter(torch.zeros(self.n_head)) if self.use_decay else None
 
     def forward(self, x):
@@ -55,7 +57,7 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (Bil nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         neg_inf = torch.finfo(torch.float32).min
@@ -122,7 +124,7 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class Block(nn.Module):
+class CsaBlock(nn.Module):
 
     def __init__(self, config, layer):
         super().__init__()
@@ -131,10 +133,259 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x, state):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, state
+
+    def initial_state(self):
+        return None
+
+
+InferenceCache = tuple[Tensor, Tensor]
+class Mamba2(nn.Module):
+    def __init__(self, config, device = None):
+        super().__init__()
+        self.device = device
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.n_state = config.n_embd
+        self.n_conv = 2
+
+        # Order: (z, x, B, C, dt)
+        d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
+        self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
+
+        conv_dim = self.n_embd + 2 * self.n_state
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            kernel_size=self.n_conv,
+            groups=conv_dim,
+            padding=self.n_conv - 1,
+            device=device,
+        )
+
+        self.dt_bias = nn.Parameter(torch.empty(self.n_head, device=device))
+        self.A_log = nn.Parameter(torch.empty(self.n_head, device=device))
+        self.D = nn.Parameter(torch.empty(self.n_head, device=device))
+        self.norm = RMSNorm(self.n_embd, device=device)
+        self.out_proj = nn.Linear(self.n_embd, args.d_model, bias=False, device=device)
+
+    def forward(self, u: Tensor, h: InferenceCache):
+        """
+        Arguments
+            u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
+            h: hidden states for inference step. Initialized to 0s if not present.
+
+        Return (y, h)
+            y: (batch, seqlen, d_model) output
+            h: updated inference cache after processing `u`
+        """
+        if h:
+            return self._step(u, h)
+
+        A = -torch.exp(self.A_log)  # (nheads,)
+        zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
+        z, xBC, dt = torch.split(
+            zxbcdt,
+            [
+                self.n_embd,
+                self.n_embd + 2 * self.n_state,
+                self.n_head
+            ],
+            dim=-1,
+        )
+        dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
+
+        # Pad or truncate xBC seqlen to d_conv
+        conv_state = F.pad(
+            rearrange(xBC, "b l d -> b d l"), (self.n_conv - u.shape[1], 0)
+        )
+
+        xBC = silu(
+            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
+        )  # (batch, seqlen, d_inner + 2 * d_state))
+        x, B, C = torch.split(
+            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
+        )
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
+        y, ssm_state = ssd(
+            x * dt.unsqueeze(-1),
+            A * dt,
+            rearrange(B, "b l n -> b l 1 n"),
+            rearrange(C, "b l n -> b l 1 n"),
+            self.args.chunk_size,
+            device=self.device,
+        )
+        y = y + x * self.D.unsqueeze(-1)
+        y = rearrange(y, "b l h p -> b l (h p)")
+        y = self.norm(y, z)
+        y = self.out_proj(y)
+
+        h = (conv_state, ssm_state)
+        return y, h
+
+    def _step(self, u: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
+        """Take a single inference step for the current input and hidden state
+
+        Unlike attention-based models, RNN-based models (eg Mamba) does not need
+        to look back at all the past tokens to generate a new token. Instead a
+        hidden state (initialized to 0s initially) is updated for each input and
+        passed to the next inference step. This means that the total inference
+        time is linear with respect to the sequence length instead of quadratic
+        in attention's case.
+
+        Arguments
+            u: (batch, 1, d_model)
+            h: initial/running hidden state
+
+        Return (y, h)
+            y: (batch, 1, d_model)
+            h: updated hidden state
+        """
+        assert u.shape[1] == 1, "Only one token can be decoded per inference step"
+
+        zxbcdt = self.in_proj(u.squeeze(1))  # (batch, d_in_proj)
+        z, xBC, dt = torch.split(
+            zxbcdt,
+            [
+                self.args.d_inner,
+                self.args.d_inner + 2 * self.args.d_state,
+                self.args.nheads,
+            ],
+            dim=-1,
+        )
+
+        # Advance convolution input
+        h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
+        h.conv_state[:, :, -1] = xBC
+        # Convolution step
+        xBC = torch.sum(
+            h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+        )
+        xBC += self.conv1d.bias
+        xBC = silu(xBC)
+
+        x, B, C = torch.split(
+            xBC, [self.config.d_inner, self.config.d_state, self.config.d_state], dim=-1
+        )
+        A = -torch.exp(self.A_log)  # (nheads,)
+
+        # SSM step
+        dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
+        dA = torch.exp(dt * A)  # (batch, nheads)
+        x = rearrange(x, "b (h p) -> b h p", p=self.config.headdim)
+        dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
+        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        y = y + rearrange(self.D, "h -> h 1") * x
+        y = rearrange(y, "b h p -> b (h p)")
+        y = self.norm(y, z)
+        y = self.out_proj(y)
+
+        return y.unsqueeze(1), h
+
+
+def segsum(x: Tensor, device = None) -> Tensor:
+    """Stable segment sum calculation.
+
+    `exp(segsum(A))` produces a 1-semiseparable matrix, which is equivalent to a scalar SSM.
+
+    Source: https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L23-L32
+    """
+    T = x.size(-1)
+    x = repeat(x, "... d -> ... d e", e=T)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
+    x = x.masked_fill(~mask, 0)
+    x_segsum = torch.cumsum(x, dim=-2)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
+    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    return x_segsum
+
+
+def ssd(x, A, B, C, chunk_size, initial_states=None, device = None):
+    """Structed State Space Duality (SSD) - the core of Mamba-2
+
+    This is almost the exact same minimal SSD code from the blog post.
+
+    Arguments
+        x: (batch, seqlen, n_heads, d_head)
+        A: (batch, seqlen, n_heads)
+        B: (batch, seqlen, n_heads, d_state)
+        C: (batch, seqlen, n_heads, d_state)
+
+    Return
+        y: (batch, seqlen, n_heads, d_head)
+
+    Source
+     1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
+     2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
+    """
+    assert x.shape[1] % chunk_size == 0
+
+    # Rearrange into chunks
+    # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
+    # This is not implemented and left as an exercise for the reader 😜
+    x, A, B, C = [
+        rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)
+    ]
+
+    A = rearrange(A, "b c l h -> b h c l")
+    A_cumsum = torch.cumsum(A, dim=-1)
+
+    # 1. Compute the output for each intra-chunk (diagonal blocks)
+    L = torch.exp(segsum(A, device=device))
+    Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
+
+    # 2. Compute the state for each intra-chunk
+    # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+    states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
+
+    # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+    # (middle term of factorization of off-diag blocks; A terms)
+    if initial_states is None:
+        initial_states = torch.zeros_like(states[:, :1])
+    states = torch.cat([initial_states, states], dim=1)
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
+    new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
+    states, final_state = new_states[:, :-1], new_states[:, -1]
+
+    # 4. Compute state -> output conversion per chunk
+    # (left term of low-rank factorization of off-diagonal blocks; C terms)
+    state_decay_out = torch.exp(A_cumsum)
+    Y_off = torch.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
+
+    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+
+    return Y, final_state
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d: int, eps: float = 1e-5, device = None):
+        """Gated Root Mean Square Layer Normalization
+
+        Paper: https://arxiv.org/abs/1910.07467
+        """
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d, device=device))
+
+    def forward(self, x, z=None):
+        if z is not None:
+            x = x * silu(z)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+def silu(x):
+    """Applies the Sigmoid Linear Unit (SiLU), element-wise.
+
+    Define this manually since torch's version doesn't seem to work on MPS.
+    """
+    return x * F.sigmoid(x)
 
 @dataclass
 class GPTConfig:
@@ -161,7 +412,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            h = nn.ModuleList([CsaBlock(config, i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -201,7 +452,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, state, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -211,8 +462,8 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        for i, block in enumerate(self.transformer.h):
+            x, state[i] = block(x, state[i])
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -224,7 +475,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, state, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -336,8 +587,11 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
+    def initial_state(self):
+        return list(map(lambda block: block.initial_state(), self.transformer.h))
+
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -347,7 +601,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, state, _ = self(idx_cond, state)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
