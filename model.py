@@ -10,11 +10,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch import LongTensor, Tensor, nn
+from einops import rearrange, repeat
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -138,7 +140,7 @@ class CsaBlock(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x, state
 
-    def initial_state(self):
+    def initial_state(self, batch_size):
         return None
 
 
@@ -147,17 +149,21 @@ class Mamba2(nn.Module):
     def __init__(self, config, device = None):
         super().__init__()
         self.device = device
+        self.mode = config.mode
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.n_state = config.n_embd
-        self.n_conv = 2
+        self.n_inner = 2 * config.n_embd
+        self.headdim = self.n_inner // self.n_head
+        self.n_state = config.n_embd // 2
+        self.n_conv = 4
+        self.n_chunk = 64
 
         # Order: (z, x, B, C, dt)
-        d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
-        self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
+        d_in_proj = 2 * self.n_inner + 2 * self.n_state + self.n_head
+        self.in_proj = nn.Linear(self.n_embd, d_in_proj, bias=False, device=device)
 
-        conv_dim = self.n_embd + 2 * self.n_state
+        conv_dim = self.n_inner + 2 * self.n_state
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
             out_channels=conv_dim,
@@ -170,20 +176,21 @@ class Mamba2(nn.Module):
         self.dt_bias = nn.Parameter(torch.empty(self.n_head, device=device))
         self.A_log = nn.Parameter(torch.empty(self.n_head, device=device))
         self.D = nn.Parameter(torch.empty(self.n_head, device=device))
-        self.norm = RMSNorm(self.n_embd, device=device)
-        self.out_proj = nn.Linear(self.n_embd, args.d_model, bias=False, device=device)
+        self.norm = RMSNorm(self.n_inner, device=device)
+        self.out_proj = nn.Linear(self.n_inner, self.n_embd, bias=False, device=device)
 
     def forward(self, u: Tensor, h: InferenceCache):
         """
         Arguments
-            u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
+            u: (batch, seqlen, n_embd) input. seqlen should be a multiple of chunk_size.
             h: hidden states for inference step. Initialized to 0s if not present.
 
         Return (y, h)
-            y: (batch, seqlen, d_model) output
+            y: (batch, seqlen, n_embd) output
             h: updated inference cache after processing `u`
         """
-        if h:
+        if self.mode == "sample":
+            u = u[:, -1, :].unsqueeze(1)
             return self._step(u, h)
 
         A = -torch.exp(self.A_log)  # (nheads,)
@@ -191,8 +198,8 @@ class Mamba2(nn.Module):
         z, xBC, dt = torch.split(
             zxbcdt,
             [
-                self.n_embd,
-                self.n_embd + 2 * self.n_state,
+                self.n_inner,
+                self.n_inner + 2 * self.n_state,
                 self.n_head
             ],
             dim=-1,
@@ -208,15 +215,15 @@ class Mamba2(nn.Module):
             self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
         )  # (batch, seqlen, d_inner + 2 * d_state))
         x, B, C = torch.split(
-            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
+            xBC, [self.n_inner, self.n_state, self.n_state], dim=-1
         )
-        x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
         y, ssm_state = ssd(
             x * dt.unsqueeze(-1),
             A * dt,
             rearrange(B, "b l n -> b l 1 n"),
             rearrange(C, "b l n -> b l 1 n"),
-            self.args.chunk_size,
+            self.n_chunk,
             device=self.device,
         )
         y = y + x * self.D.unsqueeze(-1)
@@ -251,35 +258,35 @@ class Mamba2(nn.Module):
         z, xBC, dt = torch.split(
             zxbcdt,
             [
-                self.args.d_inner,
-                self.args.d_inner + 2 * self.args.d_state,
-                self.args.nheads,
+                self.n_inner,
+                self.n_inner + 2 * self.n_state,
+                self.n_head,
             ],
             dim=-1,
         )
 
         # Advance convolution input
-        h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
-        h.conv_state[:, :, -1] = xBC
+        h[0].copy_(torch.roll(h[0], shifts=-1, dims=-1))
+        h[0][:, :, -1] = xBC
         # Convolution step
         xBC = torch.sum(
-            h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+            h[0] * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
         )
         xBC += self.conv1d.bias
         xBC = silu(xBC)
 
         x, B, C = torch.split(
-            xBC, [self.config.d_inner, self.config.d_state, self.config.d_state], dim=-1
+            xBC, [self.n_inner, self.n_state, self.n_state], dim=-1
         )
         A = -torch.exp(self.A_log)  # (nheads,)
 
         # SSM step
         dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
         dA = torch.exp(dt * A)  # (batch, nheads)
-        x = rearrange(x, "b (h p) -> b h p", p=self.config.headdim)
+        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
         dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
-        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-        y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        h[1].copy_(h[1] * rearrange(dA, "b h -> b h 1 1") + dBx)
+        y = torch.einsum("bhpn, bn -> bhp", h[1], C)
         y = y + rearrange(self.D, "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")
         y = self.norm(y, z)
@@ -287,8 +294,18 @@ class Mamba2(nn.Module):
 
         return y.unsqueeze(1), h
 
+    def initial_state(self, batch_size):
+        return (
+            torch.zeros(
+                batch_size, self.n_inner + 2 * self.n_state, self.n_conv, device=self.device
+            ),
+            torch.zeros(
+                batch_size, self.n_head, self.headdim, self.n_state, device=self.device
+            ),
+        )
 
-def segsum(x: Tensor, device = None) -> Tensor:
+
+def segsum(x: Tensor) -> Tensor:
     """Stable segment sum calculation.
 
     `exp(segsum(A))` produces a 1-semiseparable matrix, which is equivalent to a scalar SSM.
@@ -297,10 +314,10 @@ def segsum(x: Tensor, device = None) -> Tensor:
     """
     T = x.size(-1)
     x = repeat(x, "... d -> ... d e", e=T)
-    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=-1)
     x = x.masked_fill(~mask, 0)
     x_segsum = torch.cumsum(x, dim=-2)
-    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
 
@@ -336,7 +353,7 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device = None):
     A_cumsum = torch.cumsum(A, dim=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
-    L = torch.exp(segsum(A, device=device))
+    L = torch.exp(segsum(A))
     Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
 
     # 2. Compute the state for each intra-chunk
@@ -349,7 +366,7 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device = None):
     if initial_states is None:
         initial_states = torch.zeros_like(states[:, :1])
     states = torch.cat([initial_states, states], dim=1)
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
 
@@ -398,6 +415,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_decay: bool = False
+    block_type: Literal["attention", "mamba"] = "attention"
 
 class GPT(nn.Module):
 
@@ -408,11 +426,15 @@ class GPT(nn.Module):
         self.config = config
         print(config)
 
+        if config.block_type == "attention":
+            backbone = nn.ModuleList([CsaBlock(config, i) for i in range(config.n_layer)])
+        elif config.block_type == "mamba":
+            backbone = nn.ModuleList([Mamba2(config, i) for i in range(config.n_layer)])
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            backbone = backbone,
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([CsaBlock(config, i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -462,7 +484,7 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for i, block in enumerate(self.transformer.h):
+        for i, block in enumerate(self.transformer.backbone):
             x, state[i] = block(x, state[i])
         x = self.transformer.ln_f(x)
 
@@ -484,7 +506,7 @@ class GPT(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
+        for block in self.transformer.backbone:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
@@ -587,8 +609,8 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
-    def initial_state(self):
-        return list(map(lambda block: block.initial_state(), self.transformer.h))
+    def initial_state(self, batch_size):
+        return list(map(lambda block: block.initial_state(batch_size), self.transformer.backbone))
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
