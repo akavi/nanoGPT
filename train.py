@@ -344,32 +344,51 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
+    # choose a chunk length that fits memory
+    chunk_len = 1024  # e.g., 512–2048 for FFT bytes; for raster you can use S-1
+    # one optimizer step will backprop through all chunks of one batch
+    X_full, Y_full = get_batch('train')                # [B, S], BOS at [:,0]
+    B, S = X_full.shape
+    num_chunks = (S - 1 + chunk_len - 1) // chunk_len  # ceil((S-1)/chunk_len)
+    # optional: override external gradient_accumulation_steps to match chunks
+    gradient_accumulation_steps = num_chunks
+    # forward/backward with TBPTT
+    state = model.initial_state(B)                     # recurrent state per sample
+    for micro_step in range(num_chunks):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            state = model.initial_state(X.shape[0])
-            logits, _state, loss = model(X, state, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+            model.require_backward_grad_sync = (micro_step == num_chunks - 1)
+
+        # window [t : t+chunk_len] and next-token targets
+        t0 = micro_step * chunk_len
+        t1 = min(t0 + chunk_len, S - 1)                # last usable index for x
+        x = X_full[:, t0:t1]                           # [B, L]
+        y = Y_full[:, t0:t1]                           # [B, L], aligned next-token
+
+        with ctx:                                      # amp/bf16 as you already do
+            # your model API: returns (logits, new_state, loss)
+            logits, new_state, loss = model(x, state, y)
+            loss = loss / num_chunks                   # scale for accum
+
+        def rec_detach(state):
+            if isintance(state, list):
+              return [rec_detach(s) for s in state]
+            if isinstance(state, tuple):
+              return tuple(rec_detach(s) for s in state)
+            return s.detach()
+        state = rec_detach(new_state)
+
         scaler.scale(loss).backward()
-    # clip the gradient
+
+    # gradient step as before
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+
+    # prefetch next batch AFTER the optimizer step (keeps lifetime short)
+    X_full, Y_full = get_batch('train')
 
     # timing and logging
     t1 = time.time()
