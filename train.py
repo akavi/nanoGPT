@@ -148,32 +148,18 @@ def get_batch(split: str):
     # - if block_size is None or >= L, use the full row; so T = L-1
     # - else use T = block_size (must be <= L-1)
     if (block_size is None) or (block_size >= L):
-        T = L - 1
         start = 0
+        T = L - 1
     else:
+        start = 0
         T = int(block_size)
-        # random start positions per sample so crops differ
-        # start ∈ [0, L-1-T]
-        max_start = L - 1 - T
-        # vectorized per-row starts
-        start = torch.randint(low=0, high=max_start + 1, size=(batch_size,), device=device)
 
     # gather rows (vectorized)
     # Use NumPy advanced indexing once to materialize [B, L] on CPU
     rows = mat[row_ix.numpy()]  # shape [B, L], still numpy memmap-backed
 
-    # if cropping, do per-row slicing; otherwise take [:, :-1] and [:, 1:]
-    if isinstance(start, int):
-        x_np = rows[:, start : start + T]
-        y_np = rows[:, start + 1 : start + 1 + T]
-    else:
-        # build x/y by per-sample slicing; preallocate for speed
-        x_np = np.empty((batch_size, T), dtype=rows.dtype)
-        y_np = np.empty((batch_size, T), dtype=rows.dtype)
-        for i in range(batch_size):
-            s = int(start[i])
-            x_np[i, :] = rows[i, s : s + T]
-            y_np[i, :] = rows[i, s + 1 : s + 1 + T]
+    x_np = rows[:, start : start + T]
+    y_np = rows[:, start + 1 : start + 1 + T]
 
     # convert to torch int64 (token ids)
     x = torch.from_numpy(x_np.astype(np.int64, copy=False))
