@@ -53,6 +53,11 @@ block_size = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
+# mamba model
+n_inner = 1536 # n_embd * 2 ?
+n_conv = 4
+n_state = 384
+n_chunk = 64
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
@@ -101,8 +106,6 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -139,23 +142,21 @@ def get_batch(split: str):
     N, L = mat.shape
 
     # choose B row indices
-    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
+    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device=device)
 
     # determine crop length T
     # - if block_size is None or >= L, use the full row; so T = L-1
     # - else use T = block_size (must be <= L-1)
-    if ("block_size" not in globals()) or (block_size is None) or (block_size >= L):
+    if (block_size is None) or (block_size >= L):
         T = L - 1
         start = 0
     else:
-        if block_size > L - 1:
-            raise ValueError(f"block_size ({block_size}) must be <= L-1 ({L-1}).")
         T = int(block_size)
         # random start positions per sample so crops differ
         # start ∈ [0, L-1-T]
         max_start = L - 1 - T
         # vectorized per-row starts
-        start = torch.randint(low=0, high=max_start + 1, size=(batch_size,), device="cpu")
+        start = torch.randint(low=0, high=max_start + 1, size=(batch_size,), device=device)
 
     # gather rows (vectorized)
     # Use NumPy advanced indexing once to materialize [B, L] on CPU

@@ -153,11 +153,11 @@ class Mamba2(nn.Module):
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.n_inner = 2 * config.n_embd
+        self.n_inner = config.n_inner
         self.headdim = self.n_inner // self.n_head
-        self.n_state = config.n_embd // 2
-        self.n_conv = 4
-        self.n_chunk = 64
+        self.n_state = config.n_state
+        self.n_conv = config.n_conv
+        self.n_chunk = config.n_chunk
 
         # Order: (z, x, B, C, dt)
         d_in_proj = 2 * self.n_inner + 2 * self.n_state + self.n_head
@@ -412,6 +412,10 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    n_inner: int = 1536 # n_embd * 2 ?
+    n_conv: int = 4
+    n_state: int = 384
+    n_chunk: int = 64
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_decay: bool = False

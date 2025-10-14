@@ -18,6 +18,7 @@ import os
 import pickle
 from pathlib import Path
 import numpy as np
+from PIL import Image
 
 BOS_ID = 256  # begin-of-sample token; requires uint16 storage
 H = 64
