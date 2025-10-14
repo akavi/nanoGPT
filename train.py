@@ -267,20 +267,52 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(chunk_len: int = 1024, eval_batch_cap: int | None = None):
+    """
+    Chunked evaluation to avoid OOM on long sequences.
+    - chunk_len: tokens per forward pass (e.g., 512–2048)
+    - eval_batch_cap: if set, slice the sampled batch to this many rows for eval
+    """
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            initial_state = model.initial_state(X.shape[0])
-            with ctx:
-                logits, state, loss = model(X, initial_state, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+        total_loss_weighted = 0.0  # sum(loss_chunk * tokens_in_chunk)
+        total_tokens = 0           # total tokens evaluated
+
+        for _ in range(eval_iters):
+            X, Y = get_batch(split)            # [B, S], BOS at [:,0]
+            if eval_batch_cap is not None and X.size(0) > eval_batch_cap:
+                X = X[:eval_batch_cap]
+                Y = Y[:eval_batch_cap]
+            B, S = X.shape
+
+            state = model.initial_state(B)     # recurrent state
+            # Stream over the sequence in non-overlapping chunks
+            for t0 in range(0, S - 1, chunk_len):
+                t1 = min(t0 + chunk_len, S - 1)
+                x = X[:, t0:t1]                # [B, L]
+                y = Y[:, t0:t1]                # [B, L], next-token targets
+
+                # AMP/bf16 context if you're using it elsewhere
+                with ctx:
+                    # model should NOT build a long graph in inference_mode
+                    logits, new_state, loss = model(x, state, y)
+                # detach the carried state explicitly (harmless under inference_mode,
+                # but keeps behavior identical to train-side TBPTT)
+                if isinstance(new_state, (list, tuple)):
+                    state = [s.detach() for s in new_state]
+                else:
+                    state = new_state.detach()
+
+                L = x.size(1)                  # tokens per row in this chunk
+                total_loss_weighted += loss.item() * (B * L)  # weight by token count
+                total_tokens += B * L
+
+        out[split] = total_loss_weighted / max(1, total_tokens)
+
     model.train()
     return out
 
