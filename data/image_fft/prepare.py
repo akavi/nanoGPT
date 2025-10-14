@@ -171,13 +171,13 @@ def _image_to_fft_bytes_row(arr_hwc_u8, y_idx, x_idx, norm='ortho'):
         b = pack.view(np.uint8)  # 8*C bytes
         byte_buf[p:p+bytes_per_freq] = b; p += bytes_per_freq
     out[1:] = byte_buf.astype(np.uint16)
-    return out, bytes_per_freq
+    return out
 
 def main() -> None:
     out_dir = Path(os.path.dirname(__file__))
 
 
-    from datasets import load_dataset
+    from datasets import load_dataset, Features, Sequence, Value 
 
     print(f"Loading dataset {dataset_name}:{split_name} ...")
     ds = load_dataset(dataset_name, split=split_name)
@@ -189,6 +189,7 @@ def main() -> None:
     bytes_per_freq = 2 * 4 * C # [Re/Im] x 3 channels x float32
     tokens_per_row = 1 + K * bytes_per_freq  # 1 for BOS; rest are bytes 0..255
     print(f"Kept frequencies: {K} (of {W*W}); tokens_per_row (incl. BOS): {tokens_per_row}")
+
 
     def _to_uint16_row_fft_bytes(ex):
         img = ex["image"]
@@ -222,9 +223,9 @@ def main() -> None:
     def to_matrix(dataset):
         m = np.empty((len(dataset), tokens_per_row), dtype=np.uint16)
         for i, ex in enumerate(dataset):
-            r = ex["row"]
-            if r.shape[0] != tokens_per_row:
-                raise RuntimeError(f"Row length mismatch: {r.shape[0]} vs {tokens_per_row}")
+            r = np.asarray(ex["row"], dtype=np.uint16)  # ★ list → ndarray
+            if r.size != tokens_per_row:
+                raise RuntimeError(f"Row length mismatch: {r.size} vs {tokens_per_row}")
             m[i, :] = r
         return m
 
