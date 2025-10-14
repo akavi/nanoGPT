@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -113,23 +114,137 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
+# Prebatched loader: expects train.npy / val.npy saved alongside this file.
+# Each file is a 2D array with shape [N_samples, L] and dtype uint8 (or any integer dtype).
+# Returns x, y where y is next-token of x along the sequence dimension.
+
+base_dir = Path(os.path.dirname(__file__))
+def _load_memmap(split: str):
+    """Memmap the prebatched matrix for the given split."""
+    fname = "train.npy" if split == "train" else "val.npy"
+    fpath = base_dir / fname
+    # np.load with mmap avoids loading into RAM; returns an array-like memmap
+    arr = np.load(fpath, mmap_mode="r")
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array, got shape {arr.shape} in {fpath}")
+    return arr  # shape [N, L], integer dtype
+
+def get_batch(split: str):
+    """
+    Returns:
+        x: int64 tensor of shape [B, T]
+        y: int64 tensor of shape [B, T]  (next-token targets)
+    """
+    mat = _load_memmap(split)  # [N, L]
+    N, L = mat.shape
+
+    # choose B row indices
+    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
+
+    # determine crop length T
+    # - if block_size is None or >= L, use the full row; so T = L-1
+    # - else use T = block_size (must be <= L-1)
+    if ("block_size" not in globals()) or (block_size is None) or (block_size >= L):
+        T = L - 1
+        start = 0
+    else:
+        if block_size > L - 1:
+            raise ValueError(f"block_size ({block_size}) must be <= L-1 ({L-1}).")
+        T = int(block_size)
+        # random start positions per sample so crops differ
+        # start ∈ [0, L-1-T]
+        max_start = L - 1 - T
+        # vectorized per-row starts
+        start = torch.randint(low=0, high=max_start + 1, size=(batch_size,), device="cpu")
+
+    # gather rows (vectorized)
+    # Use NumPy advanced indexing once to materialize [B, L] on CPU
+    rows = mat[row_ix.numpy()]  # shape [B, L], still numpy memmap-backed
+
+    # if cropping, do per-row slicing; otherwise take [:, :-1] and [:, 1:]
+    if isinstance(start, int):
+        x_np = rows[:, start : start + T]
+        y_np = rows[:, start + 1 : start + 1 + T]
+    else:
+        # build x/y by per-sample slicing; preallocate for speed
+        x_np = np.empty((batch_size, T), dtype=rows.dtype)
+        y_np = np.empty((batch_size, T), dtype=rows.dtype)
+        for i in range(batch_size):
+            s = int(start[i])
+            x_np[i, :] = rows[i, s : s + T]
+            y_np[i, :] = rows[i, s + 1 : s + 1 + T]
+
+    # convert to torch int64 (token ids)
+    x = torch.from_numpy(x_np.astype(np.int64, copy=False))
+    y = torch.from_numpy(y_np.astype(np.int64, copy=False))
+
+    if device_type == "cuda":
+        # Pin then transfer asynchronously for better throughput
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
+
+    return x, y
+
+
+# poor man's data loader (prebatched version)
 data_dir = os.path.join('data', dataset)
+def _load_prebatched(split):
+    # Expect files produced by the prebatching step:
+    #   <data_dir>/train.npy and <data_dir>/val.npy
+    # Each is np.uint8 of shape [N_samples, S]
+    fname = 'train.npy' if split == 'train' else 'val.npy'
+    path = os.path.join(data_dir, fname)
+    # np.load with mmap_mode avoids loading into RAM and allows cheap slicing
+    arr = np.load(path, mmap_mode='r')  # shape [N, S], dtype uint8
+    if arr.ndim != 2:
+        raise ValueError(f"Expected a 2D prebatched array, got shape {arr.shape} from {path}")
+    return arr  # memmapped ndarray
+
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    data2d = _load_prebatched(split)  # memmap [N, S], uint8
+    N, S = data2d.shape
+
+    # Decide effective sequence length for this batch.
+    # If block_size is None or too large, use full sample (S-1 tokens for (x,y) shift).
+    use_full = (('block_size' not in globals()) or (block_size is None) or (block_size >= S - 1))
+    if use_full:
+        T = S - 1
+        # Sample rows
+        rows = torch.randint(low=0, high=N, size=(batch_size,))
+        # Gather rows; convert to torch on CPU first for pinning option
+        # Note: slicing memmap returns a numpy array view; we explicitly copy via np.asarray to ensure contiguous.
+        x_np = np.asarray(data2d[rows, :T], dtype=np.int64)      # [B, T]
+        y_np = np.asarray(data2d[rows, 1:T+1], dtype=np.int64)   # [B, T]
+        x = torch.from_numpy(x_np)
+        y = torch.from_numpy(y_np)
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        # Random in-row windows of length block_size (+1 for the y shift)
+        T = int(block_size)
+        if T <= 0 or T + 1 > S:
+            raise ValueError(f"Invalid block_size={block_size}; requires 1 <= block_size+1 <= S={S}")
+        rows = torch.randint(low=0, high=N, size=(batch_size,))
+        # For each chosen row, pick a valid start so that [start : start+T+1] fits
+        max_start = S - (T + 1)
+        starts = torch.randint(low=0, high=max_start + 1, size=(batch_size,))
+        # Build batch by indexing each row independently
+        x_list, y_list = [], []
+        for r, s in zip(rows.tolist(), starts.tolist()):
+            seq = data2d[r, s:s+T+1]               # numpy view length T+1
+            # Split into x,y with one-step shift
+            x_list.append(np.asarray(seq[:-1], dtype=np.int64))
+            y_list.append(np.asarray(seq[1:],  dtype=np.int64))
+        x = torch.from_numpy(np.stack(x_list, axis=0))  # [B, T]
+        y = torch.from_numpy(np.stack(y_list, axis=0))  # [B, T]
+
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
+        x = x.to(device)
+        y = y.to(device)
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
