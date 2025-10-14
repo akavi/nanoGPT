@@ -261,6 +261,7 @@ def main() -> None:
         "n_val_images": int(val_mat.shape[0]),
         "train_file": "train.npy",
         "val_file": "val.npy",
+        "vocab_size": 257,              # 0..255 bytes + 256=BOS
         "note": "Rows are BOS=256 followed by bytewise LE float32 of FFT coeffs in spiral order, dropping Hermitian redundancies.",
     }
     with open(out_dir / "meta.pkl", "wb") as f:
