@@ -270,7 +270,8 @@ model_args = dict(
         bias=bias,
         vocab_size=None,
         dropout=dropout,
-        block_type=block_type
+        block_type=block_type,
+        device=device,
 ) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch

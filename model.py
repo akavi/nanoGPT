@@ -146,9 +146,9 @@ class CsaBlock(nn.Module):
 
 InferenceCache = tuple[Tensor, Tensor]
 class Mamba2(nn.Module):
-    def __init__(self, config, device = None):
+    def __init__(self, config, idx):
         super().__init__()
-        self.device = device
+        self.device = config.device
         self.mode = config.mode
 
         self.n_head = config.n_head
@@ -161,7 +161,7 @@ class Mamba2(nn.Module):
 
         # Order: (z, x, B, C, dt)
         d_in_proj = 2 * self.n_inner + 2 * self.n_state + self.n_head
-        self.in_proj = nn.Linear(self.n_embd, d_in_proj, bias=False, device=device)
+        self.in_proj = nn.Linear(self.n_embd, d_in_proj, bias=False, device=config.device)
 
         conv_dim = self.n_inner + 2 * self.n_state
         self.conv1d = nn.Conv1d(
@@ -170,14 +170,14 @@ class Mamba2(nn.Module):
             kernel_size=self.n_conv,
             groups=conv_dim,
             padding=self.n_conv - 1,
-            device=device,
+            device=config.device,
         )
 
-        self.dt_bias = nn.Parameter(torch.empty(self.n_head, device=device))
-        self.A_log = nn.Parameter(torch.empty(self.n_head, device=device))
-        self.D = nn.Parameter(torch.empty(self.n_head, device=device))
-        self.norm = RMSNorm(self.n_inner, device=device)
-        self.out_proj = nn.Linear(self.n_inner, self.n_embd, bias=False, device=device)
+        self.dt_bias = nn.Parameter(torch.empty(self.n_head, device=config.device))
+        self.A_log = nn.Parameter(torch.empty(self.n_head, device=config.device))
+        self.D = nn.Parameter(torch.empty(self.n_head, device=config.device))
+        self.norm = RMSNorm(self.n_inner, device=config.device)
+        self.out_proj = nn.Linear(self.n_inner, self.n_embd, bias=False, device=config.device)
 
     def forward(self, u: Tensor, h: InferenceCache):
         """
@@ -420,6 +420,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_decay: bool = False
     block_type: Literal["attention", "mamba"] = "attention"
+    device: str = "cuda"
 
 class GPT(nn.Module):
 
