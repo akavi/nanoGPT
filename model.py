@@ -340,7 +340,7 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device = None):
      1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
      2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
     """
-    assert x.shape[1] % chunk_size == 0
+    assert x.shape[1] % chunk_size == 0, f"{x.shape[0]} not chunkable by {chunk_size}"
 
     # Rearrange into chunks
     # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
