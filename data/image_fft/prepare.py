@@ -28,10 +28,10 @@ import numpy as np
 from PIL import Image
 
 BOS_ID = 256
-H = 64
-W = 64
-C = 3
-dataset_name = "Dmini/FFHQ-64x64"
+H = 28
+W = 28
+C = 1
+dataset_name = "ylecun/mnist"
 split_name   = "train"
 seed         = 1337
 train_ratio  = 0.9
