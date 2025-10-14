@@ -1,5 +1,5 @@
 """
-Prebatch FFHQ-64x64 into [N, T] uint16 tokens representing byte-split
+Prebatch FFHQ-64x64 into [N, T] uint8 tokens representing byte-split
 Fourier coefficients in a spiral order, with BOS=256.
 
 Ordering per frequency bin:
@@ -12,12 +12,12 @@ Spatial ordering:
   Within kept bins: sort by radius^2 ascending, then atan2(ky, kx) ascending.
   (This yields a deterministic "spiral out from origin" by shells.)
 
-Row format (uint16):
+Row format (uint8):
   [256 (BOS), byte0, byte1, ..., byteM]   where bytes are 0..255
 
 Outputs (next to this file):
-  - train.npy (uint16, shape [N_train, T])
-  - val.npy   (uint16, shape [N_val,   T])
+  - train.npy (uint8, shape [N_train, T])
+  - val.npy   (uint8, shape [N_val,   T])
   - meta.pkl  (settings + T)
 """
 
@@ -27,7 +27,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-BOS_ID = 256
 H = 28
 W = 28
 C = 1
@@ -69,7 +68,7 @@ _BYTES_PER_FREQ = C * 2 * 4  #  numChannels * [Re/Im] * float32
 def detokenize(tokens: np.ndarray, norm: str | None = 'ortho') -> Image:
     """
     Inverse of the FFT-byte serialization (drop Hermitian duplicates).
-    tokens: 1D uint8/uint16 array of length K*24 (NO BOS) where each kept bin stores:
+    tokens: 1D uint8/uint8 array of length K*24 (NO BOS) where each kept bin stores:
             Re(R),Re(G),Re(B), Im(R),Im(G),Im(B), each as little-endian float32.
     norm: 'ortho' or None -- MUST match what you used when encoding.
 
@@ -78,8 +77,8 @@ def detokenize(tokens: np.ndarray, norm: str | None = 'ortho') -> Image:
     t = np.asarray(tokens)
     if t.ndim != 1:
         raise ValueError(f"expected 1D token array, got shape {t.shape}")
-    # Accept uint8 or uint16 holding 0..255
-    if t.dtype == np.uint16:
+    # Accept uint8 or uint8 holding 0..255
+    if t.dtype == np.uint8:
         if np.any(t > 255):
             raise ValueError("fft-byte stream should be pure 0..255 bytes (no BOS)")
         bytes_arr = t.astype(np.uint8, copy=False)
@@ -161,7 +160,8 @@ def _image_to_fft_bytes_row(arr_hwc_u8, y_idx, x_idx, norm='ortho'):
     K = y_idx.shape[0]
     bytes_per_freq = (C + C) * 4  # Re for all C, then Im for all C, float32
     total_bytes = K * bytes_per_freq
-    out = np.empty(1 + total_bytes, dtype=np.uint16); out[0] = 256
+    out = np.empty(1 + total_bytes, dtype=np.uint8)
+    out[0] = 0
     byte_buf = np.empty(total_bytes, dtype=np.uint8)
     p = 0
     for yi, xi in zip(y_idx.tolist(), x_idx.tolist()):
@@ -170,7 +170,7 @@ def _image_to_fft_bytes_row(arr_hwc_u8, y_idx, x_idx, norm='ortho'):
         pack = np.array(re + im, dtype='<f4')  # little-endian
         b = pack.view(np.uint8)  # 8*C bytes
         byte_buf[p:p+bytes_per_freq] = b; p += bytes_per_freq
-    out[1:] = byte_buf.astype(np.uint16)
+    out[1:] = byte_buf.astype(np.uint8)
     return out
 
 def main() -> None:
@@ -191,7 +191,7 @@ def main() -> None:
     print(f"Kept frequencies: {K} (of {W*W}); tokens_per_row (incl. BOS): {tokens_per_row}")
 
 
-    def _to_uint16_row_fft_bytes(ex):
+    def _to_uint8_row_fft_bytes(ex):
         img = ex["image"]
         arr = np.array(img, copy=False)
         if arr.ndim == 2:               # grayscale
@@ -201,14 +201,14 @@ def main() -> None:
             arr = arr[..., :3]
         if arr.dtype != np.uint8:
             arr = arr.astype(np.uint8, copy=False)
-        row = _image_to_fft_bytes_row(arr, y_idx, x_idx)  # uint16 length tokens_per_row
+        row = _image_to_fft_bytes_row(arr, y_idx, x_idx)  # uint8 length tokens_per_row
         return {"row": row}
 
     print("Transforming images -> FFT-byte rows with BOS...")
     ds_rows = ds.map(
-        _to_uint16_row_fft_bytes,
+        _to_uint8_row_fft_bytes,
         remove_columns=[c for c in ds.column_names if c != "image"],
-        desc="HWC -> FFT bytes (uint16)",
+        desc="HWC -> FFT bytes (uint8)",
     )
 
     n = len(ds_rows)
@@ -221,9 +221,9 @@ def main() -> None:
     ds_val   = ds_rows.select(range(n_train, n))
 
     def to_matrix(dataset):
-        m = np.empty((len(dataset), tokens_per_row), dtype=np.uint16)
+        m = np.empty((len(dataset), tokens_per_row), dtype=np.uint8)
         for i, ex in enumerate(dataset):
-            r = np.asarray(ex["row"], dtype=np.uint16)  # ★ list → ndarray
+            r = np.asarray(ex["row"], dtype=np.uint8)  # ★ list → ndarray
             if r.size != tokens_per_row:
                 raise RuntimeError(f"Row length mismatch: {r.size} vs {tokens_per_row}")
             m[i, :] = r
@@ -251,8 +251,8 @@ def main() -> None:
         "per_freq_token_order": "Re(R), Re(G), Re(B), Im(R), Im(G), Im(B)",
         "component_dtype": "<f4",
         "byte_endianness": "little",
-        "storage_dtype": "uint16",
-        "bos_id": BOS_ID,
+        "storage_dtype": "uint8",
+        "bos_id": 0,
         "has_bos": True,
         "kept_freqs": K,
         "bytes_per_freq": bytes_per_freq,

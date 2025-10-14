@@ -143,7 +143,7 @@ def get_batch(split: str):
     N, L = mat.shape
 
     # choose B row indices
-    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device=device)
+    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
 
     # determine crop length T
     # - if block_size is None or >= L, use the full row; so T = L-1
