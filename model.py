@@ -148,6 +148,7 @@ InferenceCache = tuple[Tensor, Tensor]
 class Mamba2(nn.Module):
     def __init__(self, config, idx):
         super().__init__()
+        self.idx = idx
         self.device = config.device
         self.mode = config.mode
 
@@ -192,6 +193,8 @@ class Mamba2(nn.Module):
         if self.mode == "sample":
             u = u[:, -1, :].unsqueeze(1)
             return self._step(u, h)
+
+        print("idx: ", idx, "x.shape", x.shape())
 
         A = -torch.exp(self.A_log)  # (nheads,)
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
