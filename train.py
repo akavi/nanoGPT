@@ -282,7 +282,8 @@ def estimate_loss(chunk_len: int = 1024, eval_batch_cap: int | None = None):
         total_loss_weighted = 0.0  # sum(loss_chunk * tokens_in_chunk)
         total_tokens = 0           # total tokens evaluated
 
-        for _ in range(eval_iters):
+        for i in range(eval_iters):
+            print(f"estimating loss: {i}/{eval_iters}")
             X, Y = get_batch(split)            # [B, S], BOS at [:,0]
             if eval_batch_cap is not None and X.size(0) > eval_batch_cap:
                 X = X[:eval_batch_cap]
@@ -291,21 +292,16 @@ def estimate_loss(chunk_len: int = 1024, eval_batch_cap: int | None = None):
 
             state = model.initial_state(B)     # recurrent state
             # Stream over the sequence in non-overlapping chunks
-            for t0 in range(0, S - 1, chunk_len):
-                t1 = min(t0 + chunk_len, S - 1)
-                x = X[:, t0:t1]                # [B, L]
-                y = Y[:, t0:t1]                # [B, L], next-token targets
+            for t0 in range(0, S, chunk_len):
+                t1 = min(t0 + chunk_len, S)
+                print(f"chunk {t0}:{t1}")
+                x = X[:, t0:t1].contiguous()                # [B, L]
+                y = Y[:, t0:t1].contiguous()                # [B, L], next-token targets
 
                 # AMP/bf16 context if you're using it elsewhere
                 with ctx:
                     # model should NOT build a long graph in inference_mode
                     logits, new_state, loss = model(x, state, y)
-                # detach the carried state explicitly (harmless under inference_mode,
-                # but keeps behavior identical to train-side TBPTT)
-                if isinstance(new_state, (list, tuple)):
-                    state = [s.detach() for s in new_state]
-                else:
-                    state = new_state.detach()
 
                 L = x.size(1)                  # tokens per row in this chunk
                 total_loss_weighted += loss.item() * (B * L)  # weight by token count
@@ -381,7 +377,7 @@ while True:
     # one optimizer step will backprop through all chunks of one batch
     X_full, Y_full = get_batch('train')                # [B, S], BOS at [:,0]
     B, S = X_full.shape
-    num_chunks = (S - 1 + chunk_len - 1) // chunk_len  # ceil((S-1)/chunk_len)
+    num_chunks = (S + chunk_len - 1) // chunk_len  # ceil((S-1)/chunk_len)
     # optional: override external gradient_accumulation_steps to match chunks
     gradient_accumulation_steps = num_chunks
     # forward/backward with TBPTT
@@ -392,7 +388,7 @@ while True:
 
         # window [t : t+chunk_len] and next-token targets
         t0 = micro_step * chunk_len
-        t1 = min(t0 + chunk_len, S - 1)                # last usable index for x
+        t1 = min(t0 + chunk_len, S)                # last usable index for x
         x = X_full[:, t0:t1]                           # [B, L]
         y = Y_full[:, t0:t1]                           # [B, L], aligned next-token
 
