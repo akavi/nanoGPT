@@ -22,6 +22,8 @@ from typing import List
 import numpy as np
 from PIL import Image
 import random
+from data_utils.mdct import  mdct_forward
+
 
 # ---- Configuration ----
 BOS_ID = 0          # begin-of-sample token; intentionally collides with pixel value 0
@@ -58,6 +60,23 @@ def _list_image_files(root: Path) -> List[Path]:
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
     return [p for p in root.rglob("*") if p.suffix.lower() in exts]
 
+def _zigzag_indices(h, w):
+    pairs = [(u,v) for u in range(h) for v in range(w)]
+    return sorted(pairs, key=lambda t: (t[0]+t[1], t[0]))
+
+def _rasterize(img: np.ndarray) -> np.ndarray:
+    """
+    Return a 1-D vector of img's elements in zigzag (JPEG) order.
+    img must be 2-D (grayscale or single-channel coefficient plane).
+    """
+    if img.ndim != 2:
+        raise ValueError("rasterize expects a 2-D array")
+    h, w = img.shape
+    out = np.empty(h * w, dtype=img.dtype)
+    for index, (i, j) in enumerate(_zigzag_indices(h, w)):
+        out[index] = img[i, j]
+    return out
+
 
 def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
     """
@@ -71,10 +90,9 @@ def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
             raise SystemExit(f"Unexpected size {im.size}.")
         arr = np.array(im, dtype=np.uint8)  # (H,W)
         arr = arr.reshape(H, W, 1)          # (H,W,1) for consistency
-    body = arr.reshape(-1)                  # length 1024, row-major
-    out = np.empty(TOKENS_PER_ROW, dtype=np.int16)
+    body = rasterize(mdct_forward(arr))
     out[0] = BOS_ID
-    out[1:] = body.astype(np.int16, copy=False)
+    out[1:] = body
     return out
 
 
@@ -134,7 +152,7 @@ def main() -> None:
         "dataset": DATASET_SLUG,
         "source": "kagglehub",
         "split": {"train_ratio": TRAIN_RATIO, "seed": SEED},
-        "vocab_size": 256,
+        "vocab_size": 256**2,
         "dtype": "int16",
         "note": "BOS=0 collides with pixel value 0 by design; effective pixel alphabet 0..255. Each row is one full sample; no EOI; reset model state per row.",
     }

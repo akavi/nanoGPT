@@ -10,11 +10,11 @@ log_interval = 10 # don't print too too often
 always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
-wandb_project = 'image-fft'
-wandb_run_name = 'image-fft'
+wandb_project = 'image-mdct'
+wandb_run_name = 'image-mdct'
 
 dataset = 'image_mdct'
-block_size = 1024
+block_size = 2048
 gradient_accumulation_steps = 1
 batch_size = 32 # rows/step
 

@@ -98,7 +98,7 @@ def i2i_dct1d_inverse(Y: np.ndarray) -> np.ndarray:
         n = n2
     return y
 
-def i2i_dct2d_forward(img_u8: np.ndarray) -> np.ndarray:
+def mdct_forward(img_u8: np.ndarray) -> np.ndarray:
     if img_u8.dtype != np.uint8:
         raise TypeError("img_u8 must be uint8")
     if img_u8.ndim != 2 or img_u8.shape[0] != img_u8.shape[1]:
@@ -117,7 +117,7 @@ def i2i_dct2d_forward(img_u8: np.ndarray) -> np.ndarray:
     assert max_abs <= 30000, f"coeff range {max_abs} exceeds int16; reduce N or lifting precision"
     return X.astype(np.int16)
 
-def i2i_dct2d_inverse(coeffs: np.ndarray) -> np.ndarray:
+def mdct_backward(coeffs: np.ndarray) -> np.ndarray:
     if coeffs.dtype != np.int16:
         raise TypeError("coeffs must be int16")
     if coeffs.ndim != 2 or coeffs.shape[0] != coeffs.shape[1]:

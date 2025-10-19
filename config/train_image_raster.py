@@ -14,7 +14,7 @@ wandb_project = 'image-raster'
 wandb_run_name = 'image-raster'
 
 dataset = 'image_raster'
-block_size = 768
+block_size = 1024
 gradient_accumulation_steps = 1
 batch_size = 256 # rows/step
 
