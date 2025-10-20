@@ -194,8 +194,6 @@ class Mamba2(nn.Module):
             u = u[:, -1, :].unsqueeze(1)
             return self._step(u, h)
 
-        print("idx: ", idx, "x.shape", x.shape())
-
         A = -torch.exp(self.A_log)  # (nheads,)
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
         z, xBC, dt = torch.split(
@@ -499,7 +497,7 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

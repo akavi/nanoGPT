@@ -19,7 +19,7 @@ gradient_accumulation_steps = 1
 batch_size = 256 # rows/step
 
 block_type = "mamba"
-n_layer = 12 # Mamba2 block count
+n_layer = 10 # Mamba2 block count
 n_head = 8 # SSM “heads” (not attention); with headdim=64 → d_ssm=512
 n_embd = 256 # d_model
 n_inner = 512 # if you have an MLP head; otherwise ignore
