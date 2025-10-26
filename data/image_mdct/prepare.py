@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Prebatch Anime-Face-Getchu-32x32 into [N, 1025] int16 tokens using linear (row-major) raster,
+Prebatch Anime-Face-Getchu-32x32 into [N, 1025] uint8 tokens using linear (row-major) raster,
 with a BOS token (0) prepended to every sample.
 
 Outputs (next to this file):
-- train.npy: np.int16, shape [N_train, 1025]
-- val.npy:   np.int16, shape [N_val,   1025]
+- train.npy: np.uint8, shape [N_train, 1025]
+- val.npy:   np.uint8, shape [N_val,   1025]
 - meta.pkl:  dict describing rasterization + BOS
 
 Notes:
 - Dataset source: Kaggle -> sebastiendelprat/anime-face-getchu-32x32 (downloaded via kagglehub).
 - Per-pixel tokenization order: row-major (y=0..31, x=0..31), single-channel (grayscale).
-- Row format: [BOS=0, P0, P1, ..., P(1023)] where each Pi ∈ [0,255] stored as int16.
+- Row format: [BOS=0, P0, P1, ..., P(1023)] where each Pi ∈ [0,255] stored as uint8.
 - Each row is a complete sample; no EOI; reset model state per row at training time.
 """
 
@@ -23,7 +23,7 @@ import numpy as np
 from PIL import Image
 import random
 from data_utils.mdct import  mdct_forward
-
+import sys
 
 # ---- Configuration ----
 BOS_ID = 0          # begin-of-sample token; intentionally collides with pixel value 0
@@ -35,8 +35,9 @@ SEED = 1337
 TRAIN_RATIO = 0.9
 
 # Derived constants
+WIDTH = 4
 TOKENS_LINEAR = H * W * C          # 1024 image tokens
-TOKENS_PER_ROW = TOKENS_LINEAR + 1 # 1025 including BOS
+TOKENS_PER_ROW = WIDTH*TOKENS_LINEAR + 1 # 1025 including BOS
 
 def detokenize(tokens: np.ndarray) -> Image.Image:
     """
@@ -50,10 +51,8 @@ def detokenize(tokens: np.ndarray) -> Image.Image:
     img = t.reshape(H, W)  # row-major single channel
     return Image.fromarray(img, mode="L")
 
-
 def print_out(img: Image.Image):
     img.show()
-
 
 def _list_image_files(root: Path) -> List[Path]:
     # Recursively find common image extensions
@@ -77,10 +76,36 @@ def _rasterize(img: np.ndarray) -> np.ndarray:
         out[index] = img[i, j]
     return out
 
+def i32_to_u8(x: np.ndarray, byteorder: str = "little", copy: bool = True) -> np.ndarray:
+    a = np.ascontiguousarray(x, dtype=np.int32)  # ensure C-contiguous int32
+    if byteorder != "native":
+        want_le = (byteorder == "little")
+        native_le = (sys.byteorder == "little")
+        if want_le != native_le:
+            # swap per-32-bit word to produce the requested ordering
+            a = a.byteswap().newbyteorder()
+
+    out = a.view(np.uint8)  # reinterpret bytes
+    return out.copy() if copy else out  # optional copy for stability
+
+def u8_to_i32(b: np.ndarray, byteorder: str = "little", copy: bool = True) -> np.ndarray:
+    bb = np.ascontiguousarray(b, dtype=np.uint8)
+    if bb.size % 4 != 0:
+        raise ValueError("uint8 length must be a multiple of 4")
+
+    out = bb.view(np.int32)  # reinterpret bytes into 32-bit words
+
+    if byteorder != "native":
+        want_le = (byteorder == "little")
+        native_le = (sys.byteorder == "little")
+        if want_le != native_le:
+            out = out.byteswap().newbyteorder()
+
+    return out.copy() if copy else out
 
 def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
     """
-    Load image, coerce to (H,W,1) grayscale uint8, then pack into int16 row with BOS=0.
+    Load image, coerce to (H,W,1) grayscale uint8, then pack into uint8 row with BOS=0.
     """
     with Image.open(path) as im:
         # Force grayscale
@@ -89,18 +114,17 @@ def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
         if im.size != (W, H):
             raise SystemExit(f"Unexpected size {im.size}.")
         arr = np.array(im, dtype=np.uint8)  # (H,W)
-        arr = arr.reshape(H, W, 1)          # (H,W,1) for consistency
-    body = rasterize(mdct_forward(arr))
+        arr = arr.reshape(H, W)          # (H,W,1) for consistency
+    body = _rasterize(mdct_forward(arr))
+    out = np.empty(TOKENS_PER_ROW, dtype=np.uint8)
     out[0] = BOS_ID
-    out[1:] = body
+    out[1:] = i32_to_u8(body)
     return out
 
 
 def main() -> None:
     out_dir = Path(os.path.dirname(__file__))
 
-    # ---- Always pull from KaggleHub ----
-    # Requires: pip install kagglehub ; and Kaggle credentials set up (KAGGLE_USERNAME/KAGGLE_KEY or local kaggle.json)
     print(f"Downloading dataset via kagglehub: {DATASET_SLUG} ...")
     try:
         import kagglehub
@@ -132,7 +156,7 @@ def main() -> None:
 
     # ---- Build matrices ----
     def to_matrix(paths: List[Path]) -> np.ndarray:
-        m = np.empty((len(paths), TOKENS_PER_ROW), dtype=np.int16)
+        m = np.empty((len(paths), TOKENS_PER_ROW), dtype=np.uint8)
         for i, p in enumerate(paths):
             m[i, :] = _load_and_tokenize_grayscale_row(p)
             if (i + 1) % 1000 == 0:
@@ -152,8 +176,8 @@ def main() -> None:
         "dataset": DATASET_SLUG,
         "source": "kagglehub",
         "split": {"train_ratio": TRAIN_RATIO, "seed": SEED},
-        "vocab_size": 256**2,
-        "dtype": "int16",
+        "vocab_size": 256,
+        "dtype": "uint8",
         "note": "BOS=0 collides with pixel value 0 by design; effective pixel alphabet 0..255. Each row is one full sample; no EOI; reset model state per row.",
     }
     with open(out_dir / "meta.pkl", "wb") as f:

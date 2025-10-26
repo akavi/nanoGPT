@@ -114,12 +114,12 @@ def mdct_forward(img_u8: np.ndarray) -> np.ndarray:
     for c in range(N):
         X[:, c] = i2i_dct1d_forward(X[:, c]) 
     max_abs = int(np.max(np.abs(X)))
-    assert max_abs <= 30000, f"coeff range {max_abs} exceeds int16; reduce N or lifting precision"
-    return X.astype(np.int16)
+    assert max_abs <= 2**31, f"coeff range {max_abs} exceeds int16; reduce N or lifting precision"
+    return X.astype(np.int32)
 
 def mdct_backward(coeffs: np.ndarray) -> np.ndarray:
-    if coeffs.dtype != np.int16:
-        raise TypeError("coeffs must be int16")
+    if coeffs.dtype != np.int32:
+        raise TypeError("coeffs must be int32")
     if coeffs.ndim != 2 or coeffs.shape[0] != coeffs.shape[1]:
         raise ValueError("coeffs must be square 2D array")
     N = int(coeffs.shape[0])
