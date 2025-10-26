@@ -14,7 +14,7 @@ wandb_project = 'image-mdct'
 wandb_run_name = 'image-mdct'
 
 dataset = 'image_mdct'
-block_size = 1024
+block_size = 1024*4
 gradient_accumulation_steps = 1
 batch_size = 256 # rows/step
 
