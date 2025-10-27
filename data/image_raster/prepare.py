@@ -22,6 +22,8 @@ from typing import List
 import numpy as np
 from PIL import Image
 import random
+import torch
+from pathlib import Path
 
 # ---- Configuration ----
 BOS_ID = 0          # begin-of-sample token; intentionally collides with pixel value 0
@@ -38,19 +40,20 @@ TOKENS_PER_ROW = TOKENS_LINEAR + 1 # 1025 including BOS
 
 
 def init_gen(device) -> np.ndarray:
-    return np.zeros(1, dtype=np.uint8, device=device)
+    return torch.zeros((1, 1), dtype=int, device=device)
 
-def detokenize(tokens: np.ndarray) -> Image.Image:
+def detokenize(tokens: np.ndarray, path) -> Image.Image:
     """
     Inverse of the linear row-major rasterization (grayscale).
     tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
     Returns PIL.Image (mode 'L') of shape HxW.
     """
-    t = np.asarray(tokens, dtype=np.uint8)
+    t = np.asarray(tokens[1:].cpu(), dtype=np.uint8)
     if t.ndim != 1 or t.size != TOKENS_LINEAR:
         raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
     img = t.reshape(H, W)  # row-major single channel
-    Image.fromarray(img, mode="L").show()
+    img = Image.fromarray(img, mode="L")
+    img.save(str(Path(path).with_suffix(".png")), format="PNG")
 
 def _list_image_files(root: Path) -> List[Path]:
     # Recursively find common image extensions

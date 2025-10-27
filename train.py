@@ -386,9 +386,6 @@ while True:
     # forward/backward with TBPTT
     state = model.initial_state(B)                     # recurrent state per sample
     for micro_step in range(num_chunks):
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == num_chunks - 1)
-
         # window [t : t+chunk_len] and next-token targets
         t0 = micro_step * chunk_len
         t1 = min(t0 + chunk_len, S)                # last usable index for x
@@ -397,7 +394,7 @@ while True:
 
         with ctx:                                      # amp/bf16 as you already do
             # your model API: returns (logits, new_state, loss)
-            logits, new_state, loss = model(x, state, y)
+            logits, state, loss = model(x, state, y)
             loss = loss / num_chunks                   # scale for accum
 
         scaler.scale(loss).backward()

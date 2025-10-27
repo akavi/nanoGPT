@@ -86,6 +86,7 @@ data_path = os.path.join('data', checkpoint['config']['dataset'], 'prepare.py')
 init_gen = load_callable(data_path, 'init_gen')
 detokenize = load_callable(data_path, 'detokenize')
 x = init_gen(device)
+print(x)
 
 # run generation
 with torch.no_grad():
@@ -93,4 +94,5 @@ with torch.no_grad():
         for k in range(num_samples):
             state = model.initial_state(1)
             y = model.generate(x, max_new_tokens, state, temperature=temperature, top_k=top_k)
-            detokenize(y[0])
+            print(f"{y.shape}, {max_new_tokens}")
+            detokenize(y[0], os.path.join(out_dir, str(k)))
