@@ -21,10 +21,10 @@ batch_size = 256 # rows/step
 block_type = "mamba"
 n_layer = 10 # Mamba2 block count
 n_head = 8 # SSM “heads” (not attention); with headdim=64 → d_ssm=512
-n_embd = 256 # d_model
-n_inner = 512 # if you have an MLP head; otherwise ignore
+n_embd = 384 # d_model
+n_inner = 768 # if you have an MLP head; otherwise ignore
 n_conv = 4 # conv kernel (selective conv) per block
-n_state = 128 # SSM state size per head
+n_state = 64 # SSM state size per head
 n_chunk = 32 # scan chunk/unroll (kernel perf knob)
 
 dropout = 0.05 # or 0.0 if you use even light aug
