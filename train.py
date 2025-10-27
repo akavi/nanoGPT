@@ -400,14 +400,6 @@ while True:
             logits, new_state, loss = model(x, state, y)
             loss = loss / num_chunks                   # scale for accum
 
-        def rec_detach(state):
-            if isinstance(state, list):
-              return [rec_detach(s) for s in state]
-            if isinstance(state, tuple):
-              return tuple(rec_detach(s) for s in state)
-            return state.detach()
-        state = rec_detach(new_state)
-
         scaler.scale(loss).backward()
 
     # gradient step as before

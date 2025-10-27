@@ -9,3 +9,4 @@ python -V   # should say 3.13.x
 uv sync
 
 uv run python3 data/image_raster/prepare.py 
+uv run python3 train.py config/train_image_mdct.py

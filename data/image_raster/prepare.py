@@ -36,6 +36,10 @@ TRAIN_RATIO = 0.9
 TOKENS_LINEAR = H * W * C          # 1024 image tokens
 TOKENS_PER_ROW = TOKENS_LINEAR + 1 # 1025 including BOS
 
+
+def init_gen(device) -> np.ndarray:
+    return np.zeros(1, dtype=np.uint8, device=device)
+
 def detokenize(tokens: np.ndarray) -> Image.Image:
     """
     Inverse of the linear row-major rasterization (grayscale).
@@ -46,12 +50,7 @@ def detokenize(tokens: np.ndarray) -> Image.Image:
     if t.ndim != 1 or t.size != TOKENS_LINEAR:
         raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
     img = t.reshape(H, W)  # row-major single channel
-    return Image.fromarray(img, mode="L")
-
-
-def print_out(img: Image.Image):
-    img.show()
-
+    Image.fromarray(img, mode="L").show()
 
 def _list_image_files(root: Path) -> List[Path]:
     # Recursively find common image extensions

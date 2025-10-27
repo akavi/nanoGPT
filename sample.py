@@ -10,6 +10,32 @@ from model import GPTConfig, GPT
 import math
 import matplotlib.pyplot as plt
 import os
+from importlib.util import spec_from_file_location, module_from_spec
+from pathlib import Path
+import sys
+
+
+# -----------------------------------------------------------------------------
+# Ratchet, but if it's dumb and it works it's, well, still a little dumb, but
+# only a little
+def load_callable(file_path: str, func_name: str):
+    p = Path(file_path).resolve()
+    mod_name = f"_dyn_{p.stem}_{abs(hash(p)) & 0xffff:x}"  # unique-ish to avoid cache collisions
+
+    spec = spec_from_file_location(mod_name, str(p))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {p}")
+
+    mod = module_from_spec(spec)
+    # Put in sys.modules so relative imports inside the file (if any) can work
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        raise AttributeError(f"{func_name!r} not found or not callable in {p}")
+    return fn
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -56,32 +82,10 @@ model.to(device)
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
-# look for the meta pickle in case it is available in the dataset folder
-load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"Loading meta from {meta_path}...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
-
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+data_path = os.path.join('data', checkpoint['config']['dataset'], 'prepare.py')
+init_gen = load_callable(data_path, 'init_gen')
+detokenize = load_callable(data_path, 'detokenize')
+x = init_gen(device)
 
 # run generation
 with torch.no_grad():
@@ -89,5 +93,4 @@ with torch.no_grad():
         for k in range(num_samples):
             state = model.initial_state(1)
             y = model.generate(x, max_new_tokens, state, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+            detokenize(y[0])

@@ -16,7 +16,7 @@ wandb_run_name = 'image-mdct'
 dataset = 'image_mdct'
 block_size = 1024*4
 gradient_accumulation_steps = 1
-batch_size = 256 # rows/step
+batch_size = 64 # rows/step
 
 block_type = "mamba"
 n_layer = 10 # Mamba2 block count
