@@ -381,23 +381,28 @@ while True:
     X_full, Y_full = get_batch('train')                # [B, S], BOS at [:,0]
     B, S = X_full.shape
     num_chunks = (S + chunk_len - 1) // chunk_len  # ceil((S-1)/chunk_len)
-    # optional: override external gradient_accumulation_steps to match chunks
-    gradient_accumulation_steps = num_chunks
-    # forward/backward with TBPTT
-    state = model.initial_state(B)                     # recurrent state per sample
-    for micro_step in range(num_chunks):
-        # window [t : t+chunk_len] and next-token targets
-        t0 = micro_step * chunk_len
-        t1 = min(t0 + chunk_len, S)                # last usable index for x
-        x = X_full[:, t0:t1]                           # [B, L]
-        y = Y_full[:, t0:t1]                           # [B, L], aligned next-token
 
-        with ctx:                                      # amp/bf16 as you already do
-            # your model API: returns (logits, new_state, loss)
-            logits, state, loss = model(x, state, y)
-            loss = loss / num_chunks                   # scale for accum
+    state = model.initial_state(B)
+    for micro_step in range(num_chunks):
+        t0 = micro_step * chunk_len
+        t1 = min(t0 + chunk_len, S)
+        x = X_full[:, t0:t1]
+        y = Y_full[:, t0:t1]
+
+        with ctx:
+            _, state, loss = model(x, state, y)
+            loss = loss / num_chunks  # keep gradient scale comparable
 
         scaler.scale(loss).backward()
+        def rec_detach(state):
+            if isinstance(state, tuple):
+                return (rec_detach(s) for s in state)
+            elif isinstance(state, list):
+                return [rec_detach(s) for s in state]
+            return state.detach()
+
+        # IMPORTANT: cut the graph through the recurrent state
+        state = rec_detach(state)
 
     # gradient step as before
     if grad_clip != 0.0:
