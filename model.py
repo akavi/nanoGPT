@@ -170,7 +170,7 @@ class Mamba2(nn.Module):
             out_channels=conv_dim,
             kernel_size=self.n_conv,
             groups=conv_dim,
-            padding=self.n_conv - 1,
+            padding=0,
             device=config.device,
         )
 
@@ -180,7 +180,7 @@ class Mamba2(nn.Module):
         self.norm = RMSNorm(self.n_inner, device=config.device)
         self.out_proj = nn.Linear(self.n_inner, self.n_embd, bias=False, device=config.device)
 
-    def forward(self, u: Tensor, h: InferenceCache):
+    def forward(self, u: Tensor, h: InferenceCache) -> (Tensor, InferenceCache):
         """
         Arguments
             u: (batch, seqlen, n_embd) input. seqlen should be a multiple of chunk_size.
@@ -194,7 +194,8 @@ class Mamba2(nn.Module):
             u = u[:, -1, :].unsqueeze(1)
             return self._step(u, h)
 
-        A = -torch.exp(self.A_log)  # (nheads,)
+        init_conv, init_ssm = h
+
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
         z, xBC, dt = torch.split(
             zxbcdt,
@@ -207,24 +208,30 @@ class Mamba2(nn.Module):
         )
         dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
 
-        # Pad or truncate xBC seqlen to d_conv
-        conv_state = F.pad(
-            rearrange(xBC, "b l d -> b d l"), (self.n_conv - u.shape[1], 0)
-        )
+        x_in = rearrange(xBC, "b l d -> b d l")  
 
-        xBC = silu(
-            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
-        )  # (batch, seqlen, d_inner + 2 * d_state))
+        # Pad or truncate xBC seqlen to n_conv
+        if self.n_conv > 1:
+            left = init_conv[:, :, - (self.n_conv-1):] 
+        else:
+            left = init_conv[:, :, :0]
+        x_cat = torch.cat([left, x_in], dim=-1) # (b, d, n_conv-1+L)
+        x_conv = self.conv1d(x_cat)
+
+        xBC = silu(rearrange(x_conv, "b d l -> b l d")) # (batch, seqlen, d_inner + 2* d_state)
         x, B, C = torch.split(
             xBC, [self.n_inner, self.n_state, self.n_state], dim=-1
         )
         x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
-        y, ssm_state = ssd(
+
+        A = -torch.exp(self.A_log)  # (nheads,)
+        y, new_ssm_state = ssd(
             x * dt.unsqueeze(-1),
             A * dt,
             rearrange(B, "b l n -> b l 1 n"),
             rearrange(C, "b l n -> b l 1 n"),
             self.n_chunk,
+            initial_states=init_ssm.unsqueeze(1), # (b, 1, h, p, n)
             device=self.device,
         )
         y = y + x * self.D.unsqueeze(-1)
@@ -232,8 +239,8 @@ class Mamba2(nn.Module):
         y = self.norm(y, z)
         y = self.out_proj(y)
 
-        h = (conv_state, ssm_state)
-        return y, h
+        new_conv_state = torch.cat([init_conv, x_in], dim=-1)[:, :, -self.n_conv:]  # (b, conv_dim, n_conv)
+        return y, (new_conv_state, new_ssm_state)
 
     def _step(self, u: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
         """Take a single inference step for the current input and hidden state
@@ -323,7 +330,7 @@ def segsum(x: Tensor) -> Tensor:
     return x_segsum
 
 
-def ssd(x, A, B, C, chunk_size, initial_states=None, device = None):
+def ssd(x, A, B, C, chunk_size, initial_states, device = None):
     """Structed State Space Duality (SSD) - the core of Mamba-2
 
     This is almost the exact same minimal SSD code from the blog post.
@@ -364,8 +371,6 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device = None):
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
-    if initial_states is None:
-        initial_states = torch.zeros_like(states[:, :1])
     states = torch.cat([initial_states, states], dim=1)
     decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
