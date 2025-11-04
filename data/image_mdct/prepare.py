@@ -22,7 +22,7 @@ from typing import List
 import numpy as np
 from PIL import Image
 import random
-from data_utils.mdct import  mdct_forward
+from data_utils.mdct import mdct_forward, mdct_backward
 import sys
 
 # ---- Configuration ----
@@ -36,10 +36,10 @@ TRAIN_RATIO = 0.9
 
 # Derived constants
 WIDTH = 4
-TOKENS_LINEAR = H * W * C          # 1024 image tokens
-TOKENS_PER_ROW = WIDTH*TOKENS_LINEAR + 1 # 1025 including BOS
+TOKENS_LINEAR = WIDTH*H * W * C          # 1024 image tokens
+TOKENS_PER_ROW = TOKENS_LINEAR + 1 # 1025 including BOS
 
-def detokenize(tokens: np.ndarray) -> Image.Image:
+def detokenize(tokens: np.ndarray, path) -> Image.Image:
     """
     Inverse of the linear row-major rasterization (grayscale).
     tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
@@ -48,8 +48,21 @@ def detokenize(tokens: np.ndarray) -> Image.Image:
     t = np.asarray(tokens, dtype=np.uint8)
     if t.ndim != 1 or t.size != TOKENS_LINEAR:
         raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
-    img = t.reshape(H, W)  # row-major single channel
-    return Image.fromarray(img, mode="L")
+
+    img = mdct_backward(_derasterize(i8_to_i32(tokens), H, W))
+    img = Image.fromarray(img, mode="L")
+    img.save(str(Path(path).with_suffix(".png")), format="PNG")
+
+def _derasterize(vec: np.ndarray, h: int, w: int) -> np.ndarray:
+    if vec.ndim != 1:
+        raise ValueError("_derasterize expects a 1-D array")
+    if vec.size != h * w:
+        raise ValueError(f"vector length {vec.size} does not match h*w={h*w}")
+
+    out = np.empty((h, w), dtype=vec.dtype)
+    ij = np.array(_zigzag_indices(h, w))  # shape: (h*w, 2)
+    out[ij[:, 0], ij[:, 1]] = vec
+    return out
 
 def print_out(img: Image.Image):
     img.show()
@@ -115,10 +128,10 @@ def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
             raise SystemExit(f"Unexpected size {im.size}.")
         arr = np.array(im, dtype=np.uint8)  # (H,W)
         arr = arr.reshape(H, W)          # (H,W,1) for consistency
-    body = _rasterize(mdct_forward(arr))
+    body = i32_to_u8(_rasterize(mdct_forward(arr)))
     out = np.empty(TOKENS_PER_ROW, dtype=np.uint8)
     out[0] = BOS_ID
-    out[1:] = i32_to_u8(body)
+    out[1:] = body
     return out
 
 

@@ -29,7 +29,7 @@ n_chunk = 32 # scan chunk/unroll (kernel perf knob)
 
 dropout = 0.05 # or 0.0 if you use even light aug
 learning_rate = 3e-4 # AdamW
-max_iters = 500 # ≈ one pass compute-optimal
+max_iters = 12000 # ≈ one pass compute-optimal
 lr_decay_iters = 300
 min_lr = 3e-5
 beta2 = 0.95

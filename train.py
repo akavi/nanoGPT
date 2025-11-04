@@ -273,7 +273,7 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss(chunk_len: int = 512, eval_batch_cap: int | None = None):
+def estimate_loss(chunk_len: int = 4096, eval_batch_cap: int | None = None):
     """
     Chunked evaluation to avoid OOM on long sequences.
     - chunk_len: tokens per forward pass (e.g., 512–2048)
@@ -376,7 +376,7 @@ while True:
         break
 
     # choose a chunk length that fits memory
-    chunk_len = 512  # e.g., 512–2048 for FFT bytes; for raster you can use S-1
+    chunk_len = 4096  # e.g., 512–2048 for FFT bytes; for raster you can use S-1
     # one optimizer step will backprop through all chunks of one batch
     X_full, Y_full = get_batch('train')                # [B, S], BOS at [:,0]
     B, S = X_full.shape
@@ -391,7 +391,6 @@ while True:
 
         with ctx:
             _, state, loss = model(x, state, y)
-            loss = loss / num_chunks  # keep gradient scale comparable
 
         scaler.scale(loss).backward()
         def rec_detach(state):
