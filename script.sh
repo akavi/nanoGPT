@@ -10,4 +10,5 @@ uv sync
 
 uv run python3 data/image_mdct/prepare.py  
 uv run python3 train.py config/train_image_raster.py --init_from=resume
-scp out-image-mdct ubuntu@69.19.136.157:~/nanoGPT
+uv run python3 sample.py --out_dir=out-image-mdct --max_new_tokens=4096
+scp -r out-image-mdct ubuntu@69.19.136.157:~/nanoGPT

@@ -24,6 +24,7 @@ from PIL import Image
 import random
 from data_utils.mdct import mdct_forward, mdct_backward
 import sys
+import torch
 
 # ---- Configuration ----
 BOS_ID = 0          # begin-of-sample token; intentionally collides with pixel value 0
@@ -39,17 +40,20 @@ WIDTH = 4
 TOKENS_LINEAR = WIDTH*H * W * C          # 1024 image tokens
 TOKENS_PER_ROW = TOKENS_LINEAR + 1 # 1025 including BOS
 
+def init_gen(device) -> np.ndarray:
+    return torch.zeros((1, 1), dtype=int, device=device)
+
 def detokenize(tokens: np.ndarray, path) -> Image.Image:
     """
     Inverse of the linear row-major rasterization (grayscale).
     tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
     Returns PIL.Image (mode 'L') of shape HxW.
     """
-    t = np.asarray(tokens, dtype=np.uint8)
+    t = np.asarray(tokens[1:].cpu(), dtype=np.uint8)
     if t.ndim != 1 or t.size != TOKENS_LINEAR:
         raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
 
-    img = mdct_backward(_derasterize(i8_to_i32(tokens), H, W))
+    img = mdct_backward(_derasterize(u8_to_i32(t), H, W))
     img = Image.fromarray(img, mode="L")
     img.save(str(Path(path).with_suffix(".png")), format="PNG")
 
