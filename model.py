@@ -500,9 +500,28 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+            logits = self.lm_head(x)                        
+            B, T, V = logits.shape
+            device, dtype = logits.device, logits.dtype
+
+            ignore_index = -1
+            loss_tok = F.cross_entropy(
+                logits.view(-1, V),
+                targets.view(-1),
+                ignore_index=ignore_index,
+                reduction="none",
+            ).view(B, T)                                   
+
+            weights = torch.tensor([1, 2, 4, 8], dtype=dtype, device=device)
+            w_stream = weights[torch.arange(T, device=device) % 4]
+            w_stream = w_stream.unsqueeze(0).expand(B, T)
+
+            valid = (targets != ignore_index).to(dtype)
+            w_stream = w_stream * valid
+
+            # weighted mean
+            denom = w_stream.sum().clamp_min(1e-12)
+            loss = (loss_tok * w_stream).sum() / denom
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
