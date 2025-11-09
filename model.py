@@ -527,6 +527,17 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
+        def mean_by_quarter(x: torch.Tensor) -> torch.Tensor:
+            quarters = torch.tensor_split(x, 4, dim=1)
+            return torch.stack([q.mean(dim=1) for q in quarters], dim=1)
+
+        def mean_by_mod4(x: torch.Tensor) -> torch.Tensor:
+            return torch.stack([x[:, r::4].mean(dim=1) for r in range(4)], dim=1)
+
+        if loss:
+            print("mean by quarters", mean_by_quarter(loss))
+            print("mean by mod4", mean_by_mod4(loss))
+
         return logits, state, loss
 
     def crop_block_size(self, block_size):

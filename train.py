@@ -375,33 +375,15 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # choose a chunk length that fits memory
-    chunk_len = 4096  # e.g., 512–2048 for FFT bytes; for raster you can use S-1
-    # one optimizer step will backprop through all chunks of one batch
-    X_full, Y_full = get_batch('train')                # [B, S], BOS at [:,0]
-    B, S = X_full.shape
-    num_chunks = (S + chunk_len - 1) // chunk_len  # ceil((S-1)/chunk_len)
+    for micro_step in range(gradient_accumulation_steps):
+        x, y = get_batch('train')                # [B, S], BOS at [:,0]
+        B, S = x.shape
 
-    state = model.initial_state(B)
-    for micro_step in range(num_chunks):
-        t0 = micro_step * chunk_len
-        t1 = min(t0 + chunk_len, S)
-        x = X_full[:, t0:t1]
-        y = Y_full[:, t0:t1]
-
+        state = model.initial_state(B)
         with ctx:
             _, state, loss = model(x, state, y)
 
         scaler.scale(loss).backward()
-        def rec_detach(state):
-            if isinstance(state, tuple):
-                return (rec_detach(s) for s in state)
-            elif isinstance(state, list):
-                return [rec_detach(s) for s in state]
-            return state.detach()
-
-        # IMPORTANT: cut the graph through the recurrent state
-        state = rec_detach(state)
 
     # gradient step as before
     if grad_clip != 0.0:
