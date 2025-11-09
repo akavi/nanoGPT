@@ -24,4 +24,4 @@ scp -r -P 22 out-image-mdct-superlate root@86.38.238.145:~/nanoGPT
 scp -r -P 22 root@86.38.238.145:~/nanoGPT/out-image-mdct-early/ .
 scp -r -P 22 root@86.38.238.145:~/nanoGPT/out-image-mdct-even/ .
 scp -r -P 22 root@86.38.238.145:~/nanoGPT/out-image-mdct-late/ .
-scp -r -P 22 root@86.38.238.145:~/nanoGPT/out-image-mdct-superlate/ .
+scp -r -P 22 root@86.38.238.193:~/nanoGPT/out-image-mdct-hyperlate/ .
