@@ -9,7 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Literal
 
 import torch
@@ -411,6 +411,20 @@ def silu(x):
     return x * F.sigmoid(x)
 
 @dataclass
+class LayerConfig:
+    block_size: int = 1024
+    n_head: int = 12
+    n_embd: int = 768
+    n_inner: int = 1536 # n_embd * 2 ?
+    n_conv: int = 4
+    n_state: int
+    n_chunk: int = 64
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_decay: bool = False
+    device: str = "cuda"
+
+@dataclass
 class GPTConfig:
     mode: str = "train"
     block_size: int = 1024
@@ -420,7 +434,7 @@ class GPTConfig:
     n_embd: int = 768
     n_inner: int = 1536 # n_embd * 2 ?
     n_conv: int = 4
-    n_state: int = 384
+    n_state: [int]
     n_chunk: int = 64
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -438,9 +452,23 @@ class GPT(nn.Module):
         print(config)
 
         if config.block_type == "attention":
-            backbone = nn.ModuleList([CsaBlock(config, i) for i in range(config.n_layer)])
+            backbone = nn.ModuleList([CsaBlock(config, i) for i in config.n_state])
         elif config.block_type == "mamba":
-            backbone = nn.ModuleList([Mamba2(config, i) for i in range(config.n_layer)])
+            backbone = nn.ModuleList([
+                Mamba2(LayerConfig(
+                    block_size=config.block_size,
+                    n_head=config.n_head,
+                    n_embd=config.n_embd,
+                    n_inner=config.n_inner,
+                    n_conv=config.n_conv,
+                    n_state=n_state,
+                    n_chunk=config.n_state,
+                    dropout=config.dropout,
+                    bias=config.bias,
+                    use_decay=config.use_decay,
+                    device=config.device,
+                ), i) for i, n_state in enumerate(config.n_state)
+            ])
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -512,7 +540,7 @@ class GPT(nn.Module):
                 reduction="none",
             ).view(B, T)                                   
 
-            weights = torch.tensor([1, 2, 4, 8], dtype=dtype, device=device)
+            weights = torch.tensor([1, 1, 1, 1], dtype=dtype, device=device)
             w_stream = weights[torch.arange(T, device=device) % 4]
             w_stream = w_stream.unsqueeze(0).expand(B, T)
 
@@ -530,10 +558,10 @@ class GPT(nn.Module):
 
         def mean_by_quarter(x: torch.Tensor) -> torch.Tensor:
             quarters = torch.tensor_split(x, 4, dim=1)
-            return torch.stack([q.mean() for q in quarters], dim=0)
+            return torch.stack([q.mean() for q in quarters], dim=0).tolist()
 
         def mean_by_mod4(x: torch.Tensor) -> torch.Tensor:
-            return torch.stack([x[:, r::4].mean() for r in range(4)], dim=0)
+            return torch.stack([x[:, r::4].mean() for r in range(4)], dim=0).tolist()
 
         if loss_tok is not None:
             print("mean by quarters", mean_by_quarter(loss_tok))
