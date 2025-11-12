@@ -40,15 +40,18 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+
 # model
 n_layer = 12
 n_head = 12
@@ -60,6 +63,8 @@ n_state = 384
 n_chunk = 64
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+block_type = "attention"
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -67,48 +72,29 @@ weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
+
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 use_decay = False
-block_type = "attention"
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
-else:
-    # if not ddp, we are running on a single gpu, and one process
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
+seed_offset = 0
+ddp_world_size = 1
 
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
+os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -209,9 +195,7 @@ if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model_args['vocab_size'] = meta_vocab_size 
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -237,18 +221,6 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -273,7 +245,7 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss(chunk_len: int = 4096, eval_batch_cap: int | None = None):
+def estimate_loss():
     """
     Chunked evaluation to avoid OOM on long sequences.
     - chunk_len: tokens per forward pass (e.g., 512–2048)
@@ -287,28 +259,19 @@ def estimate_loss(chunk_len: int = 4096, eval_batch_cap: int | None = None):
 
         for i in range(eval_iters):
             print(f"estimating loss: {i}/{eval_iters}")
-            X, Y = get_batch(split)            # [B, S], BOS at [:,0]
-            if eval_batch_cap is not None and X.size(0) > eval_batch_cap:
-                X = X[:eval_batch_cap]
-                Y = Y[:eval_batch_cap]
-            B, S = X.shape
+            x, y = get_batch(split)            # [B, S], BOS at [:,0]
+            B, S = x.shape
 
             state = model.initial_state(B)     # recurrent state
-            # Stream over the sequence in non-overlapping chunks
-            for t0 in range(0, S, chunk_len):
-                t1 = min(t0 + chunk_len, S)
-                print(f"chunk {t0}:{t1}")
-                x = X[:, t0:t1].contiguous()                # [B, L]
-                y = Y[:, t0:t1].contiguous()                # [B, L], next-token targets
+            t1 = min(t0 + chunk_len, S)
+            # AMP/bf16 context if you're using it elsewhere
+            with ctx:
+                # model should NOT build a long graph in inference_mode
+                logits, new_state, loss = model(x, state, y)
 
-                # AMP/bf16 context if you're using it elsewhere
-                with ctx:
-                    # model should NOT build a long graph in inference_mode
-                    logits, new_state, loss = model(x, state, y)
-
-                L = x.size(1)                  # tokens per row in this chunk
-                total_loss_weighted += loss.item() * (B * L)  # weight by token count
-                total_tokens += B * L
+            L = x.size(1)                  # tokens per row in this chunk
+            total_loss_weighted += loss.item() * (B * L)  # weight by token count
+            total_tokens += B * L
 
         out[split] = total_loss_weighted / max(1, total_tokens)
 
@@ -330,15 +293,14 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
-if wandb_log and master_process:
+if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+x, y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
 
@@ -348,7 +310,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -363,7 +325,7 @@ while True:
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
@@ -376,36 +338,34 @@ while True:
         break
 
     for micro_step in range(gradient_accumulation_steps):
-        x, y = get_batch('train')                # [B, S], BOS at [:,0]
         B, S = x.shape
 
         state = model.initial_state(B)
         with ctx:
             _, state, loss = model(x, state, y)
 
+        x, y = get_batch('train')                # [B, S], BOS at [:,0]
         scaler.scale(loss).backward()
 
     # gradient step as before
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
-
-    # prefetch next batch AFTER the optimizer step (keeps lifetime short)
-    X_full, Y_full = get_batch('train')
 
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and master_process:
+    if iter_num % log_interval == 0:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
@@ -414,6 +374,3 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
-
-if ddp:
-    destroy_process_group()

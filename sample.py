@@ -60,24 +60,19 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# model
-if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    print("val loss", checkpoint['best_val_loss'])
-    print("iters", checkpoint['iter_num'])
-    gptconf = GPTConfig(**{**checkpoint['model_args'], "mode": "sample"})
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+# init from a model saved in a specific directory
+ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+checkpoint = torch.load(ckpt_path, map_location=device)
+print("val loss", checkpoint['best_val_loss'])
+print("iters", checkpoint['iter_num'])
+gptconf = GPTConfig(**{**checkpoint['model_args'], "mode": "sample"})
+model = GPT(gptconf)
+state_dict = checkpoint['model']
+unwanted_prefix = '_orig_mod.'
+for k,v in list(state_dict.items()):
+    if k.startswith(unwanted_prefix):
+        state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+model.load_state_dict(state_dict)
 
 model.eval()
 model.to(device)
