@@ -1,212 +1,173 @@
-
-# dmol_autoregressive.py
 from dataclasses import dataclass
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn import functional as F
 from torch import Tensor
-from models.layernorm import LayerNorm
-from models.utils import mean_by_quarter, mean_by_mod4  
-
-# ---------- Config ----------
+ from models.layer_norm import LayerNorm
 
 @dataclass
-class DMoLConfig:
-    n_block: int = 1024
-    n_vocab: int = 256         # discrete 8-bit tokens for feedback/embedding
+class MoLConfig:
+    n_block: int = 1024      # context length
     n_embd: int = 768
-    dropout: float = 0.0
+    n_mix: int = 10          # number of mixture components K
     bias: bool = True
-    K: int = 10                # mixture components
+    dropout: float = 0.0
+    value_hidden: int = 128
 
-# ---------- Model ----------
-
-class DMoLAutoregressive(nn.Module):
+class MoLAutoregressive(nn.Module):
     """
-    Single-channel (grayscale) DMoL wrapper around a sequential backbone.
+    Autoregressive over real-valued tokens x_t \in (-inf, inf).
+    Head predicts K-component logistic mixture per step.
     """
-    def __init__(self, config: DMoLConfig, backbone: nn.Module):
+    def __init__(self, config: MoLConfig, backbone: nn.Module):
         super().__init__()
-        self.config = config
         self.n_block = config.n_block
-        self.K = config.K
+        self.n_mix = config.n_mix
 
-        self.wte = nn.Embedding(config.n_vocab, config.n_embd)
+        self.vte = nn.Sequential(
+            nn.Linear(1, config.value_hidden, bias=config.bias),
+            nn.GELU(),
+            nn.Linear(config.value_hidden, config.n_embd, bias=config.bias),
+        )
+
+        # learned absolute positions
         self.wpe = nn.Embedding(config.n_block, config.n_embd)
+
         self.backbone = backbone
         self.drop = nn.Dropout(config.dropout)
-        self.ln_f = LayerNorm(config.n_embd, elementwise_affine=config.bias)
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
 
-        # Head outputs: for grayscale, K*(pi, mean, log_scale) = 3K
-        self.head = nn.Linear(config.n_embd, 3 * config.K, bias=True)
+        # output head: [mix_logits K | means K | log_scales K] = 3K per step
+        self.lm_head = nn.Linear(config.n_embd, 3 * config.n_mix, bias=config.bias)
 
         self.apply(self._init_weights)
-
-        # report number of parameters
+        # print parameter count
         n_params = sum(p.numel() for p in self.parameters())
         print(f"number of parameters: {n_params/1e6:.2f}M")
 
-
-    def forward(self, idx: Tensor, state, targets: Tensor | None = None, ignore_index: int = -1):
-        """
-        idx: [B,T] int tokens in [0,255] (previous pixel values)
-        targets: [B,T] int tokens in [0,255] (next pixel values), or -1 at masked positions
-        """
-        device = idx.device
-        B, T = idx.shape
-        assert T <= self.n_block, f"len {T} > block {self.n_block}"
-        pos = torch.arange(0, T, dtype=torch.long, device=device)
-
-        tok = self.wte(idx)             # [B,T,C]
-        pos_emb = self.wpe(pos)         # [T,C]
-        x = self.drop(tok + pos_emb)    # [B,T,C]
-
-        x, state = self.backbone(x, state)
-
-        x = self.ln_f(x)                # [B,T,C]
-        head_out = self.head(x)         # [B,T,3K]
-        pi_logits, means, log_scales = _split_head(head_out, self.K)
-
-        loss = None
-        loss_tok = None
-        if targets is not None:
-            # log prob per position
-            logp = dmol_log_prob(targets, pi_logits, means, log_scales, ignore_index=ignore_index)  # [B,T]
-            # negative log-likelihood
-            loss_tok = -logp  # [B,T]
-
-            # Optional stream weighting (your mean_by_* utils expect per-token loss)
-            # Example: uniform average over valid tokens
-            valid = (targets != ignore_index).float()
-            denom = valid.sum().clamp_min(1.0)
-            loss = (loss_tok * valid).sum() / denom
-
-        if loss_tok is not None:
-            print("mean by quarters", mean_by_quarter(loss_tok))
-            print("mean by mod4", mean_by_mod4(loss_tok))
-
-        # Return the raw head params to allow custom evaluation/sampling
-        return (pi_logits, means, log_scales), state, loss
-
-    @torch.no_grad()
-    def generate(
-        self,
-        idx: Tensor,                # [B,t0] seed tokens in [0,255]
-        max_new_tokens: int,
-        state,
-        temperature: float = 1.0,   # applied to mixture weights and scales
-        top_k_components: int | None = None,  # prune mixture components at sampling
-    ):
-        self.eval()
-        B = idx.size(0)
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.n_block else idx[:, -self.n_block:]
-            (pi_logits, means, log_scales), state, _ = self(idx_cond, state, targets=None)
-            # take last time step
-            pi = pi_logits[:, -1, :]                    # [B,K]
-            mu = means[:, -1, :]                        # [B,K]
-            ls = log_scales[:, -1, :]                   # [B,K]
-
-            # temperature: soften mixture and widen scales
-            if temperature != 1.0:
-                pi = pi / temperature
-                ls = ls + math.log(temperature)
-
-            # optionally restrict to top-k mixture components
-            if top_k_components is not None and top_k_components < pi.size(-1):
-                v, ix = torch.topk(pi, top_k_components, dim=-1)
-                mask = torch.full_like(pi, float('-inf'))
-                pi_masked = mask.scatter(-1, ix, v)
-            else:
-                pi_masked = pi
-
-            mix = torch.distributions.Categorical(logits=pi_masked).sample()  # [B]
-            # select parameters per batch
-            mu_sel = mu.gather(1, mix.unsqueeze(1)).squeeze(1)          # [B]
-            s_sel = F.softplus(ls.gather(1, mix.unsqueeze(1)).squeeze(1)) + 1e-5  # [B]
-
-            # sample from logistic via inverse CDF
-            u = torch.rand(B, device=idx.device).clamp_(1e-6, 1-1e-6)
-            x = mu_sel + s_sel * (torch.log(u) - torch.log1p(-u))       # continuous in [-∞,∞] but model learns [-1,1]
-
-            # map back to byte, round+clamp
-            x_byte = torch.clamp(torch.round((x + 1.0) * 0*_
-
-    def flops_per_token(self):
-        return self.backbone.flops_per_token()
-
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def initial_state(self, batch_size: int):
+        return self.backbone.initial_state(batch_size)
+
+    def forward(self, x_cont: Tensor, state, targets: Tensor | None = None):
+        """
+        x_cont:  [B, T] real-valued previous tokens
+        targets: [B, T] real-valued next-token targets (aligned with x_cont positions)
+        Returns:
+          params tuple for last step if targets is None (inference), else full-step loss.
+        """
+        device = x_cont.device
+        B, T = x_cont.shape
+        assert T <= self.n_block, f"seq len {T} > block size {self.n_block}"
+
+        pos = torch.arange(0, T, dtype=torch.long, device=device)    # [T]
+        # value embedding
+        tok_emb = self.vte(x_cont.unsqueeze(-1))                     # [B,T,n_embd]
+        pos_emb = self.wpe(pos).unsqueeze(0).expand(B, T, -1)        # [B,T,n_embd]
+        h_in = self.drop(tok_emb + pos_emb)
+
+        h_out, state = self.backbone(h_in, state)                    # [B,T,n_embd], state
+        h_out = self.ln_f(h_out)
+        y = self.lm_head(h_out)                                      # [B,T,3K]
+        mix_logits, mu, log_s = torch.split(y, self.n_mix, dim=-1)
+
+        if targets is not None:
+            # continuous NLL of mixture of logistics
+            logp = mixture_loglik(targets, mix_logits, mu, log_s)    # [B,T]
+            loss_tok = -logp                                          # per-token loss
+            loss = loss_tok.mean()
+            # Optional diagnostics:
+            # print("mean by quarter", mean_by_quarter(loss_tok))
+            # print("mean by mod4", mean_by_mod4(loss_tok))
+            return (mix_logits, mu, log_s), state, loss
+        else:
+            # inference: return only last-step params for efficiency
+            mix_logits = mix_logits[:, [-1], :]                      # [B,1,K]
+            mu         = mu[:,       [-1], :]                        # [B,1,K]
+            log_s      = log_s[:,    [-1], :]                        # [B,1,K]
+            return (mix_logits, mu, log_s), state, None
+
+    @torch.no_grad()
+    def generate(self,
+                 x_prefix: Tensor,
+                 max_new_tokens: int,
+                 state,
+                 temperature: float = 1.0) -> Tensor:
+        """
+        Autoregressively sample continuous tokens.
+        x_prefix: [B, T0] seed sequence (can be empty T0=0 with a learned BOS if you add one)
+        Returns concatenated sequence [B, T0 + max_new_tokens].
+        Temperature scales *component scales*; 1.0 = nominal, >1.0 = more spread.
+        """
+        x = x_prefix
+        for _ in range(max_new_tokens):
+            x_cond = x if x.size(1) <= self.n_block else x[:, -self.n_block:]
+            (mix_logits, mu, log_s), state, _ = self(x_cond, state, targets=None)
+            # shapes [B,1,K]
+            mix_logits = mix_logits[:, -1, :] / 1.0                   # you could divide by a "mixture temp" if desired
+            pi = F.softmax(mix_logits, dim=-1)                        # [B,K]
+
+            # sample mixture indices
+            k = torch.distributions.Categorical(pi).sample()          # [B]
+            k_onehot = F.one_hot(k, num_classes=pi.size(-1)).float()  # [B,K]
+
+            # select component params
+            mu_k    = (mu[:, -1, :]    * k_onehot).sum(dim=-1)        # [B]
+            log_s_k = (log_s[:, -1, :] * k_onehot).sum(dim=-1)        # [B]
+
+            # temperature on scale
+            if temperature != 1.0:
+                # equivalent to multiplying s by temperature
+                log_s_k = torch.log(F.softplus(log_s_k) * temperature + 1e-8)
+
+            x_next = sample_logistic(mu_k, log_s_k)                   # [B]
+            x = torch.cat([x, x_next.unsqueeze(1)], dim=1)            # [B, T+1]
+
+        return x
 
     def initial_state(self, batch_size):
         return self.backbone.initial_state(batch_size)
 
-# ---------- Utilities: DMoL discretized likelihood ----------
-def _split_head(h: Tensor, K: int):
+    def flops_per_token(self):
+        return self.backbone.flops_per_token()
+
+# ---------- utilities ----------
+
+def logistic_logpdf(x: Tensor, mu: Tensor, log_s: Tensor) -> Tensor:
     """
-    h: [B,T,3K] -> pi_logits, means, log_scales each [B,T,K]
+    log pdf of Logistic(mu, s), with s = softplus(log_s) for positivity.
+    Uses: log f(x) = -log s + log_sigmoid((x-mu)/s) + log_sigmoid(-(x-mu)/s)
+    Shapes broadcast as needed.
     """
-    pi_logits, means, log_scales = torch.split(h, K, dim=-1)
-    return pi_logits, means, log_scales
+    s = F.softplus(log_s) + 1e-8
+    z = (x - mu) / s
+    return -torch.log(s) + F.logsigmoid(z) + F.logsigmoid(-z)
 
-def _logistic_cdf(x: Tensor) -> Tensor:
-    # sigmoid with clamp for stability
-    return torch.sigmoid(x.clamp(min=-30.0, max=30.0))
-
-def _log_sum_exp(a: Tensor, dim=-1) -> Tensor:
-    m = a.max(dim=dim, keepdim=True).values
-    return (a - m).exp().sum(dim=dim, keepdim=True).log() + m
-
-def dmol_log_prob(
-    x_int: Tensor,         # [B,T] uint8-like ints in [0,255] (or -1 for ignore)
-    pi_logits: Tensor,     # [B,T,K]
-    means: Tensor,         # [B,T,K]
-    log_scales: Tensor,    # [B,T,K], unconstrained; softplus used internally
-    ignore_index: int = -1,
-) -> Tensor:
+def mixture_loglik(x: Tensor, mix_logits: Tensor, mu: Tensor, log_s: Tensor) -> Tensor:
     """
-    Return per-position log-prob (B,T) for 8-bit discrete x using CDF bin-masses.
-    x is mapped to [-1,1] with bin width Δ=2/255. Edge bins handled as in PixelCNN++.
+    x:        [B, T]
+    mix_logits, mu, log_s: [B, T, K]
+    returns log p(x) per position: [B, T]
     """
-    B, T, K = pi_logits.shape
-    # mask ignored
-    valid = (x_int != ignore_index)
-    x_int = x_int.clamp(min=0)  # safe when ignored
-    # map to continuous [-1,1]
-    x = (x_int.float() / 255.0) * 2.0 - 1.0  # [B,T]
-    x = x.unsqueeze(-1)  # [B,T,1]
+    log_pi = F.log_softmax(mix_logits, dim=-1)                      # [B,T,K]
+    # expand x to [B,T,1] for broadcasting against [B,T,K]
+    x_exp = x.unsqueeze(-1)
+    log_comp = logistic_logpdf(x_exp, mu, log_s)                    # [B,T,K]
+    return torch.logsumexp(log_pi + log_comp, dim=-1)               # [B,T]
 
-    # positive scales
-    s = F.softplus(log_scales) + 1e-5  # [B,T,K]
+def sample_logistic(mu: Tensor, log_s: Tensor) -> Tensor:
+    """
+    Sample from Logistic(mu, s) with s = softplus(log_s).
+    Returns tensor with the broadcasted shape of mu/log_s.
+    """
+    u = torch.rand_like(mu).clamp_(1e-6, 1 - 1e-6)
+    s = F.softplus(log_s) + 1e-8
+    return mu + s * (torch.log(u) - torch.log1p(-u))  # logit(u)
 
-    # bin half width in [-1,1] space
-    delta = 2.0 / 255.0
-
-    # CDF at bin edges
-    inv_s = 1.0 / s
-    cdf_hi = _logistic_cdf((x + 0.5 * delta - means) * inv_s)
-    cdf_lo = _logistic_cdf((x - 0.5 * delta - means) * inv_s)
-
-    # exact bin mass; edge correction for x at endpoints
-    # left edge (v==0): mass = cdf(x+Δ/2)
-    # right edge (v==255): mass = 1 - cdf(x-Δ/2)
-    v0 = (x_int == 0).unsqueeze(-1)
-    v255 = (x_int == 255).unsqueeze(-1)
-
-    bin_mass = torch.where(
-        v0, cdf_hi,
-        torch.where(v255, 1.0 - cdf_lo, (cdf_hi - cdf_lo).clamp_min(1e-12))
-    )  # [B,T,K]
-
-    log_mix = F.log_softmax(pi_logits, dim=-1)  # [B,T,K]
-    log_probs = _log_sum_exp(torch.log(bin_mass.clamp_min(1e-12)) + log_mix, dim=-1).squeeze(-1)  # [B,T]
-
-    # set ignored positions to 0 so downstream sums can mask them
-    log_probs = torch.where(valid, log_probs, torch.zeros_like(log_probs))
-    return log_probs  # [B,T]

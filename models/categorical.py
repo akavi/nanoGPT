@@ -39,6 +39,14 @@ class Categorical(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, state, targets=None):
         device = idx.device
         b, t = idx.size()
@@ -49,8 +57,7 @@ class Categorical(nn.Module):
         tok_emb = self.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.drop(tok_emb + pos_emb)
-        for i, block in enumerate(self.backbone):
-            x, state[i] = block(x, state[i])
+        x, state = self.backbone(x, state)
         x = self.ln_f(x)
 
         if targets is not None:
@@ -105,16 +112,8 @@ class Categorical(nn.Module):
 
         return idx
     
-    def flops_per_token(self):
-        return self.backbone.flops_per_token()
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
     def initial_state(self, batch_size):
         return self.backbone.initial_state(batch_size)
+
+    def flops_per_token(self):
+        return self.backbone.flops_per_token()

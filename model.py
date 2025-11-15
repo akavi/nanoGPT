@@ -18,7 +18,6 @@ from torch.nn import functional as F
 from torch import LongTensor, Tensor, nn
 from einops import rearrange, repeat
 
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_idx):
