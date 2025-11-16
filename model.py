@@ -17,6 +17,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch import LongTensor, Tensor, nn
 from einops import rearrange, repeat
+from models.layer_norm import LayerNorm
 
 class CausalSelfAttention(nn.Module):
 
@@ -416,7 +417,7 @@ class LayerConfig:
 
 @dataclass
 class GPTConfig:
-    n_state: [int]
+    n_state: [int] = None
     mode: str = "train"
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
@@ -497,7 +498,7 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.wpe.weight.numel()
+            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):

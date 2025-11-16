@@ -1,11 +1,15 @@
+import os
+import pickle
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
 import torch
 from torch import Tensor
+import inspect
 
 from train import train, TrainConfig  # existing import
+from model import GPT
 
 @dataclass
 class DataConfig:
@@ -13,9 +17,9 @@ class DataConfig:
     block_size: Optional[int]
     device: str
 
-def get_batch(
+def get_sampled_batch(
     split: str,
-    batch_size_arg: int,
+    batch_size: int,
     cfg: DataConfig,
 ) -> tuple[Tensor, Tensor]:
     """
@@ -23,29 +27,22 @@ def get_batch(
         x: int64 tensor of shape [B, T]
         y: int64 tensor of shape [B, T]  (next-token targets)
     """
-    mat = _load_memmap(split, cfg)  # [N, L]
+    mat = _load_memmap(split, "npy", cfg)  # [N, L]
     N, L = mat.shape
 
     # choose B row indices
-    row_ix = torch.randint(low=0, high=N, size=(batch_size_arg,), device="cpu")
+    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
 
     # determine crop length T
     # - if block_size is None or >= L, use the full row; so T = L-1
     # - else use T = block_size (must be <= L-1)
-    if (cfg.block_size is None) or (cfg.block_size >= L):
-        start = 0
-        T = L - 1
-    else:
-        start = 0
-        T = int(cfg.block_size)
+    start = 0
+    T = L - 1 if (cfg.block_size is None) or (cfg.block_size >= L) else int(cfg.block_size)
 
-    # gather rows (vectorized)
     rows = mat[row_ix.numpy()]  # [B, L], numpy memmap
-
     x_np = rows[:, start : start + T]
     y_np = rows[:, start + 1 : start + 1 + T]
 
-    # convert to torch int64 (token ids)
     x = torch.from_numpy(x_np.astype(np.int64, copy=False))
     y = torch.from_numpy(y_np.astype(np.int64, copy=False))
 
@@ -59,19 +56,35 @@ def get_batch(
 
     return x, y
 
-def _load_memmap(split: str, cfg: DataConfig) -> np.memmap:
-    """Memmap the prebatched matrix for the given split."""
-    fname = "train.npy" if split == "train" else "val.npy"
-    path = os.path.join(cfg.data_dir, fname)
-    arr = np.load(path, mmap_mode="r")
-    if arr.ndim != 2:
-        raise ValueError(f"Expected 2D array, got shape {arr.shape} in {path}")
-    return arr  # shape [N, L], integer dtype
+def get_batch(
+    split: str,
+    batch_siz: int,
+    cfg: DataConfig,
+) -> tuple[Tensor, Tensor]:
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    mat = _load_memmap(split, "bin", cfg)
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
 
+    if device_type == 'cuda':
+        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(cfg.device)
+        y = y.to(cfg.device)
+    return x, y
+
+def _load_memmap(split: str, suffix: str, cfg: DataConfig) -> np.memmap:
+    fname = f"train.{suffix}" if split == "train" else f"val.{suffix}"
+    path = os.path.join(cfg.data_dir, fname)
+    return np.load(path, mmap_mode="r", allow_pickle=True)
 
 def save_checkpoint(
-    out_dir: string,
-    model_args
+    out_dir: str,
+    model_args,
     iter_num: int,
     best_val_loss: float,
     cfg: TrainConfig,
@@ -90,13 +103,19 @@ def save_checkpoint(
     print(f"saving checkpoint to {out_dir}")
     torch.save(ckpt, os.path.join(out_dir, "ckpt.pt"))
 
-def load_metadata(data_dir: str):
+def init_data(data_dir: str, prepare_fn):
     """Load vocab_size from data_dir/meta.pkl if present, else return None."""
     meta_path = os.path.join(data_dir, "meta.pkl")
     if not os.path.exists(meta_path):
-        return None
-    with open(meta_path, "rb") as f:
-        meta = pickle.load(f)
+        train_ids, val_ids, meta = prepare_fn()
+        train_ids.tofile(os.path.join(data_dir, 'train.bin'))
+        val_ids.tofile(os.path.join(data_dir, 'val.bin'))
+        with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
+            pickle.dump(meta, f)
+    else:
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+
     return meta
 
 def load_checkpoint(
@@ -127,12 +146,39 @@ def load_checkpoint(
             state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
 
-    optimizer = model.configure_optimizers(
+    optimizer = configure_optimizers(
+        model,
         weight_decay,
         learning_rate,
         (beta1, beta2),
         "cuda" if "cuda" in device else "cpu",
     )
+    optimizer.load_state_dict(checkpoint['optimizer'])
 
     return model, optimizer, checkpoint["iter_num"], checkpoint["best_val_loss"]
 
+def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
+    # start with all of the candidate parameters
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    # filter out those that do not require grad
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+    # Create AdamW optimizer and use the fused version if it is available
+    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and device_type == 'cuda'
+    extra_args = dict(fused=True) if use_fused else dict()
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+    print(f"using fused AdamW: {use_fused}")
+
+    return optimizer

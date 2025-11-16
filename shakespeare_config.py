@@ -1,7 +1,3 @@
-"""
-Single-GPU training script 
-"""
-
 import os
 from pathlib import Path
 from typing import Any
@@ -11,19 +7,22 @@ import torch
 from model import GPTConfig, GPT
 from train import train, TrainConfig  # refactored loop
 from utils import (
-    GetBatchConfig,
+    DataConfig,
     get_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
-    load_metadata,
+    init_data,
     load_checkpoint,
+    configure_optimizers,
 )
+from data.shakespeare_char.prepare import prepare as prepare_shakespeare
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = "out"
-init_from = "scratch"  # 'scratch' or 'resume'
-device = "cuda" if torch.cuda.is_available() else "cpu"
+out_dir = "out-shakespeare"
+data_path = "shakespeare_char"
+mode = "from_scratch"  # 'scratch' or 'resume'
+device = "mps"
 # data
 config_keys = [
     k
@@ -39,21 +38,19 @@ config_dict = {k: globals()[k] for k in config_keys}  # useful for logging
 # -----------------------------------------------------------------------------#
 
 base_dir = Path(os.path.dirname(__file__))
-data_dir = os.path.join("data", "openwebtext")
-meta = load_metadata(data_dir)
+data_dir = os.path.join("data", data_path)
+meta = init_data(data_dir, prepare_shakespeare)
 
 # model init args
-block_size = 1024
+# --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0
+block_size = 64
 model_args: dict[str, Any] = dict(
-    n_layer=12,
-    n_head=12,
-    n_embd=768,
-    n_inner=1536,      # 2 * n_embd
-    n_state=384,
-    n_chunk=64,
+    n_state=[None, None, None, None],
+    n_head=4,
+    n_embd=128,
     block_size=block_size,
     bias=False,
-    vocab_size=None,   # filled below
+    vocab_size=meta['vocab_size'],
     dropout=0.0,
     block_type="attention",
     device=device,
@@ -67,52 +64,59 @@ beta2 = 0.95
 
 # -----------------------------------------------------------------------------
 
-if init_from == "scratch":
+if mode == "from_scratch":
     print("Initializing a new model from scratch")
     iter_num = 0
     best_val_loss = 1e9
 
-    model_args["vocab_size"] = meta["vocab_size"]
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-    optimizer = model.configure_optimizers(
+    optimizer = configure_optimizers(
+        model,
         weight_decay,
         learning_rate,
         (beta1, beta2),
         "cuda" if "cuda" in device else "cpu",
     )
 
-elif init_from == "resume":
+elif mode == "resume":
+    model, optimizer, iter_num, best_val_loss = load_checkpoint(
+        out_dir, device, model_args
+    )
+elif mode == "sample":
     model, optimizer, iter_num, best_val_loss = load_checkpoint(
         out_dir, device, model_args
     )
 else:
-    raise ValueError(f"Unsupported init_from={init_from!r}")
+    raise ValueError(f"Unsupported mode={mode}")
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
 # -----------------------------------------------------------------------------#
 
+# --device=cpu
+# --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 
 train_config = TrainConfig(
     seed=1337,
     learning_rate=learning_rate,          # used also in optimizer
     decay_lr=True,
     warmup_iters=2000,
-    lr_decay_iters=600_000,
+    lr_decay_iters=2000,
     min_lr=6e-5,
     grad_clip=1.0,
-    max_iters=600_000,
+    max_iters=2000,
     gradient_accumulation_steps=5 * 8,
     batch_size=12,                # also used in get_batch
     eval_only=False,
     eval_interval=2000,
-    eval_iters=200,
+    eval_iters=20,
     log_interval=1,
     always_save_checkpoint=True,
     device=device,
     out_dir=out_dir,
     initial_iter_num=iter_num,
     initial_val_loss=best_val_loss,
+    compile=False,
 )
 
 train(
@@ -121,7 +125,7 @@ train(
     get_batch=lambda split, bsz: get_config_batch(
         split,
         bsz,
-        GetBatchConfig(
+        DataConfig(
             block_size=block_size,
             data_dir=data_dir,
             device=device,
