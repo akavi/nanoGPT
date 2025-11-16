@@ -483,11 +483,12 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def flops_per_token(self): 
+    def flops_per_fwdbwd(self): 
         N = self.get_num_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
-        return 6*N + 12*L*H*Q*T
+        flops_per_token = 6*N + 12*L*H*Q*T
+        return flops_per_token * T
 
     def get_num_params(self, non_embedding=True):
         """
@@ -524,44 +525,13 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            logits = self.lm_head(x)                        
-            B, T, V = logits.shape
-            device, dtype = logits.device, logits.dtype
-
-            ignore_index = -1
-            loss_tok = F.cross_entropy(
-                logits.view(-1, V),
-                targets.view(-1),
-                ignore_index=ignore_index,
-                reduction="none",
-            ).view(B, T)                                   
-
-            weights = torch.tensor([1, 1, 1, 1], dtype=dtype, device=device)
-            w_stream = weights[torch.arange(T, device=device) % 4]
-            w_stream = w_stream.unsqueeze(0).expand(B, T)
-
-            valid = (targets != ignore_index).to(dtype)
-            w_stream = w_stream * valid
-
-            # weighted mean
-            denom = w_stream.sum().clamp_min(1e-12)
-            loss = (loss_tok * w_stream).sum() / denom
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss_tok = None
             loss = None
-
-        def mean_by_quarter(x: torch.Tensor) -> torch.Tensor:
-            quarters = torch.tensor_split(x, 4, dim=1)
-            return torch.stack([q.mean() for q in quarters], dim=0).tolist()
-
-        def mean_by_mod4(x: torch.Tensor) -> torch.Tensor:
-            return torch.stack([x[:, r::4].mean() for r in range(4)], dim=0).tolist()
-
-        if loss_tok is not None:
-            print("mean by quarters", mean_by_quarter(loss_tok))
-            print("mean by mod4", mean_by_mod4(loss_tok))
 
         return logits, state, loss
 

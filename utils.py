@@ -58,12 +58,17 @@ def get_sampled_batch(
 
 def get_batch(
     split: str,
-    batch_siz: int,
+    batch_size: int,
     cfg: DataConfig,
 ) -> tuple[Tensor, Tensor]:
+    block_size = cfg.block_size
+    device_type = "cuda" if "cuda" in cfg.device else "cpu"
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    mat = _load_memmap(split, "bin", cfg)
+    if split == 'train':
+        data = np.memmap(os.path.join(cfg.data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(cfg.data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
@@ -80,7 +85,7 @@ def get_batch(
 def _load_memmap(split: str, suffix: str, cfg: DataConfig) -> np.memmap:
     fname = f"train.{suffix}" if split == "train" else f"val.{suffix}"
     path = os.path.join(cfg.data_dir, fname)
-    return np.load(path, mmap_mode="r", allow_pickle=True)
+    return np.load(path, mmap_mode="r")
 
 def save_checkpoint(
     out_dir: str,

@@ -178,8 +178,10 @@ def train(
         if iter_num % config.log_interval == 0:
             lossf = loss.item() * config.gradient_accumulation_steps
             if local_iter_num >= 5:
-                mfu = model.estimate_mfu(
-                    config.batch_size * config.gradient_accumulation_steps, dt
+                mfu = estimate_mfu(
+                    model,
+                    config.batch_size * config.gradient_accumulation_steps,
+                    dt
                 )
                 running_mfu = (
                     mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
@@ -257,3 +259,13 @@ def estimate_loss(
 
     model.train()
     return out
+
+def estimate_mfu(model, fwdbwd_per_iter, dt):
+    """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+    flops_per_iter = model.flops_per_fwdbwd() * fwdbwd_per_iter
+    # express our flops throughput as ratio of A100 bfloat16 peak flops
+    flops_achieved = flops_per_iter * (1.0/dt) # per second
+    flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+    mfu = flops_achieved / flops_promised
+    return mfu
+    pass
