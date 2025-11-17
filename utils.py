@@ -9,12 +9,19 @@ from torch import Tensor
 import inspect
 
 from train import train, TrainConfig  # existing import
-from model import GPT
+from model import GPTConfig, GPT
 
 @dataclass
 class DataConfig:
     data_dir: str
     block_size: Optional[int]
+    device: str
+
+@dataclass
+class OptimizerConfig:
+    weight_decay: float
+    learning_rate: float
+    betas: list[float]
     device: str
 
 def get_sampled_batch(
@@ -89,7 +96,6 @@ def _load_memmap(split: str, suffix: str, cfg: DataConfig) -> np.memmap:
 
 def save_checkpoint(
     out_dir: str,
-    model_args,
     iter_num: int,
     best_val_loss: float,
     cfg: TrainConfig,
@@ -98,12 +104,10 @@ def save_checkpoint(
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     ckpt = {
-        "model": model._orign_mod.state_dict(),
+        "model": model.state_dict(),
         "optimizer": opt.state_dict(),
-        "model_args": model_args,
-        "iter_num": iter_num_ckpt,
-        "best_val_loss": best_val_loss_ckpt,
-        "config": config_dict,
+        "iter_num": iter_num,
+        "best_val_loss": best_val_loss,
     }
     print(f"saving checkpoint to {out_dir}")
     torch.save(ckpt, os.path.join(out_dir, "ckpt.pt"))
@@ -126,23 +130,18 @@ def init_data(data_dir: str, prepare_fn):
 def load_checkpoint(
     out_dir: str,
     device: str,
-    model_args: dict[str, Any],
+    model: GPT,
+    optimizer_config: OptimizerConfig,
 ) -> tuple[GPT, torch.optim.Optimizer, int, float]:
     """
     Load model, optimizer, iter_num, best_val_loss from a checkpoint,
     updating model_args to match the checkpoint's architecture.
     """
-    print(f"Resuming training from {out_dir}")
+    print(f"Loading checkpoint from {out_dir}")
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
     checkpoint = torch.load(ckpt_path, map_location=device)
 
-    checkpoint_model_args = checkpoint["model_args"]
-    # force these config attributes to be equal otherwise we can't even resume
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = checkpoint_model_args[k]
-
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    # TODO validate the checkpoint can be passed into the model
 
     state_dict = checkpoint["model"]
     unwanted_prefix = "_orig_mod."
@@ -153,16 +152,13 @@ def load_checkpoint(
 
     optimizer = configure_optimizers(
         model,
-        weight_decay,
-        learning_rate,
-        (beta1, beta2),
-        "cuda" if "cuda" in device else "cpu",
+        optimizer_config,
     )
     optimizer.load_state_dict(checkpoint['optimizer'])
 
     return model, optimizer, checkpoint["iter_num"], checkpoint["best_val_loss"]
 
-def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
+def configure_optimizers(model, config):
     # start with all of the candidate parameters
     param_dict = {pn: p for pn, p in model.named_parameters()}
     # filter out those that do not require grad
@@ -172,7 +168,7 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
     optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': decay_params, 'weight_decay': config.weight_decay},
         {'params': nodecay_params, 'weight_decay': 0.0}
     ]
     num_decay_params = sum(p.numel() for p in decay_params)
@@ -181,9 +177,12 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
     print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
     # Create AdamW optimizer and use the fused version if it is available
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    use_fused = fused_available and device_type == 'cuda'
+    use_fused = fused_available and "cuda" in config.device
     extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
     print(f"using fused AdamW: {use_fused}")
-
-    return optimizer
+    return torch.optim.AdamW(
+        optim_groups,
+        lr=config.learning_rate,
+        betas=config.betas,
+        **extra_args
+    )

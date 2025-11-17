@@ -5,8 +5,10 @@ from typing import Any
 import torch
 
 from model import GPTConfig, GPT
-from train import train, TrainConfig  # refactored loop
+from train import train, TrainConfig
+from sample import sample, SampleConfig
 from utils import (
+    OptimizerConfig,
     DataConfig,
     get_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
@@ -44,7 +46,15 @@ meta = init_data(data_dir, prepare_shakespeare)
 # model init args
 # --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0
 block_size = 64
-model_args: dict[str, Any] = dict(
+# adamw optimizer
+learning_rate = 1e-3
+weight_decay = 1e-1
+beta1 = 0.9
+beta2 = 0.99
+
+# -----------------------------------------------------------------------------
+
+model = GPT(GPTConfig(
     n_state=[None, None, None, None],
     n_head=4,
     n_embd=128,
@@ -54,39 +64,28 @@ model_args: dict[str, Any] = dict(
     dropout=0.0,
     block_type="attention",
     device=device,
+))
+
+optimizer_config = OptimizerConfig(
+    weight_decay=weight_decay,
+    learning_rate=learning_rate,
+    betas=(beta1, beta2),
+    device=device,
 )
-
-# adamw optimizer
-learning_rate = 6e-4     # max learning rate
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-
-# -----------------------------------------------------------------------------
-
 if mode == "from_scratch":
-    print("Initializing a new model from scratch")
     iter_num = 0
     best_val_loss = 1e9
 
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
     optimizer = configure_optimizers(
         model,
-        weight_decay,
-        learning_rate,
-        (beta1, beta2),
-        "cuda" if "cuda" in device else "cpu",
+        optimizer_config,
     )
 
-elif mode == "resume":
+elif mode == "resume" or mode == "sample":
     model, optimizer, iter_num, best_val_loss = load_checkpoint(
-        out_dir, device, model_args
+        out_dir, device, model, optimizer_config,
     )
-elif mode == "sample":
-    model, optimizer, iter_num, best_val_loss = load_checkpoint(
-        out_dir, device, model_args
-    )
+    print("Best val loss: ", best_val_loss)
 else:
     raise ValueError(f"Unsupported mode={mode}")
 
@@ -94,52 +93,79 @@ else:
 # TrainConfig and train() call
 # -----------------------------------------------------------------------------#
 
-# --device=cpu
-# --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 
-train_config = TrainConfig(
-    seed=1337,
-    learning_rate=learning_rate,          # used also in optimizer
-    decay_lr=True,
-    warmup_iters=2000,
-    lr_decay_iters=2000,
-    min_lr=6e-5,
-    grad_clip=1.0,
-    max_iters=2000,
-    gradient_accumulation_steps=5 * 8,
-    batch_size=12,                # also used in get_batch
-    eval_only=False,
-    eval_interval=2000,
-    eval_iters=20,
-    log_interval=1,
-    always_save_checkpoint=True,
-    device=device,
-    out_dir=out_dir,
-    initial_iter_num=iter_num,
-    initial_val_loss=best_val_loss,
-    compile=False,
-)
 
-train(
-    model=model,
-    optimizer=optimizer,
-    get_batch=lambda split, bsz: get_config_batch(
-        split,
-        bsz,
-        DataConfig(
-            block_size=block_size,
-            data_dir=data_dir,
-            device=device,
+if mode == "resume" or mode == "from_scratch":
+    train_config = TrainConfig(
+        seed=1337,
+        learning_rate=learning_rate,          # used also in optimizer
+        decay_lr=True,
+        warmup_iters=100,
+        lr_decay_iters=2000,
+        min_lr=1e-4,
+        grad_clip=1.0,
+        max_iters=2000,
+        gradient_accumulation_steps=1,
+        batch_size=12,                # also used in get_batch
+        eval_only=False,
+        eval_interval=250,
+        eval_iters=20,
+        log_interval=1,
+        always_save_checkpoint=True,
+        device=device,
+        out_dir=out_dir,
+        initial_iter_num=iter_num,
+        initial_val_loss=best_val_loss,
+        compile=False,
+    )
+
+    train(
+        model=model,
+        optimizer=optimizer,
+        get_batch=lambda split, bsz: get_config_batch(
+            split,
+            bsz,
+            DataConfig(
+                block_size=block_size,
+                data_dir=data_dir,
+                device=device,
+            ),
         ),
-    ),
-    save_checkpoint=lambda it, val_loss, cfg, mdl, opt: save_config_checkpoint(
-        out_dir,
-        it,
-        val_loss,
-        cfg,
-        mdl,
-        opt,
-        model_args=model_args,
-        config_dict=config_dict,
-    ),
-    config=train_config,
-)
+        save_checkpoint=lambda it, val_loss, cfg, mdl, opt: save_config_checkpoint(
+            out_dir,
+            it,
+            val_loss,
+            cfg,
+            mdl,
+            opt,
+        ),
+        config=train_config,
+    )
+else:
+    stoi, itos = meta['stoi'], meta['itos']
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: ''.join([itos[i] for i in l])
+    def init_gen(device):
+        start_ids = encode("\n")
+        return (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+    def detokenize(tensor, idx):
+        print(f"sample {idx}:")
+        print(decode(tensor.tolist()))
+        print('---------------')
+
+    sample_config = SampleConfig(
+        num_samples=10,
+        max_new_tokens=500,
+        temperature=0.8,
+        top_k=200,
+        seed=1337,
+        device=device,
+        compile=False,
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    sample(
+        model=model,
+        init_gen=init_gen,
+        detokenize=detokenize,
+        config=sample_config,
+    )
