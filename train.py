@@ -50,7 +50,6 @@ SaveCheckpointFn = Callable[
 @dataclass
 class TrainConfig:
     # --- optimization ---
-    seed: int = 1337
     compile: bool = True
     learning_rate: float = 3e-4
     decay_lr: bool = True
@@ -90,8 +89,6 @@ def train(
     save_checkpoint: SaveCheckpointFn,
     config: TrainConfig,
 ) -> None:
-    # seed & device setup
-    torch.manual_seed(config.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -99,15 +96,10 @@ def train(
     if config.compile:
         model = torch.compile(model)
 
-    # decide dtype *inside* train
-    if "cuda" in config.device:
-        if torch.cuda.is_bf16_supported():
-            dtype: DTypeStr = "bfloat16"
-        else:
-            dtype = "float16"
+    if torch.cuda.is_bf16_supported():
+        dtype: DTypeStr = "bfloat16"
     else:
-        # on CPU default to float32 unless you have a strong reason otherwise
-        dtype = "float32"
+        dtype = "float16"
 
     device_type = "cuda" if "cuda" in config.device else "cpu"
     ctx = make_ctx(device_type, dtype)
@@ -124,8 +116,8 @@ def train(
     best_val_loss = config.initial_val_loss
 
     while True:
-        # learning rate
         lr = get_lr(iter_num, config) if config.decay_lr else config.learning_rate
+        # learning rate
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -157,6 +149,7 @@ def train(
             state = model.initial_state(B)
             with ctx:
                 _, state, loss = model(x, state, y)
+                loss = loss / config.gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
             # prefetch for next step / next iter
             x, y = get_batch("train", config.batch_size)
@@ -199,7 +192,6 @@ def train(
 
 
 # --- helpers -----------------------------------------------------
-
 def get_lr(it: int, cfg: TrainConfig) -> float:
     # 1) linear warmup
     if it < cfg.warmup_iters:
@@ -244,7 +236,6 @@ def estimate_loss(
         total_tokens = 0
 
         for i in range(config.eval_iters):
-            print(f"estimating loss ({split}): {i+1}/{config.eval_iters}")
             x, y = get_batch(split, config.batch_size)  # [B, T]
             B, T = x.shape
 

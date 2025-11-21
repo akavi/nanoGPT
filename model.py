@@ -417,7 +417,7 @@ class LayerConfig:
 
 @dataclass
 class GPTConfig:
-    n_state: [int] = None
+    n_state: int = 128
     mode: str = "train"
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
@@ -441,7 +441,7 @@ class GPT(nn.Module):
         self.config = config
 
         if config.block_type == "attention":
-            backbone = nn.ModuleList([CsaBlock(config, i) for i in config.n_state])
+            backbone = nn.ModuleList([CsaBlock(config, i) for i in range(config.n_layer)])
         elif config.block_type == "mamba":
             backbone = nn.ModuleList([
                 Mamba2(LayerConfig(
@@ -451,13 +451,13 @@ class GPT(nn.Module):
                     n_embd=config.n_embd,
                     n_inner=config.n_inner,
                     n_conv=config.n_conv,
-                    n_state=n_state,
+                    n_state=config.n_state,
                     n_chunk=config.n_state,
                     dropout=config.dropout,
                     bias=config.bias,
                     use_decay=config.use_decay,
                     device=config.device,
-                ), i) for i, n_state in enumerate(config.n_state)
+                ), i) for i in range(config.n_layer)
             ])
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),

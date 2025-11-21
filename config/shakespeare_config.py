@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,63 +16,49 @@ from utils import (
     init_data,
     load_checkpoint,
     configure_optimizers,
+    override,
 )
 from data.shakespeare_char.prepare import prepare as prepare_shakespeare
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = "out-shakespeare"
-data_path = "shakespeare_char"
-mode = "from_scratch"  # 'scratch' or 'resume'
-device = "mps"
-# data
-config_keys = [
-    k
-    for k, v in globals().items()
-    if not k.startswith("_") and isinstance(v, (int, float, bool, str))
-]
-exec(open("configurator.py").read())  # overrides from command line or config file
-config_dict = {k: globals()[k] for k in config_keys}  # useful for logging
-# -----------------------------------------------------------------------------
+overridable = override(sys.argv, {
+    "out_dir": "out-shakespeare",
+    "dataset": "shakespeare_char",
+    "mode": "from_scratch",  # 'scratch' or 'resume'
+    "device": "mps",
+    "block_size": 64,
+    "learning_rate":1e-3,
+    "seed":1337,
+})
 
 # -----------------------------------------------------------------------------#
 # Metadata / model init
 # -----------------------------------------------------------------------------#
 
-base_dir = Path(os.path.dirname(__file__))
-data_dir = os.path.join("data", data_path)
-meta = init_data(data_dir, prepare_shakespeare)
-
-# model init args
-# --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0
-block_size = 64
-# adamw optimizer
-learning_rate = 1e-3
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.99
-
-# -----------------------------------------------------------------------------
-
+torch.manual_seed(overridable['seed'])
+meta = init_data(overridable['dataset'], prepare_shakespeare)
 model = GPT(GPTConfig(
-    n_state=[None, None, None, None],
     n_head=4,
     n_embd=128,
-    block_size=block_size,
+    n_layer=4,
+    block_size=overridable['block_size'],
     bias=False,
     vocab_size=meta['vocab_size'],
     dropout=0.0,
     block_type="attention",
-    device=device,
+    device=overridable['device'],
 ))
 
 optimizer_config = OptimizerConfig(
-    weight_decay=weight_decay,
-    learning_rate=learning_rate,
-    betas=(beta1, beta2),
-    device=device,
+    weight_decay=1e-1,
+    learning_rate=overridable['learning_rate'],
+    betas=(0.9, 0.99),
+    device=overridable['device'],
 )
+
+mode = overridable['mode']
 if mode == "from_scratch":
     iter_num = 0
     best_val_loss = 1e9
@@ -83,55 +70,54 @@ if mode == "from_scratch":
 
 elif mode == "resume" or mode == "sample":
     model, optimizer, iter_num, best_val_loss = load_checkpoint(
-        out_dir, device, model, optimizer_config,
+        out_dir, overridable['device'], model, optimizer_config,
     )
     print("Best val loss: ", best_val_loss)
 else:
     raise ValueError(f"Unsupported mode={mode}")
 
+train_config = TrainConfig(
+    learning_rate=overridable['learning_rate'],
+    decay_lr=True,
+    warmup_iters=100,
+    lr_decay_iters=2000,
+    min_lr=1e-4,
+    grad_clip=1.0,
+    max_iters=2000,
+    gradient_accumulation_steps=1,
+    batch_size=12,                # also used in get_batch
+    eval_only=False,
+    eval_interval=250,
+    eval_iters=20,
+    log_interval=1,
+    always_save_checkpoint=True,
+    device=overridable['device'],
+    out_dir=overridable['out_dir'],
+    initial_iter_num=iter_num,
+    initial_val_loss=best_val_loss,
+    compile=False,
+)
+
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
 # -----------------------------------------------------------------------------#
 
-
+print(f"{optimizer=}")
 if mode == "resume" or mode == "from_scratch":
-    train_config = TrainConfig(
-        seed=1337,
-        learning_rate=learning_rate,          # used also in optimizer
-        decay_lr=True,
-        warmup_iters=100,
-        lr_decay_iters=2000,
-        min_lr=1e-4,
-        grad_clip=1.0,
-        max_iters=2000,
-        gradient_accumulation_steps=1,
-        batch_size=12,                # also used in get_batch
-        eval_only=False,
-        eval_interval=250,
-        eval_iters=20,
-        log_interval=1,
-        always_save_checkpoint=True,
-        device=device,
-        out_dir=out_dir,
-        initial_iter_num=iter_num,
-        initial_val_loss=best_val_loss,
-        compile=False,
-    )
-
     train(
         model=model,
         optimizer=optimizer,
-        get_batch=lambda split, bsz: get_config_batch(
+        get_batch=lambda split, batch_size: get_config_batch(
             split,
-            bsz,
+            batch_size,
             DataConfig(
-                block_size=block_size,
-                data_dir=data_dir,
-                device=device,
+                block_size=overridable['block_size'],
+                dataset=overridable['dataset'],
+                device=overridable['device'],
             ),
         ),
         save_checkpoint=lambda it, val_loss, cfg, mdl, opt: save_config_checkpoint(
-            out_dir,
+            overridable['out_dir'],
             it,
             val_loss,
             cfg,
@@ -159,10 +145,10 @@ else:
         temperature=0.8,
         top_k=200,
         seed=1337,
-        device=device,
+        device=overridable['device'],
         compile=False,
     )
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(overridable['out_dir'], exist_ok=True)
     sample(
         model=model,
         init_gen=init_gen,
