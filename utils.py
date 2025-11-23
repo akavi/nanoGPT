@@ -2,6 +2,7 @@ import os
 import pickle
 from dataclasses import dataclass
 from typing import Optional, Any
+from ast import literal_eval
 
 import numpy as np
 import torch
@@ -9,7 +10,7 @@ from torch import Tensor
 import inspect
 
 from train import train, TrainConfig  # existing import
-from model import GPTConfig, GPT
+from models.model import GPT
 
 @dataclass
 class DataConfig:
@@ -101,7 +102,7 @@ def save_checkpoint(
     iter_num: int,
     best_val_loss: float,
     config: TrainConfig,
-    model,
+    model: Any,
     opt: torch.optim.Optimizer,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
@@ -133,7 +134,7 @@ def init_data(dataset: str, prepare_fn):
 def load_checkpoint(
     out_dir: str,
     device: str,
-    model: GPT,
+    model: Any,
     optimizer_config: OptimizerConfig,
 ) -> tuple[GPT, torch.optim.Optimizer, int, float]:
     """
@@ -211,3 +212,4 @@ def override(argv, config):
         else:
             raise ValueError(f"Unknown config key: {key}")
     return config
+

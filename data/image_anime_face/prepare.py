@@ -31,7 +31,6 @@ H = 32
 W = 32
 C = 1               # grayscale
 DATASET_SLUG = "sebastiendelprat/anime-face-getchu-32x32"  # Kaggle dataset slug
-SEED = 1337
 TRAIN_RATIO = 0.9
 
 # Derived constants
@@ -39,40 +38,23 @@ TOKENS_LINEAR = H * W * C          # 1024 image tokens
 TOKENS_PER_ROW = TOKENS_LINEAR + 1 # 1025 including BOS
 
 
-def init_gen(device) -> np.ndarray:
-    return torch.zeros((1, 1), dtype=int, device=device)
-
-def detokenize(tokens: np.ndarray, path) -> Image.Image:
-    """
-    Inverse of the linear row-major rasterization (grayscale).
-    tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
-    Returns PIL.Image (mode 'L') of shape HxW.
-    """
-    t = np.asarray(tokens[1:].cpu(), dtype=np.uint8)
-    if t.ndim != 1 or t.size != TOKENS_LINEAR:
-        raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
-    img = t.reshape(H, W)  # row-major single channel
-    img = Image.fromarray(img, mode="L")
-    img.save(str(Path(path).with_suffix(".png")), format="PNG")
-
 def _list_image_files(root: Path) -> List[Path]:
     # Recursively find common image extensions
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
     return [p for p in root.rglob("*") if p.suffix.lower() in exts]
 
 
-def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
+def _tokenize_grayscale_row(im: Image) -> np.ndarray:
     """
     Load image, coerce to (H,W,1) grayscale uint8, then pack into int16 row with BOS=0.
     """
-    with Image.open(path) as im:
-        # Force grayscale
-        im = im.convert("L")
-        # Ensure size HxW
-        if im.size != (W, H):
-            raise SystemExit(f"Unexpected size {im.size}.")
-        arr = np.array(im, dtype=np.uint8)  # (H,W)
-        arr = arr.reshape(H, W, 1)          # (H,W,1) for consistency
+    # Force grayscale
+    im = im.convert("L")
+    # Ensure size HxW
+    if im.size != (W, H):
+        raise SystemExit(f"Unexpected size {im.size}.")
+    arr = np.array(im, dtype=np.uint8)  # (H,W)
+    arr = arr.reshape(H, W, 1)          # (H,W,1) for consistency
     body = arr.reshape(-1)                  # length 1024, row-major
     out = np.empty(TOKENS_PER_ROW, dtype=np.int16)
     out[0] = BOS_ID
@@ -80,9 +62,7 @@ def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
     return out
 
 
-def main() -> None:
-    out_dir = Path(os.path.dirname(__file__))
-
+def prepare() -> (np.array, np.array, dict[str, int]): 
     # ---- Always pull from KaggleHub ----
     # Requires: pip install kagglehub ; and Kaggle credentials set up (KAGGLE_USERNAME/KAGGLE_KEY or local kaggle.json)
     print(f"Downloading dataset via kagglehub: {DATASET_SLUG} ...")
@@ -103,13 +83,10 @@ def main() -> None:
     print(f"Found {len(files)} image files.")
 
     # ---- Shuffle + split ----
-    rng = random.Random(SEED)
-    files_sorted = sorted(files)  # deterministic base order before shuffle
-    rng.shuffle(files_sorted)
-    n = len(files_sorted)
+    n = len(files)
     n_train = int(n * TRAIN_RATIO)
-    train_files = files_sorted[:n_train]
-    val_files   = files_sorted[n_train:]
+    train_files = files[:n_train]
+    val_files   = files[n_train:]
 
     print(f"Total images: {n}; train: {len(train_files)} | val: {len(val_files)}")
     print(f"tokens/image (excl. BOS): {TOKENS_LINEAR} | tokens/row (incl. BOS): {TOKENS_PER_ROW}")
@@ -118,7 +95,8 @@ def main() -> None:
     def to_matrix(paths: List[Path]) -> np.ndarray:
         m = np.empty((len(paths), TOKENS_PER_ROW), dtype=np.int16)
         for i, p in enumerate(paths):
-            m[i, :] = _load_and_tokenize_grayscale_row(p)
+            with Image.open(p) as im:
+                m[i, :] = _tokenize_grayscale_row(im)
             if (i + 1) % 1000 == 0:
                 print(f"  processed {i+1}/{len(paths)}")
         return m
@@ -129,25 +107,7 @@ def main() -> None:
     val_mat = to_matrix(val_files)
 
     # ---- Save artifacts ----
-    np.save(out_dir / "train.npy", train_mat, allow_pickle=False)
-    np.save(out_dir / "val.npy",   val_mat,   allow_pickle=False)
-
     meta = {
-        "dataset": DATASET_SLUG,
-        "source": "kagglehub",
-        "split": {"train_ratio": TRAIN_RATIO, "seed": SEED},
         "vocab_size": 256,
-        "dtype": "int16",
-        "note": "BOS=0 collides with pixel value 0 by design; effective pixel alphabet 0..255. Each row is one full sample; no EOI; reset model state per row.",
     }
-    with open(out_dir / "meta.pkl", "wb") as f:
-        pickle.dump(meta, f)
-
-    print(f"Saved {out_dir / 'train.npy'} {train_mat.shape} {train_mat.dtype}")
-    print(f"Saved {out_dir / 'val.npy'}   {val_mat.shape}   {val_mat.dtype}")
-    print(f"Saved {out_dir / 'meta.pkl'}")
-    print("Done.")
-
-
-if __name__ == "__main__":
-    main()
+    return train_mat, val_mat, meta

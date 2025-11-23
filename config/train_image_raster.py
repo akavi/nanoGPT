@@ -6,13 +6,6 @@ eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 1
 
-# we expect to overfit on this small dataset, so only save when val improves
-always_save_checkpoint = False
-
-wandb_log = False # override via command line if you like
-wandb_project = 'image-raster'
-wandb_run_name = 'image-raster'
-
 dataset = 'image_raster'
 block_size = 1024
 gradient_accumulation_steps = 1
@@ -28,10 +21,10 @@ n_state = 64 # SSM state size per head
 n_chunk = 32 # scan chunk/unroll (kernel perf knob)
 
 dropout = 0.05 # or 0.0 if you use even light aug
-learning_rate = 3e-4 # AdamW
-max_iters = 3000 # ≈ one pass compute-optimal
-lr_decay_iters = 300
 min_lr = 3e-5
+learning_rate = 3e-4 # AdamW
+lr_decay_iters = 300
+max_iters = 3000 # ≈ one pass compute-optimal
 beta2 = 0.95
 
 warmup_iters = 30 # ~10%

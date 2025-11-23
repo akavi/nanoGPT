@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch import Tensor, Tensor, nn
 from models.utils import mean_by_quarter, mean_by_mod4
+from models.layer_norm import LayerNorm
 
 @dataclass
 class CategoricalConfig:
@@ -16,7 +17,7 @@ class CategoricalConfig:
 class Categorical(nn.Module):
     def __init__(self, config, backbone: nn.Module):
         super().__init__()
-        assert config.vocab_size is not None
+        assert config.n_vocab is not None
         assert config.n_block is not None
         self.n_block = config.n_block
 
@@ -26,7 +27,7 @@ class Categorical(nn.Module):
         self.drop = nn.Dropout(config.dropout)
         self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
 
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.n_vocab, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -62,17 +63,11 @@ class Categorical(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)                        
-            B, T, V = logits.shape
-            device, dtype = logits.device, logits.dtype
-
-            loss_tok = F.cross_entropy(
-                logits.view(-1, V),
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1,
-                reduction="none",
-            ).view(B, T)                                   
-
-            loss = loss_tok * w_stream).sum() / denom
+                ignore_index=-1
+            )
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -117,3 +112,15 @@ class Categorical(nn.Module):
 
     def flops_per_token(self):
         return self.backbone.flops_per_token()
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.wpe.weight.numel()
+        return n_params

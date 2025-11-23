@@ -9,8 +9,7 @@ source .venv/bin/activate
 python -V   # should say 3.13.x
 uv sync
 
-uv run python3 data/image_mdct/prepare.py  
-uv run python3 train.py config/train_image_mdct.py --out_dir=out-image-mdct-top-heavy --batch_size=48 --max_iters=1000
+uv run python3 config/face_ar_config.py --out_dir=out-image-ar-refactor
 uv run python3 sample.py --out_dir=out-image-mdct-early --max_new_tokens=4096
 uv run python3 sample.py --out_dir=out-image-mdct-even --max_new_tokens=4096
 uv run python3 sample.py --out_dir=out-image-mdct-late --max_new_tokens=4096
