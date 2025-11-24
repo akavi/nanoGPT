@@ -7,14 +7,14 @@ from torch import Tensor
 
 @dataclass
 class MoLConfig:
-    n_block: int = 1024      # context length
+    n_block: int = 1024      
     n_embd: int = 768
-    n_mix: int = 10          # number of mixture components K
+    n_mix: int = 10          
     bias: bool = True
     dropout: float = 0.0
-    value_hidden: int = 128
+    n_mlp_hidden: int = 128
 
-class MoLAutoregressive(nn.Module):
+class MoL(nn.Module):
     """
     Autoregressive over real-valued tokens x_t \in (-inf, inf).
     Head predicts K-component logistic mixture per step.
@@ -24,10 +24,12 @@ class MoLAutoregressive(nn.Module):
         self.n_block = config.n_block
         self.n_mix = config.n_mix
 
+        # Chagpt claims this is better than a linear embedding
+        # idk tho
         self.vte = nn.Sequential(
-            nn.Linear(1, config.value_hidden, bias=config.bias),
+            nn.Linear(1, config.n_mlp_hidden, bias=config.bias),
             nn.GELU(),
-            nn.Linear(config.value_hidden, config.n_embd, bias=config.bias),
+            nn.Linear(config.n_mlp_hidden, config.n_embd, bias=config.bias),
         )
 
         # learned absolute positions
@@ -83,9 +85,6 @@ class MoLAutoregressive(nn.Module):
             logp = mixture_loglik(targets, mix_logits, mu, log_s)    # [B,T]
             loss_tok = -logp                                          # per-token loss
             loss = loss_tok.mean()
-            # Optional diagnostics:
-            # print("mean by quarter", mean_by_quarter(loss_tok))
-            # print("mean by mod4", mean_by_mod4(loss_tok))
             return (mix_logits, mu, log_s), state, loss
         else:
             # inference: return only last-step params for efficiency
@@ -141,21 +140,11 @@ class MoLAutoregressive(nn.Module):
 # ---------- utilities ----------
 
 def logistic_logpdf(x: Tensor, mu: Tensor, log_s: Tensor) -> Tensor:
-    """
-    log pdf of Logistic(mu, s), with s = softplus(log_s) for positivity.
-    Uses: log f(x) = -log s + log_sigmoid((x-mu)/s) + log_sigmoid(-(x-mu)/s)
-    Shapes broadcast as needed.
-    """
     s = F.softplus(log_s) + 1e-8
     z = (x - mu) / s
     return -torch.log(s) + F.logsigmoid(z) + F.logsigmoid(-z)
 
 def mixture_loglik(x: Tensor, mix_logits: Tensor, mu: Tensor, log_s: Tensor) -> Tensor:
-    """
-    x:        [B, T]
-    mix_logits, mu, log_s: [B, T, K]
-    returns log p(x) per position: [B, T]
-    """
     log_pi = F.log_softmax(mix_logits, dim=-1)                      # [B,T,K]
     # expand x to [B,T,1] for broadcasting against [B,T,K]
     x_exp = x.unsqueeze(-1)
@@ -163,10 +152,6 @@ def mixture_loglik(x: Tensor, mix_logits: Tensor, mu: Tensor, log_s: Tensor) -> 
     return torch.logsumexp(log_pi + log_comp, dim=-1)               # [B,T]
 
 def sample_logistic(mu: Tensor, log_s: Tensor) -> Tensor:
-    """
-    Sample from Logistic(mu, s) with s = softplus(log_s).
-    Returns tensor with the broadcasted shape of mu/log_s.
-    """
     u = torch.rand_like(mu).clamp_(1e-6, 1 - 1e-6)
     s = F.softplus(log_s) + 1e-8
     return mu + s * (torch.log(u) - torch.log1p(-u))  # logit(u)

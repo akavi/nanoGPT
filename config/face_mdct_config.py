@@ -1,11 +1,13 @@
 import sys
 from pathlib import Path
 from typing import Any
+import numpy as np
+from PIL import Image
 
 import torch
 
 from models.model import ModuleList
-from models.categorical import CategoricalConfig, Categorical
+from models.mol import MoLConfig, MoL
 from models.mamba import Mamba2, MambaConfig
 from train import train, TrainConfig
 import torch.nn as nn
@@ -21,6 +23,8 @@ from utils import (
     override,
 )
 from data.image_anime_face.prepare import prepare as prepare_image_anime_face
+from data_utils.mdct import mdct_forward, mdct_backward
+
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -36,7 +40,6 @@ overridable = override(sys.argv, {
     "n_layer": 10,
     "n_embd":384,
     "bias": True,
-    "block_size": 1024,
 })
 
 # -----------------------------------------------------------------------------#
@@ -60,7 +63,7 @@ backbone = ModuleList([
         mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
     ), i)
 for i in range(overridable['n_layer'])])
-model = Categorical(CategoricalConfig(
+model = MoL(MoLConfig(
     n_block=overridable['block_size'],
     n_vocab=meta['vocab_size'],
     n_embd=overridable['n_embd'],
@@ -93,6 +96,69 @@ elif mode == "resume" or mode == "sample":
 else:
     raise ValueError(f"Unsupported mode={mode}")
 
+# -----------------------------------------------------------------------------#
+# Conversion utils
+# -----------------------------------------------------------------------------#
+
+# TODO: We should store raw images
+# and perform conversions on the fly
+BOS_ID = 0
+H, W, C = 32, 32, 1
+TOKENS_LINEAR = H * W * C
+TOKENS_PER_ROW = TOKENS_LINEAR + 1
+
+def _zigzag_indices(h, w):
+    pairs = [(u,v) for u in range(h) for v in range(w)]
+    return sorted(pairs, key=lambda t: (t[0]+t[1], t[0]))
+
+def _rasterize(img: np.ndarray) -> np.ndarray:
+    """
+    Return a 1-D vector of img's elements in zigzag (JPEG) order.
+    img must be 2-D (grayscale or single-channel coefficient plane).
+    """
+    if img.ndim != 2:
+        raise ValueError("rasterize expects a 2-D array")
+    h, w = img.shape
+    out = np.empty(h * w, dtype=img.dtype)
+    for index, (i, j) in enumerate(_zigzag_indices(h, w)):
+        out[index] = img[i, j]
+    return out
+
+def _derasterize(vec: np.ndarray, h: int, w: int) -> np.ndarray:
+    if vec.ndim != 1:
+        raise ValueError("_derasterize expects a 1-D array")
+    if vec.size != h * w:
+        raise ValueError(f"vector length {vec.size} does not match h*w={h*w}")
+
+    out = np.empty((h, w), dtype=vec.dtype)
+    ij = np.array(_zigzag_indices(h, w))  # shape: (h*w, 2)
+    out[ij[:, 0], ij[:, 1]] = vec
+    return out
+
+def tokenize(arr: np.ndarray) -> torch.Tensor:
+    # Ignore existing BOS value
+    pixels = row_np[1:].astype(np.float32)  # (1024,)
+    img = pixels.reshape(H, W)              # (32, 32)
+    coeffs = mdct_forward(img)              # (H, W) float32
+    flat = _rasterize(coeffs)               # (1024,)
+    out = np.empty(TOKENS_PER_ROW, dtype=np.float32)
+    out[0] = float(BOS_ID)
+    out[1:] = flat
+    return torch.from_numpy(out)
+
+def detokenize(tokens: torch.Tensor) -> Image.Image:
+    # tokens: (..., TOKENS_PER_ROW) torch.float*
+    t = tokens.detach().cpu().numpy()
+    assert t.ndim == 1 and t.size == TOKENS_PER_ROW
+    coeffs_flat = t[1:]                         # drop BOS
+    coeffs = _derasterize(coeffs_flat, H, W)    # (H, W)
+    return mdct_backward(coeffs, H, W)
+
+
+# -----------------------------------------------------------------------------#
+# TrainConfig and train() call
+# -----------------------------------------------------------------------------#
+
 train_config = TrainConfig(
     initial_iter_num=iter_num,
     initial_val_loss=best_val_loss,
@@ -119,24 +185,39 @@ train_config = TrainConfig(
     compile=False,
 )
 
-# -----------------------------------------------------------------------------#
-# TrainConfig and train() call
-# -----------------------------------------------------------------------------#
+def get_batch(split, batch_size):
+    rows, _ = get_config_batch(
+        split,
+        batch_size,
+        DataConfig(
+            block_size=TOKENS_PER_ROW,          # full row length
+            dataset=overridable['dataset'],
+            device=overridable['device'],
+        ),
+    )
+    # rows: (B, TOKENS_PER_ROW) uint8 (linearly rasterized rows)
 
-print(f"{optimizer=}")
+    tokens = torch.stack(
+        [tokenize(row) for row in rows],
+        dim=0,
+    ).to(overridable['device'])              # (B, TOKENS_PER_ROW), float32
+
+    block_size = overridable['block_size']
+    assert block_size + 1 == TOKENS_PER_ROW, (
+        f"Expected block_size + 1 == TOKENS_PER_ROW, got "
+        f"{block_size + 1} vs {TOKENS_PER_ROW}"
+    )
+
+    x_out = tokens[:, :block_size]           # (B, 1024)
+    y_out = tokens[:, 1:block_size + 1]      # (B, 1024)
+
+    return x_out, y_out
+
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
         optimizer=optimizer,
-        get_batch=lambda split, batch_size: get_config_batch(
-            split,
-            batch_size,
-            DataConfig(
-                block_size=overridable['block_size'],
-                dataset=overridable['dataset'],
-                device=overridable['device'],
-            ),
-        ),
+        get_batch=get_batch,
         save_checkpoint=lambda it, val_loss, cfg, mdl, opt: save_config_checkpoint(
             overridable['out_dir'],
             it,
@@ -149,21 +230,10 @@ if mode == "resume" or mode == "from_scratch":
     )
 else:
     def init_gen(device):
-        start_ids = [0]
-        return (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+        return torch.zeros((1, 1), dtype=int, device=device)
 
-    # TODO: We should store raw images
-    # and perform conversions on the fly
-    def detokenize(tokens: np.ndarray) -> Image.Image:
-        """
-        Inverse of the linear row-major rasterization (grayscale).
-        tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
-        Returns PIL.Image (mode 'L') of shape HxW.
-        """
-        t = np.asarray(tokens[1:].cpu(), dtype=np.uint8)
-        if t.ndim != 1 or t.size != TOKENS_LINEAR:
-            raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
-        img = t.reshape(H, W)  # row-major single channel
+    def detokenize_and_save(tokens: np.ndarray, path: str):
+        img = detokenize(tokens)
         img = Image.fromarray(img, mode="L")
 
         path = os.path.join(overridable['out_dir'], str(Path(path).with_suffix(".png")))
@@ -182,6 +252,6 @@ else:
     sample(
         model=model,
         init_gen=init_gen,
-        detokenize=detokenize,
+        detokenize=detokenize_and_save,
         config=sample_config,
     )

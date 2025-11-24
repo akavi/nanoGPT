@@ -76,10 +76,6 @@ def _list_image_files(root: Path) -> List[Path]:
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
     return [p for p in root.rglob("*") if p.suffix.lower() in exts]
 
-def _zigzag_indices(h, w):
-    pairs = [(u,v) for u in range(h) for v in range(w)]
-    return sorted(pairs, key=lambda t: (t[0]+t[1], t[0]))
-
 def _rasterize(img: np.ndarray) -> np.ndarray:
     """
     Return a 1-D vector of img's elements in zigzag (JPEG) order.
@@ -132,11 +128,6 @@ def _load_and_tokenize_grayscale_row(path: Path) -> np.ndarray:
             raise SystemExit(f"Unexpected size {im.size}.")
         arr = np.array(im, dtype=np.uint8)  # (H,W)
         arr = arr.reshape(H, W)          # (H,W,1) for consistency
-    body = i32_to_u8(_rasterize(mdct_forward(arr)))
-    out = np.empty(TOKENS_PER_ROW, dtype=np.uint8)
-    out[0] = BOS_ID
-    out[1:] = body
-    return out
 
 
 def main() -> None:
