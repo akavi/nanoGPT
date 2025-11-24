@@ -14,7 +14,7 @@ from utils import (
     DataConfig,
     get_sampled_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
-    init_data,
+    init_sampled_data,
     load_checkpoint,
     configure_optimizers,
     override,
@@ -26,7 +26,7 @@ from data.image_anime_face.prepare import prepare as prepare_image_anime_face
 # I/O
 overridable = override(sys.argv, {
     "out_dir": "out-shakespeare",
-    "dataset": "shakespeare_char",
+    "dataset": "image_anime_face",
     "mode": "from_scratch",  
     "device": "cuda",
     "seed":1337,
@@ -43,7 +43,7 @@ overridable = override(sys.argv, {
 # -----------------------------------------------------------------------------#
 
 torch.manual_seed(overridable['seed'])
-meta = init_data(overridable['dataset'], prepare_image_anime_face)
+meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
 backbone = nn.ModuleList([
     Mamba2(MambaConfig(
         n_head=8,

@@ -25,17 +25,32 @@ class OptimizerConfig:
     betas: list[float]
     device: str
 
+def _load_memmap(split: str, config: DataConfig):
+    """Memmap the prebatched matrix for the given split."""
+    data_dir = os.path.join("data", config.dataset)
+    fname = 'train.npy' if split == 'train' else 'val.npy'
+    path = os.path.join(data_dir, fname)
+    # np.load with mmap avoids loading into RAM; returns an array-like memmap
+    arr = np.load(path, mmap_mode="r", allow_pickle=True)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array, got shape {arr.shape} in {fpath}")
+    return arr  # shape [N, L], integer dtype
+
 def get_sampled_batch(
     split: str,
     batch_size: int,
     config: DataConfig,
-) -> tuple[Tensor, Tensor]:
+):
     """
     Returns:
         x: int64 tensor of shape [B, T]
         y: int64 tensor of shape [B, T]  (next-token targets)
     """
-    mat = _load_memmap(split, "npy", config)  # [N, L]
+    block_size = config.block_size
+    device_type = "cuda" if "cuda" in config.device else "cpu"
+    data_dir = os.path.join("data", config.dataset)
+
+    mat = _load_memmap(split, config)  # [N, L]
     N, L = mat.shape
 
     # choose B row indices
@@ -44,23 +59,31 @@ def get_sampled_batch(
     # determine crop length T
     # - if block_size is None or >= L, use the full row; so T = L-1
     # - else use T = block_size (must be <= L-1)
-    start = 0
-    T = L - 1 if (config.block_size is None) or (config.block_size >= L) else int(config.block_size)
+    if (block_size is None) or (block_size >= L):
+        start = 0
+        T = L - 1
+    else:
+        start = 0
+        T = int(block_size)
 
-    rows = mat[row_ix.numpy()]  # [B, L], numpy memmap
+    # gather rows (vectorized)
+    # Use NumPy advanced indexing once to materialize [B, L] on CPU
+    rows = mat[row_ix.numpy()]  # shape [B, L], still numpy memmap-backed
+
     x_np = rows[:, start : start + T]
     y_np = rows[:, start + 1 : start + 1 + T]
 
+    # convert to torch int64 (token ids)
     x = torch.from_numpy(x_np.astype(np.int64, copy=False))
     y = torch.from_numpy(y_np.astype(np.int64, copy=False))
 
-    device_type = "cuda" if "cuda" in config.device else "cpu"
     if device_type == "cuda":
-        x = x.pin_memory().to(config.device, non_blocking=True)
-        y = y.pin_memory().to(config.device, non_blocking=True)
+        # Pin then transfer asynchronously for better throughput
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
     else:
-        x = x.to(config.device)
-        y = y.to(config.device)
+        x = x.to(device)
+        y = y.to(device)
 
     return x, y
 
@@ -91,12 +114,6 @@ def get_batch(
         y = y.to(config.device)
     return x, y
 
-def _load_memmap(split: str, suffix: str, config: DataConfig) -> np.memmap:
-    data_dir = os.path.join("data", config.dataset)
-    fname = f"train.{suffix}" if split == "train" else f"val.{suffix}"
-    path = os.path.join(data_dir, fname)
-    return np.load(path, mmap_mode="r")
-
 def save_checkpoint(
     out_dir: str,
     iter_num: int,
@@ -116,13 +133,27 @@ def save_checkpoint(
     torch.save(ckpt, os.path.join(out_dir, "ckpt.pt"))
 
 def init_data(dataset: str, prepare_fn):
-    """Load vocab_size from data_dir/meta.pkl if present, else return None."""
     data_dir = os.path.join("data", dataset)
     meta_path = os.path.join(data_dir, "meta.pkl")
     if not os.path.exists(meta_path):
         train_ids, val_ids, meta = prepare_fn()
-        train_ids.tofile(os.path.join(data_dir, 'train.bin'))
-        val_ids.tofile(os.path.join(data_dir, 'val.bin'))
+        np.save(data_dir / "train.npy", train_mat, allow_pickle=False)
+        np.save(data_dir / "val.npy",   val_mat,   allow_pickle=False)
+        with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
+            pickle.dump(meta, f)
+    else:
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+
+    return meta
+
+def init_sampled_data(dataset: str, prepare_fn):
+    data_dir = os.path.join("data", dataset)
+    meta_path = os.path.join(data_dir, "meta.pkl")
+    if not os.path.exists(meta_path):
+        train_ids, val_ids, meta = prepare_fn()
+        train_ids.tofile(os.path.join(data_dir, 'train.npy'))
+        val_ids.tofile(os.path.join(data_dir, 'val.npy'))
         with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
             pickle.dump(meta, f)
     else:
