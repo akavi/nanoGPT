@@ -19,6 +19,24 @@ from torch import LongTensor, Tensor, nn
 from einops import rearrange, repeat
 from models.layer_norm import LayerNorm
 
+class ModuleList(nn.Module):
+    def __init__(self, inner_list):
+        super().__init__()
+        self.inner_list = inner_list
+
+    def forward(self, x, old_state):
+        new_state = []
+
+        for idx, fn in enumerate(self.inner_list):
+            x, this_state = fn(x, old_state[idx])
+            new_state.append(this_state)
+
+        return x, new_state
+
+    def initial_state(self, batch_size):
+        return list(map(lambda m: m.initial_state(batch_size), self.inner_list))
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_idx):

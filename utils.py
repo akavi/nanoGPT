@@ -3,6 +3,7 @@ import pickle
 from dataclasses import dataclass
 from typing import Optional, Any
 from ast import literal_eval
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -31,7 +32,8 @@ def _load_memmap(split: str, config: DataConfig):
     fname = 'train.npy' if split == 'train' else 'val.npy'
     path = os.path.join(data_dir, fname)
     # np.load with mmap avoids loading into RAM; returns an array-like memmap
-    arr = np.load(path, mmap_mode="r", allow_pickle=True)
+    print("PATH", path)
+    arr = np.load(path, mmap_mode="r")
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array, got shape {arr.shape} in {fpath}")
     return arr  # shape [N, L], integer dtype
@@ -47,7 +49,8 @@ def get_sampled_batch(
         y: int64 tensor of shape [B, T]  (next-token targets)
     """
     block_size = config.block_size
-    device_type = "cuda" if "cuda" in config.device else "cpu"
+    device = config.device
+    device_type = "cuda" if "cuda" in device else "cpu"
     data_dir = os.path.join("data", config.dataset)
 
     mat = _load_memmap(split, config)  # [N, L]
@@ -93,7 +96,8 @@ def get_batch(
     config: DataConfig,
 ) -> tuple[Tensor, Tensor]:
     block_size = config.block_size
-    device_type = "cuda" if "cuda" in config.device else "cpu"
+    device = config.device
+    device_type = "cuda" if "cuda" in device else "cpu"
     data_dir = os.path.join("data", config.dataset)
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -133,10 +137,10 @@ def save_checkpoint(
     torch.save(ckpt, os.path.join(out_dir, "ckpt.pt"))
 
 def init_data(dataset: str, prepare_fn):
-    data_dir = os.path.join("data", dataset)
+    data_dir = Path(os.path.join("data", dataset))
     meta_path = os.path.join(data_dir, "meta.pkl")
     if not os.path.exists(meta_path):
-        train_ids, val_ids, meta = prepare_fn()
+        train_mat, val_mat, meta = prepare_fn()
         np.save(data_dir / "train.npy", train_mat, allow_pickle=False)
         np.save(data_dir / "val.npy",   val_mat,   allow_pickle=False)
         with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
@@ -148,12 +152,12 @@ def init_data(dataset: str, prepare_fn):
     return meta
 
 def init_sampled_data(dataset: str, prepare_fn):
-    data_dir = os.path.join("data", dataset)
+    data_dir = Path(os.path.join("data", dataset))
     meta_path = os.path.join(data_dir, "meta.pkl")
     if not os.path.exists(meta_path):
-        train_ids, val_ids, meta = prepare_fn()
-        train_ids.tofile(os.path.join(data_dir, 'train.npy'))
-        val_ids.tofile(os.path.join(data_dir, 'val.npy'))
+        train_mat, val_mat, meta = prepare_fn()
+        np.save(data_dir / "train.npy", train_mat, allow_pickle=False)
+        np.save(data_dir / "val.npy",   val_mat,   allow_pickle=False)
         with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
             pickle.dump(meta, f)
     else:

@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 
+from models.model import ModuleList
 from models.categorical import CategoricalConfig, Categorical
 from models.mamba import Mamba2, MambaConfig
 from train import train, TrainConfig
@@ -44,7 +45,7 @@ overridable = override(sys.argv, {
 
 torch.manual_seed(overridable['seed'])
 meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
-backbone = nn.ModuleList([
+backbone = ModuleList([
     Mamba2(MambaConfig(
         n_head=8,
         n_embd=overridable['n_embd'],
