@@ -192,6 +192,9 @@ class Mamba2(nn.Module):
 
         return y.unsqueeze(1), h
 
+    def flops_per_fwdbwd(self):
+        return 1
+
     def initial_state(self, batch_size):
         return (
             torch.zeros(

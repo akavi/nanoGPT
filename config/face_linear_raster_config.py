@@ -141,7 +141,7 @@ train_config = TrainConfig(
     device=overridable['device'],
 
     decay_lr=True,
-    lr_decay_iters=300,
+    lr_decay_iters=3000,
     learning_rate=overridable['learning_rate'],
     min_lr=overridable['min_lr'],
 

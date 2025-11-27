@@ -36,6 +36,9 @@ class ModuleList(nn.Module):
     def initial_state(self, batch_size):
         return list(map(lambda m: m.initial_state(batch_size), self.inner_list))
 
+    def flops_per_fwdbwd(self):
+        return sum(list(map(lambda m: m.flops_per_fwdbwd(), self.inner_list)))
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -138,6 +141,9 @@ class CsaBlock(nn.Module):
 
     def __init__(self, config, layer):
         super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.block_size = config.block_size
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config, layer)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -151,7 +157,11 @@ class CsaBlock(nn.Module):
     def initial_state(self, batch_size):
         return None
 
-
+    def flops_per_fwdbwd(self):
+        N = self.get_num_params()
+        H, Q, T = self.n_head, self.n_embd // self.n_head, self.block_size
+        flops_per_token = 6*N + 12*H*Q*T
+        return flops_per_token * T
 
 @dataclass
 class GPTConfig:

@@ -131,8 +131,8 @@ class MoL(nn.Module):
     def initial_state(self, batch_size):
         return self.backbone.initial_state(batch_size)
 
-    def flops_per_token(self):
-        return self.backbone.flops_per_token()
+    def flops_per_fwdbwd(self):
+        return self.backbone.flops_per_fwdbwd()
 
 # ---------- utilities ----------
 
