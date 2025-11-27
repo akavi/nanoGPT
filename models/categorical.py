@@ -71,12 +71,7 @@ class Categorical(nn.Module):
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss_tok = None
             loss = None
-
-        if loss_tok is not None:
-            print("mean by quarters", mean_by_quarter(loss_tok))
-            print("mean by mod4", mean_by_mod4(loss_tok))
 
         return logits, state, loss
 

@@ -127,7 +127,7 @@ def get_batch(split, batch_size):
     )
     block_size = overridable['block_size']
     x_out = rows[:, :block_size]           # (B, 1024)
-    y_out = rows[:, 1:block_size + 1]      # (B, 1024)
+    y_out = rows[:, 1:block_size + 1].contiguous()      # (B, 1024)
 
     return x_out, y_out
 
@@ -147,7 +147,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=256,                # also used in get_batch
+    batch_size=128,                # also used in get_batch
 
     eval_only=False,
     eval_interval=250,

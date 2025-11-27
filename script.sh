@@ -1,5 +1,5 @@
 tmux
-git clone --depth 1 --branch master https://github.com/akavi/nanoGPT.git
+tit clone --depth 1 --branch master https://github.com/akavi/nanoGPT.git
 cd nanoGPT/
 sudo snap install astral-uv --classic
 uv python install 3.13
@@ -9,7 +9,7 @@ source .venv/bin/activate
 python -V   # should say 3.13.x
 uv sync
 
-uv run python3 config/face_ar_config.py --out_dir=out-image-ar-refactor
+uv run python3 config/face_linear_raster_config.py
 uv run python3 sample.py --out_dir=out-image-mdct-early --max_new_tokens=4096
 uv run python3 sample.py --out_dir=out-image-mdct-even --max_new_tokens=4096
 uv run python3 sample.py --out_dir=out-image-mdct-late --max_new_tokens=4096

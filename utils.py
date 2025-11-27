@@ -31,7 +31,6 @@ def _load_memmap(split: str, config: DataConfig):
     fname = 'train.npy' if split == 'train' else 'val.npy'
     path = os.path.join(data_dir, fname)
     # np.load with mmap avoids loading into RAM; returns an array-like memmap
-    print("PATH", path)
     arr = np.load(path, mmap_mode="r")
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array, got shape {arr.shape} in {fpath}")
@@ -49,10 +48,8 @@ def get_sampled_batch(
     """
     device = config.device
     device_type = "cuda" if "cuda" in device else "cpu"
-    data_dir = os.path.join("data", config.dataset)
 
     mat = _load_memmap(split, config)  # [N, L]
-    print("MAT SHAPE", mat.shape)
     N, L = mat.shape
 
     # choose B row indices

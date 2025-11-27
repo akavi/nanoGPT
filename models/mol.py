@@ -55,9 +55,6 @@ class MoL(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def initial_state(self, batch_size: int):
-        return self.backbone.initial_state(batch_size)
-
     def forward(self, x_cont: Tensor, state, targets: Tensor | None = None):
         """
         x_cont:  [B, T] real-valued previous tokens
