@@ -16,7 +16,6 @@ from models.model import GPT
 @dataclass
 class DataConfig:
     dataset: str
-    block_size: Optional[int]
     device: str
 
 @dataclass
@@ -48,47 +47,25 @@ def get_sampled_batch(
         x: int64 tensor of shape [B, T]
         y: int64 tensor of shape [B, T]  (next-token targets)
     """
-    block_size = config.block_size
     device = config.device
     device_type = "cuda" if "cuda" in device else "cpu"
     data_dir = os.path.join("data", config.dataset)
 
     mat = _load_memmap(split, config)  # [N, L]
+    print("MAT SHAPE", mat.shape)
     N, L = mat.shape
 
     # choose B row indices
     row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
-
-    # determine crop length T
-    # - if block_size is None or >= L, use the full row; so T = L-1
-    # - else use T = block_size (must be <= L-1)
-    if (block_size is None) or (block_size >= L):
-        start = 0
-        T = L - 1
-    else:
-        start = 0
-        T = int(block_size)
-
-    # gather rows (vectorized)
-    # Use NumPy advanced indexing once to materialize [B, L] on CPU
     rows = mat[row_ix.numpy()]  # shape [B, L], still numpy memmap-backed
-
-    x_np = rows[:, start : start + T]
-    y_np = rows[:, start + 1 : start + 1 + T]
-
-    # convert to torch int64 (token ids)
-    x = torch.from_numpy(x_np.astype(np.int64, copy=False))
-    y = torch.from_numpy(y_np.astype(np.int64, copy=False))
+    rows = torch.from_numpy(rows.astype(np.int64, copy=False))
 
     if device_type == "cuda":
         # Pin then transfer asynchronously for better throughput
-        x = x.pin_memory().to(device, non_blocking=True)
-        y = y.pin_memory().to(device, non_blocking=True)
+        rows = rows.pin_memory().to(device, non_blocking=True)
     else:
-        x = x.to(device)
-        y = y.to(device)
-
-    return x, y
+        rows = rows.to(device)
+    return rows
 
 def get_batch(
     split: str,

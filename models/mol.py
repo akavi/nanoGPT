@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch import Tensor
- from models.layer_norm import LayerNorm
+from models.layer_norm import LayerNorm
 
 @dataclass
 class MoLConfig:

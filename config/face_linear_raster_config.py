@@ -1,14 +1,15 @@
 import sys
 from pathlib import Path
 from typing import Any
-
+import numpy as np
+from PIL import Image
 import torch
+import os
 
 from models.model import ModuleList
 from models.categorical import CategoricalConfig, Categorical
 from models.mamba import Mamba2, MambaConfig
 from train import train, TrainConfig
-import torch.nn as nn
 from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
@@ -22,11 +23,8 @@ from utils import (
 )
 from data.image_anime_face.prepare import prepare as prepare_image_anime_face
 
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
 overridable = override(sys.argv, {
-    "out_dir": "out-shakespeare",
+    "out_dir": "out-face-linear-raster",
     "dataset": "image_anime_face",
     "mode": "from_scratch",  
     "device": "cuda",
@@ -40,7 +38,7 @@ overridable = override(sys.argv, {
 })
 
 # -----------------------------------------------------------------------------#
-# Metadata / model init
+# Init Model
 # -----------------------------------------------------------------------------#
 
 torch.manual_seed(overridable['seed'])
@@ -87,11 +85,55 @@ if mode == "from_scratch":
 
 elif mode == "resume" or mode == "sample":
     model, optimizer, iter_num, best_val_loss = load_checkpoint(
-        out_dir, overridable['device'], model, optimizer_config,
+        overridable['out_dir'], overridable['device'], model, optimizer_config,
     )
     print("Best val loss: ", best_val_loss)
 else:
     raise ValueError(f"Unsupported mode={mode}")
+
+# -----------------------------------------------------------------------------#
+# Data utils
+# -----------------------------------------------------------------------------#
+
+# TODO: We should store raw images
+# and perform conversions on the fly
+BOS_ID = 0
+H, W, C = 32, 32, 1
+TOKENS_LINEAR = H * W * C
+TOKENS_PER_ROW = TOKENS_LINEAR + 1
+
+# TODO: We should store raw images
+# and perform conversions on the fly
+def detokenize(tokens: torch.Tensor) -> Image.Image:
+    """
+    Inverse of the linear row-major rasterization (grayscale).
+    tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
+    Returns PIL.Image (mode 'L') of shape HxW.
+    """
+    t = np.asarray(tokens[1:].cpu(), dtype=np.uint8)
+    if t.ndim != 1 or t.size != TOKENS_LINEAR:
+        raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
+    img = t.reshape(H, W)  # row-major single channel
+    return Image.fromarray(img, mode="L")
+
+def get_batch(split, batch_size):
+    rows = get_config_batch(
+        split,
+        batch_size,
+        DataConfig(
+            dataset=overridable['dataset'],
+            device=overridable['device'],
+        ),
+    )
+    block_size = overridable['block_size']
+    x_out = rows[:, :block_size]           # (B, 1024)
+    y_out = rows[:, 1:block_size + 1]      # (B, 1024)
+
+    return x_out, y_out
+
+# -----------------------------------------------------------------------------#
+# TrainConfig and train() call
+# -----------------------------------------------------------------------------#
 
 train_config = TrainConfig(
     initial_iter_num=iter_num,
@@ -119,24 +161,11 @@ train_config = TrainConfig(
     compile=False,
 )
 
-# -----------------------------------------------------------------------------#
-# TrainConfig and train() call
-# -----------------------------------------------------------------------------#
-
-print(f"{optimizer=}")
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
         optimizer=optimizer,
-        get_batch=lambda split, batch_size: get_config_batch(
-            split,
-            batch_size,
-            DataConfig(
-                block_size=overridable['block_size'],
-                dataset=overridable['dataset'],
-                device=overridable['device'],
-            ),
-        ),
+        get_batch=get_batch,
         save_checkpoint=lambda it, val_loss, cfg, mdl, opt: save_config_checkpoint(
             overridable['out_dir'],
             it,
@@ -149,23 +178,10 @@ if mode == "resume" or mode == "from_scratch":
     )
 else:
     def init_gen(device):
-        start_ids = [0]
-        return (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+        return torch.zeros((1, 1), dtype=int, device=device)
 
-    # TODO: We should store raw images
-    # and perform conversions on the fly
-    def detokenize(tokens: np.ndarray) -> Image.Image:
-        """
-        Inverse of the linear row-major rasterization (grayscale).
-        tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
-        Returns PIL.Image (mode 'L') of shape HxW.
-        """
-        t = np.asarray(tokens[1:].cpu(), dtype=np.uint8)
-        if t.ndim != 1 or t.size != TOKENS_LINEAR:
-            raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
-        img = t.reshape(H, W)  # row-major single channel
-        img = Image.fromarray(img, mode="L")
-
+    def detokenize_and_save(tokens: np.ndarray, path: str):
+        img = detokenize(tokens)
         path = os.path.join(overridable['out_dir'], str(Path(path).with_suffix(".png")))
         img.save(path, format="PNG")
 
@@ -182,6 +198,6 @@ else:
     sample(
         model=model,
         init_gen=init_gen,
-        detokenize=detokenize,
+        detokenize=detokenize_and_save,
         config=sample_config,
     )

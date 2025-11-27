@@ -100,7 +100,7 @@ def i2i_dct1d_inverse(Y: np.ndarray) -> np.ndarray:
 
 def mdct_forward(img_u8: np.ndarray) -> np.ndarray:
     if img_u8.dtype != np.uint8:
-        raise TypeError("img_u8 must be uint8")
+        raise TypeError(f"img_u8 must be uint8, is {img_u8.dtype}")
     if img_u8.ndim != 2 or img_u8.shape[0] != img_u8.shape[1]:
         raise ValueError("img_u8 must be square 2D array")
     N = int(img_u8.shape[0])

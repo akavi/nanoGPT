@@ -103,6 +103,7 @@ def prepare() -> (np.array, np.array, dict[str, int]):
 
     print("Building train matrix...")
     train_mat = to_matrix(train_files)
+    print("train mat shape", train_mat.shape)
     print("Building val matrix...")
     val_mat = to_matrix(val_files)
 

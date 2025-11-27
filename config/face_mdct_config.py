@@ -3,14 +3,13 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 from PIL import Image
-
 import torch
+import os
 
 from models.model import ModuleList
 from models.mol import MoLConfig, MoL
 from models.mamba import Mamba2, MambaConfig
 from train import train, TrainConfig
-import torch.nn as nn
 from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
@@ -25,12 +24,8 @@ from utils import (
 from data.image_anime_face.prepare import prepare as prepare_image_anime_face
 from data_utils.mdct import mdct_forward, mdct_backward
 
-
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
 overridable = override(sys.argv, {
-    "out_dir": "out-shakespeare",
+    "out_dir": "out-face-linear-raster",
     "dataset": "image_anime_face",
     "mode": "from_scratch",  
     "device": "cuda",
@@ -40,10 +35,11 @@ overridable = override(sys.argv, {
     "n_layer": 10,
     "n_embd":384,
     "bias": True,
+    "block_size": 1024,
 })
 
 # -----------------------------------------------------------------------------#
-# Metadata / model init
+# Init Model
 # -----------------------------------------------------------------------------#
 
 torch.manual_seed(overridable['seed'])
@@ -65,7 +61,6 @@ backbone = ModuleList([
 for i in range(overridable['n_layer'])])
 model = MoL(MoLConfig(
     n_block=overridable['block_size'],
-    n_vocab=meta['vocab_size'],
     n_embd=overridable['n_embd'],
     bias=overridable['bias'],
     dropout=0.05,
@@ -90,14 +85,14 @@ if mode == "from_scratch":
 
 elif mode == "resume" or mode == "sample":
     model, optimizer, iter_num, best_val_loss = load_checkpoint(
-        out_dir, overridable['device'], model, optimizer_config,
+        overridable['out_dir'], overridable['device'], model, optimizer_config,
     )
     print("Best val loss: ", best_val_loss)
 else:
     raise ValueError(f"Unsupported mode={mode}")
 
 # -----------------------------------------------------------------------------#
-# Conversion utils
+# Data utils
 # -----------------------------------------------------------------------------#
 
 # TODO: We should store raw images
@@ -135,9 +130,9 @@ def _derasterize(vec: np.ndarray, h: int, w: int) -> np.ndarray:
     out[ij[:, 0], ij[:, 1]] = vec
     return out
 
-def tokenize(arr: np.ndarray) -> torch.Tensor:
-    # Ignore existing BOS value
-    pixels = row_np[1:].astype(np.float32)  # (1024,)
+def tokenize(arr: torch.Tensor) -> torch.Tensor:
+    arr = arr.detach().cpu().numpy()
+    pixels = arr[1:].astype(np.uint8)  # (1024,)
     img = pixels.reshape(H, W)              # (32, 32)
     coeffs = mdct_forward(img)              # (H, W) float32
     flat = _rasterize(coeffs)               # (1024,)
@@ -150,10 +145,30 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     # tokens: (..., TOKENS_PER_ROW) torch.float*
     t = tokens.detach().cpu().numpy()
     assert t.ndim == 1 and t.size == TOKENS_PER_ROW
-    coeffs_flat = t[1:]                         # drop BOS
+    coeffs_flat = t[1:].astype(np.int32)                         
     coeffs = _derasterize(coeffs_flat, H, W)    # (H, W)
-    return mdct_backward(coeffs, H, W)
+    img = mdct_backward(coeffs)
+    return Image.fromarray(img, mode="L")
 
+def get_batch(split, batch_size):
+    rows = get_config_batch(
+        split,
+        batch_size,
+        DataConfig(
+            dataset=overridable['dataset'],
+            device=overridable['device'],
+        ),
+    )
+    tokens = torch.stack(
+        [tokenize(row) for row in rows],
+        dim=0,
+    ).to(overridable['device'])              # (B, TOKENS_PER_ROW), float32
+
+    block_size = overridable['block_size']
+    x_out = tokens[:, :block_size]           # (B, 1024)
+    y_out = tokens[:, 1:block_size + 1]      # (B, 1024)
+
+    return x_out, y_out
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
@@ -185,34 +200,6 @@ train_config = TrainConfig(
     compile=False,
 )
 
-def get_batch(split, batch_size):
-    rows, _ = get_config_batch(
-        split,
-        batch_size,
-        DataConfig(
-            block_size=TOKENS_PER_ROW,          # full row length
-            dataset=overridable['dataset'],
-            device=overridable['device'],
-        ),
-    )
-    # rows: (B, TOKENS_PER_ROW) uint8 (linearly rasterized rows)
-
-    tokens = torch.stack(
-        [tokenize(row) for row in rows],
-        dim=0,
-    ).to(overridable['device'])              # (B, TOKENS_PER_ROW), float32
-
-    block_size = overridable['block_size']
-    assert block_size + 1 == TOKENS_PER_ROW, (
-        f"Expected block_size + 1 == TOKENS_PER_ROW, got "
-        f"{block_size + 1} vs {TOKENS_PER_ROW}"
-    )
-
-    x_out = tokens[:, :block_size]           # (B, 1024)
-    y_out = tokens[:, 1:block_size + 1]      # (B, 1024)
-
-    return x_out, y_out
-
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
@@ -234,8 +221,6 @@ else:
 
     def detokenize_and_save(tokens: np.ndarray, path: str):
         img = detokenize(tokens)
-        img = Image.fromarray(img, mode="L")
-
         path = os.path.join(overridable['out_dir'], str(Path(path).with_suffix(".png")))
         img.save(path, format="PNG")
 
