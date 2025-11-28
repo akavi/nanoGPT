@@ -29,8 +29,8 @@ overridable = override(sys.argv, {
     "mode": "from_scratch",  
     "device": "cuda",
     "seed":1337,
-    "learning_rate":3e-4,
-    "min_lr":3e-5,
+    "learning_rate":3e-3,
+    "min_lr":3e-4,
     "n_layer": 10,
     "n_embd":384,
     "bias": True,
@@ -187,7 +187,7 @@ else:
 
     sample_config = SampleConfig(
         num_samples=10,
-        max_new_tokens=500,
+        max_new_tokens=1024,
         temperature=0.8,
         top_k=200,
         seed=1337,

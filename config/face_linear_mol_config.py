@@ -1,20 +1,19 @@
 import sys
 from pathlib import Path
-from typing import Any
 import numpy as np
 from PIL import Image
 import torch
 import os
 
 from models.model import ModuleList
-from models.mol import MoLConfig, MoL
 from models.mamba import Mamba2, MambaConfig
+from models.mol import MoLConfig, MoL
 from train import train, TrainConfig
 from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_fixed_batch,
+    get_sampled_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
     load_checkpoint,
@@ -25,7 +24,7 @@ from data.image_anime_face.prepare import prepare as prepare_image_anime_face
 from data_utils.mdct import mdct_forward, mdct_backward
 
 overridable = override(sys.argv, {
-    "out_dir": "out-face-mdct-zigzag",
+    "out_dir": "out-face-linear-mol",
     "dataset": "image_anime_face",
     "mode": "from_scratch",  
     "device": "cuda",
@@ -36,6 +35,7 @@ overridable = override(sys.argv, {
     "n_embd":384,
     "bias": True,
     "block_size": 1024,
+    "n_mix": 5,
 })
 
 # -----------------------------------------------------------------------------#
@@ -62,7 +62,7 @@ for i in range(overridable['n_layer'])])
 model = MoL(MoLConfig(
     n_block=overridable['block_size'],
     n_embd=overridable['n_embd'],
-    n_mix=20,
+    n_mix=overridable["n_mix"],
     bias=overridable['bias'],
     dropout=0.05,
 ), backbone)
@@ -103,56 +103,23 @@ H, W, C = 32, 32, 1
 TOKENS_LINEAR = H * W * C
 TOKENS_PER_ROW = TOKENS_LINEAR + 1
 
-def _zigzag_indices(h, w):
-    pairs = [(u,v) for u in range(h) for v in range(w)]
-    return sorted(pairs, key=lambda t: (t[0]+t[1], t[0]))
-
-def _rasterize(img: np.ndarray) -> np.ndarray:
-    """
-    Return a 1-D vector of img's elements in zigzag (JPEG) order.
-    img must be 2-D (grayscale or single-channel coefficient plane).
-    """
-    if img.ndim != 2:
-        raise ValueError("rasterize expects a 2-D array")
-    h, w = img.shape
-    out = np.empty(h * w, dtype=img.dtype)
-    for index, (i, j) in enumerate(_zigzag_indices(h, w)):
-        out[index] = img[i, j]
-    return out
-
-def _derasterize(vec: np.ndarray, h: int, w: int) -> np.ndarray:
-    if vec.ndim != 1:
-        raise ValueError("_derasterize expects a 1-D array")
-    if vec.size != h * w:
-        raise ValueError(f"vector length {vec.size} does not match h*w={h*w}")
-
-    out = np.empty((h, w), dtype=vec.dtype)
-    ij = np.array(_zigzag_indices(h, w))  # shape: (h*w, 2)
-    out[ij[:, 0], ij[:, 1]] = vec
-    return out
-
-def tokenize(arr: torch.Tensor) -> torch.Tensor:
-    arr = arr.detach().cpu().numpy()
-    pixels = arr[1:].astype(np.uint8)  # (1024,)
-    img = pixels.reshape(H, W)              # (32, 32)
-    coeffs = mdct_forward(img)              # (H, W) float32
-    flat = _rasterize(coeffs)               # (1024,)
-    out = np.empty(TOKENS_PER_ROW, dtype=np.float32)
-    out[0] = float(BOS_ID)
-    out[1:] = flat
-    return torch.from_numpy(out)
-
+# TODO: We should store raw images
+# and perform conversions on the fly
 def detokenize(tokens: torch.Tensor) -> Image.Image:
-    # tokens: (..., TOKENS_PER_ROW) torch.float*
-    t = tokens.detach().cpu().numpy()
-    assert t.ndim == 1 and t.size == TOKENS_PER_ROW, f"actual dim={t.ndim}, actual size={t.size}"
-    coeffs_flat = t[1:].astype(np.int32)                         
-    coeffs = _derasterize(coeffs_flat, H, W)    # (H, W)
-    img = mdct_backward(coeffs)
+    """
+    Inverse of the linear row-major rasterization (grayscale).
+    tokens: length TOKENS_LINEAR array-like of floats in [-1,1], NO BOS at front.
+    Returns PIL.Image (mode 'L') of shape HxW.
+    """
+    t = (tokens[1:].cpu() + 1.0) * 127.5
+    t = t.clamp(0, 255).numpy().astype(np.uint8)
+    if t.ndim != 1 or t.size != TOKENS_LINEAR:
+        raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
+    img = t.reshape(H, W)
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_fixed_batch(
+    rows = get_config_batch(
         split,
         batch_size,
         DataConfig(
@@ -160,14 +127,9 @@ def get_batch(split, batch_size):
             device=overridable['device'],
         ),
     )
-    tokens = torch.stack(
-        [tokenize(row) for row in rows],
-        dim=0,
-    ).to(overridable['device'])              # (B, TOKENS_PER_ROW), float32
-
     block_size = overridable['block_size']
-    x_out = tokens[:, :block_size] / (2**16 - 0.5)
-    y_out = tokens[:, 1:block_size + 1].contiguous() / (2**16 - 0.5)
+    x_out = rows[:, :block_size].to(dtype=torch.float) / 127.5 - 1.0
+    y_out = rows[:, 1:block_size + 1].to(dtype=torch.float) / 127.5 - 1.0
 
     return x_out, y_out
 
@@ -187,7 +149,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=1,                
+    batch_size=128,                
 
     eval_only=False,
     eval_interval=250,
