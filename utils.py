@@ -36,6 +36,30 @@ def _load_memmap(split: str, config: DataConfig):
         raise ValueError(f"Expected 2D array, got shape {arr.shape} in {fpath}")
     return arr  # shape [N, L], integer dtype
 
+def get_fixed_batch(
+    split: str,
+    batch_size: int,
+    config: DataConfig,
+):
+    """
+    Returns:
+        x: int64 tensor of shape [B, T]
+        y: int64 tensor of shape [B, T]  (next-token targets)
+    """
+    device = config.device
+    device_type = "cuda" if "cuda" in device else "cpu"
+
+    mat = _load_memmap(split, config)  # [N, L]
+    rows = mat[0:batch_size, :]  # shape [B, L], still numpy memmap-backed
+    rows = torch.from_numpy(rows.astype(np.int64, copy=False))
+
+    if device_type == "cuda":
+        # Pin then transfer asynchronously for better throughput
+        rows = rows.pin_memory().to(device, non_blocking=True)
+    else:
+        rows = rows.to(device)
+    return rows
+
 def get_sampled_batch(
     split: str,
     batch_size: int,

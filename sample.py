@@ -83,6 +83,5 @@ def sample(
                     config.max_new_tokens,
                     state,
                     temperature=config.temperature,
-                    top_k=config.top_k,
                 )
                 detokenize(y[0], str(k))

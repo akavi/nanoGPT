@@ -14,7 +14,7 @@ from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_sampled_batch as get_config_batch,
+    get_fixed_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
     load_checkpoint,
@@ -25,7 +25,7 @@ from data.image_anime_face.prepare import prepare as prepare_image_anime_face
 from data_utils.mdct import mdct_forward, mdct_backward
 
 overridable = override(sys.argv, {
-    "out_dir": "out-face-linear-raster",
+    "out_dir": "out-face-mdct-zigzag",
     "dataset": "image_anime_face",
     "mode": "from_scratch",  
     "device": "cuda",
@@ -62,6 +62,7 @@ for i in range(overridable['n_layer'])])
 model = MoL(MoLConfig(
     n_block=overridable['block_size'],
     n_embd=overridable['n_embd'],
+    n_mix=84,
     bias=overridable['bias'],
     dropout=0.05,
 ), backbone)
@@ -69,7 +70,7 @@ model = MoL(MoLConfig(
 optimizer_config = OptimizerConfig(
     weight_decay=1e-1,
     learning_rate=overridable['learning_rate'],
-    betas=(0.9, 0.95),
+    betas=[0.9, 0.95],
     device=overridable['device'],
 )
 
@@ -144,14 +145,14 @@ def tokenize(arr: torch.Tensor) -> torch.Tensor:
 def detokenize(tokens: torch.Tensor) -> Image.Image:
     # tokens: (..., TOKENS_PER_ROW) torch.float*
     t = tokens.detach().cpu().numpy()
-    assert t.ndim == 1 and t.size == TOKENS_PER_ROW
+    assert t.ndim == 1 and t.size == TOKENS_PER_ROW, f"actual dim={t.ndim}, actual size={t.size}"
     coeffs_flat = t[1:].astype(np.int32)                         
     coeffs = _derasterize(coeffs_flat, H, W)    # (H, W)
     img = mdct_backward(coeffs)
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_config_batch(
+    rows = get_fixed_batch(
         split,
         batch_size,
         DataConfig(
@@ -186,7 +187,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=128,                # also used in get_batch
+    batch_size=1,                
 
     eval_only=False,
     eval_interval=250,
@@ -217,7 +218,7 @@ if mode == "resume" or mode == "from_scratch":
     )
 else:
     def init_gen(device):
-        return torch.zeros((1, 1), dtype=int, device=device)
+        return torch.zeros((1, 1), dtype=torch.bfloat16, device=device)
 
     def detokenize_and_save(tokens: np.ndarray, path: str):
         img = detokenize(tokens)
@@ -226,9 +227,8 @@ else:
 
     sample_config = SampleConfig(
         num_samples=10,
-        max_new_tokens=500,
+        max_new_tokens=1024,
         temperature=0.8,
-        top_k=200,
         seed=1337,
         device=overridable['device'],
         compile=False,
