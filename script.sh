@@ -17,7 +17,7 @@ uv run python3 sample.py --out_dir=out-image-mdct-late --max_new_tokens=4096
 uv run python3 sample.py --out_dir=out-image-mdct-superlate --max_new_tokens=4096
 
 export LOGIN=root@86.38.238.107
-export DIR=out-face-linear-mol
+export DIR=out-face-linear-raster
 scp -r -P 22 $LOGIN:~/nanoGPT/$DIR .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
 scp -r -P 22 out-image-mdct-even $LOGIN:~/nanoGPT

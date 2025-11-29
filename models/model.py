@@ -22,7 +22,7 @@ from models.layer_norm import LayerNorm
 class ModuleList(nn.Module):
     def __init__(self, inner_list):
         super().__init__()
-        self.inner_list = inner_list
+        self.inner_list = nn.ModuleList(inner_list)
 
     def forward(self, x, old_state):
         new_state = []
