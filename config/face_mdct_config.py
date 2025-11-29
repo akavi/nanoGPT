@@ -62,7 +62,7 @@ for i in range(overridable['n_layer'])])
 model = MoL(MoLConfig(
     n_block=overridable['block_size'],
     n_embd=overridable['n_embd'],
-    n_mix=20,
+    n_mix=5,
     bias=overridable['bias'],
     dropout=0.05,
 ), backbone)
@@ -148,7 +148,7 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     assert t.ndim == 1 and t.size == TOKENS_PER_ROW, f"actual dim={t.ndim}, actual size={t.size}"
     coeffs_flat = t[1:].astype(np.int32)                         
     coeffs = _derasterize(coeffs_flat, H, W)    # (H, W)
-    img = mdct_backward(coeffs)
+    img = mdct_backward(coeffs) * 2**16
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
@@ -166,8 +166,8 @@ def get_batch(split, batch_size):
     ).to(overridable['device'])              # (B, TOKENS_PER_ROW), float32
 
     block_size = overridable['block_size']
-    x_out = tokens[:, :block_size] / (2**16 - 0.5)
-    y_out = tokens[:, 1:block_size + 1].contiguous() / (2**16 - 0.5)
+    x_out = tokens[:, :block_size] / (2**16)
+    y_out = tokens[:, 1:block_size + 1].contiguous() / (2**16)
 
     return x_out, y_out
 
