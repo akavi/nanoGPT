@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 from typing import Any
+import matplotlib.pyplot as plt  # add this near the top of your file
 import numpy as np
 from PIL import Image
 import torch
@@ -14,7 +15,7 @@ from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_fixed_batch,
+    get_fixed_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
     load_checkpoint,
@@ -30,8 +31,8 @@ overridable = override(sys.argv, {
     "mode": "from_scratch",  
     "device": "cuda",
     "seed":1337,
-    "learning_rate":3e-3,
-    "min_lr":3e-4,
+    "learning_rate":1e-5,
+    "min_lr":1e-6,
     "n_layer": 10,
     "n_embd":384,
     "bias": True,
@@ -135,24 +136,30 @@ def tokenize(arr: torch.Tensor) -> torch.Tensor:
     arr = arr.detach().cpu().numpy()
     pixels = arr[1:].astype(np.uint8)  # (1024,)
     img = pixels.reshape(H, W)              # (32, 32)
-    coeffs = mdct_forward(img)              # (H, W) float32
-    flat = _rasterize(coeffs)               # (1024,)
+    coeffs = mdct_forward(img) 
+    flat = _rasterize(coeffs) 
+    N, = flat.shape
+    idx = torch.arange(1, N + 1, device=flat.device).cpu().numpy()   # [1, 2, ..., N]
+    flat = flat * idx / 2**16
     out = np.empty(TOKENS_PER_ROW, dtype=np.float32)
     out[0] = float(BOS_ID)
     out[1:] = flat
-    return torch.from_numpy(out)
+    return torch.from_numpy(out) 
 
 def detokenize(tokens: torch.Tensor) -> Image.Image:
     # tokens: (..., TOKENS_PER_ROW) torch.float*
     t = tokens.detach().cpu().numpy()
     assert t.ndim == 1 and t.size == TOKENS_PER_ROW, f"actual dim={t.ndim}, actual size={t.size}"
-    coeffs_flat = t[1:].astype(np.int32)                         
-    coeffs = _derasterize(coeffs_flat, H, W)    # (H, W)
-    img = mdct_backward(coeffs) * 2**16
+    coeffs_flat = t[1:]
+    N, = coeffs_flat.shape
+    idx = torch.arange(1, N + 1, device=coeffs_flat.device)   # [1, 2, ..., N]
+    coeffs_flat = coeffs_flat / idx * 2**16
+    coeffs = _derasterize(coeffs_flat, H, W).astype(np.int32)                        # (H, W)
+    img = mdct_backward(coeffs) 
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_fixed_batch(
+    rows = get_config_batch(
         split,
         batch_size,
         DataConfig(
@@ -166,15 +173,14 @@ def get_batch(split, batch_size):
     ).to(overridable['device'])              # (B, TOKENS_PER_ROW), float32
 
     block_size = overridable['block_size']
-    x_out = tokens[:, :block_size] / (2**16)
-    y_out = tokens[:, 1:block_size + 1].contiguous() / (2**16)
+    x_out = tokens[:, :block_size] 
+    y_out = tokens[:, 1:block_size + 1].contiguous() 
 
     return x_out, y_out
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
 # -----------------------------------------------------------------------------#
-
 train_config = TrainConfig(
     initial_iter_num=iter_num,
     initial_val_loss=best_val_loss,
