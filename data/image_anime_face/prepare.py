@@ -32,11 +32,7 @@ W = 32
 C = 1               # grayscale
 DATASET_SLUG = "sebastiendelprat/anime-face-getchu-32x32"  # Kaggle dataset slug
 TRAIN_RATIO = 0.9
-
-# Derived constants
 TOKENS_LINEAR = H * W * C          # 1024 image tokens
-TOKENS_PER_ROW = TOKENS_LINEAR + 1 # 1025 including BOS
-
 
 def _list_image_files(root: Path) -> List[Path]:
     # Recursively find common image extensions
@@ -56,10 +52,7 @@ def _tokenize_grayscale_row(im: Image) -> np.ndarray:
     arr = np.array(im, dtype=np.uint8)  # (H,W)
     arr = arr.reshape(H, W, 1)          # (H,W,1) for consistency
     body = arr.reshape(-1)                  # length 1024, row-major
-    out = np.empty(TOKENS_PER_ROW, dtype=np.int16)
-    out[0] = BOS_ID
-    out[1:] = body.astype(np.int16, copy=False)
-    return out
+    return body.astype(np.int16, copy=False)
 
 
 def prepare() -> (np.array, np.array, dict[str, int]): 
@@ -89,11 +82,11 @@ def prepare() -> (np.array, np.array, dict[str, int]):
     val_files   = files[n_train:]
 
     print(f"Total images: {n}; train: {len(train_files)} | val: {len(val_files)}")
-    print(f"tokens/image (excl. BOS): {TOKENS_LINEAR} | tokens/row (incl. BOS): {TOKENS_PER_ROW}")
+    print(f"tokens/image (excl. BOS): {TOKENS_LINEAR}")
 
     # ---- Build matrices ----
     def to_matrix(paths: List[Path]) -> np.ndarray:
-        m = np.empty((len(paths), TOKENS_PER_ROW), dtype=np.int16)
+        m = np.empty((len(paths), TOKENS_LINEAR), dtype=np.int16)
         for i, p in enumerate(paths):
             with Image.open(p) as im:
                 m[i, :] = _tokenize_grayscale_row(im)

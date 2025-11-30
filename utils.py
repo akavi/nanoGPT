@@ -246,3 +246,41 @@ def override(argv, config):
             raise ValueError(f"Unknown config key: {key}")
     return config
 
+def check_roundtrip(
+    get_batch,
+    tokenize,
+    detokenize,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> bool:
+    """
+    Sample a batch of rows, run through tokenize -> detokenize,
+    and compare reconstructed images to the original images.
+    """
+    rows = get_batch()
+
+    all_ok = True
+
+    for i, row in enumerate(rows):
+        tokens = tokenize(row)
+        recon_row = detokenize(tokens)
+
+        np_row = row.cpu().numpy()
+        np_recon_row = row.cpu().numpy()
+
+        # Compare
+        diff = np.abs(np_row- np_recon_row)
+        max_diff = float(diff.max())
+        mse = float((diff ** 2).mean())
+
+        ok = np.allclose(np_row, np_recon_row, atol=atol, rtol=rtol)
+        print(
+            f"[{i}] max_diff={max_diff:.6f}, mse={mse:.6e}, "
+            f"{'OK' if ok else 'MISMATCH'}"
+        )
+
+        if not ok:
+            all_ok = False
+
+    print("=> ROUNDTRIP OK" if all_ok else "=> ROUNDTRIP MISMATCH")
+    return all_ok
