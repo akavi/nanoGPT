@@ -4,13 +4,15 @@ from dataclasses import dataclass
 from typing import Optional, Any
 from ast import literal_eval
 from pathlib import Path
+import matplotlib.pyplot as plt 
+from PIL import Image
 
 import numpy as np
 import torch
 from torch import Tensor
 import inspect
 
-from train import train, TrainConfig  # existing import
+from train import train, TrainConfig
 from models.model import GPT
 
 @dataclass
@@ -65,11 +67,21 @@ def get_sampled_batch(
     batch_size: int,
     config: DataConfig,
 ):
-    """
-    Returns:
-        x: int64 tensor of shape [B, T]
-        y: int64 tensor of shape [B, T]  (next-token targets)
-    """
+    device = config.device
+    device_type = "cuda" if "cuda" in device else "cpu"
+
+    mat = _load_memmap(split, config)  # [N, L] with L == H*W == 1024
+    N, L = mat.shape
+
+    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
+    rows_np = mat[row_ix.numpy()]  # np.int16, shape (B, L)
+
+    rows = torch.from_numpy(rows_np)  # still integer, 0–255
+    if device_type == "cuda":
+        rows = rows.pin_memory().to(device, non_blocking=True)
+    else:
+        rows = rows.to(device)
+    return rows
     device = config.device
     device_type = "cuda" if "cuda" in device else "cpu"
 
@@ -79,7 +91,7 @@ def get_sampled_batch(
     # choose B row indices
     row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
     rows = mat[row_ix.numpy()]  # shape [B, L], still numpy memmap-backed
-    rows = torch.from_numpy(rows.astype(np.int64, copy=False))
+    rows = torch.from_numpy(rows)
 
     if device_type == "cuda":
         # Pin then transfer asynchronously for better throughput
@@ -246,6 +258,47 @@ def override(argv, config):
             raise ValueError(f"Unknown config key: {key}")
     return config
 
+def view_roundtrip(
+    get_batch,
+    tokenize,
+    detokenize,
+):
+    """
+    Sample a batch of rows, run through tokenize -> detokenize,
+    and compare reconstructed images to the original images.
+    """
+    rows = get_batch()
+
+    for i, row in enumerate(rows):
+        tokens = tokenize(row)
+        recon_row = detokenize(tokens)
+
+        np_row = row.cpu().numpy().reshape(32, 32)
+        np_recon_row = recon_row.cpu().numpy().reshape(32, 32)
+
+        # Prepare for display
+        orig_u8 = np_row.astype(np.uint8)
+        recon_u8 = np_recon_row.astype(np.uint8)
+
+        img = Image.fromarray(orig_u8, mode="L")
+        recon_img = Image.fromarray(recon_u8, mode="L")
+
+        _, axes = plt.subplots(1, 2, figsize=(8, 4))
+
+        axes[0].imshow(img, cmap="gray", vmin=0, vmax=255)
+        axes[0].axis("off")
+        axes[0].set_title("Original")
+
+        axes[1].imshow(recon_img, cmap="gray", vmin=0, vmax=255)
+        axes[1].axis("off")
+        axes[1].set_title("Reconstruction")
+
+        plt.tight_layout()
+        plt.show()
+        img = Image.fromarray(np_row, mode="L")
+        recon_img = Image.fromarray(np_recon_row, mode="L")
+
+
 def check_roundtrip(
     get_batch,
     tokenize,
@@ -266,7 +319,7 @@ def check_roundtrip(
         recon_row = detokenize(tokens)
 
         np_row = row.cpu().numpy()
-        np_recon_row = row.cpu().numpy()
+        np_recon_row = recon_row.cpu().numpy()
 
         # Compare
         diff = np.abs(np_row- np_recon_row)
@@ -284,3 +337,106 @@ def check_roundtrip(
 
     print("=> ROUNDTRIP OK" if all_ok else "=> ROUNDTRIP MISMATCH")
     return all_ok
+
+def plot_log_token_position_means(
+    get_batch,
+    tokenize,
+) -> None:
+    """
+    Draw `num_samples` rows, tokenize, shift by 2**16 to make values positive,
+    take log, then compute the average log value at each token position and plot.
+    """
+    rows = get_batch()
+    with torch.no_grad():
+        # (num_samples, TOKENS_PER_ROW)
+        tokens = torch.stack([tokenize(row) for row in rows], dim=0).float()
+        mean_per_pos_log = tokens.mean(dim=0).cpu().numpy()
+
+    _, N = tokens.shape
+    positions = np.arange(N)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(positions, mean_per_pos_log)
+    plt.xlabel("Token position")
+    plt.ylabel("Average value")
+    plt.title(f"Mean log token value per position over {N} samples")
+    plt.tight_layout()
+    plt.show()
+
+def debug_one_image(split: str, H, W, config: DataConfig):
+    mat = _load_memmap(split, config)  # [N, L]
+    print("mat.shape:", mat.shape, "dtype:", mat.dtype)
+    row = mat[0]                       # shape (L,)
+
+    print("row.shape:", row.shape)
+    print("row min/max:", row.min(), row.max())
+    print("unique count (up to 20):", np.unique(row)[:20])
+
+    assert row.size == H * W, f"expected 1024, got {row.size}"
+
+    arr = row.reshape(H, W).astype(np.uint8)
+    img = Image.fromarray(arr, mode="L")
+    plt.imshow(img, cmap="gray")
+    plt.title("Direct from memmap")
+    plt.axis("off")
+    plt.show()
+
+
+def get_raw_rows(split: str, batch_size: int, config: DataConfig) -> torch.Tensor:
+    """
+    Return raw grayscale rows of shape (B, H*W), dtype int16/int32.
+    This is a thin wrapper over _load_memmap.
+    """
+    device = config.device
+    device_type = "cuda" if "cuda" in device else "cpu"
+
+    mat = _load_memmap(split, config)  # [N, L] with L == H*W == 1024
+    N, L = mat.shape
+
+    row_ix = torch.randint(low=0, high=N, size=(batch_size,), device="cpu")
+    rows_np = mat[row_ix.numpy()]  # np.int16, shape (B, L)
+
+    rows = torch.from_numpy(rows_np)  # still integer, 0–255
+    if device_type == "cuda":
+        rows = rows.pin_memory().to(device, non_blocking=True)
+    else:
+        rows = rows.to(device)
+    return rows
+
+def view_roundtrip_once(
+    split: str,
+    config: DataConfig,
+    tokenize,
+    detokenize,
+):
+    rows = get_raw_rows(split, batch_size=1, config=config)   # (1, 1024)
+    row = rows[0]                                             # (1024,)
+
+    tokens = tokenize(row)          # (TOKENS_LINEAR,)
+    recon_row = detokenize(tokens)  # (1024,)
+
+    # Compute reconstruction error
+    orig = row.cpu().numpy().astype(np.float32).reshape(32, 32)
+    recon = recon_row.cpu().numpy().reshape(32, 32).astype(np.float32)
+    max_err = np.abs(orig - recon).max()
+    print("max abs reconstruction error:", max_err)
+
+    # Prepare for display
+    orig_u8 = orig.clip(0, 255).astype(np.uint8)
+    recon_u8 = recon.clip(0, 255).astype(np.uint8)
+
+    img = Image.fromarray(orig_u8, mode="L")
+    recon_img = Image.fromarray(recon_u8, mode="L")
+
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+
+    axes[0].imshow(img, cmap="gray", vmin=0, vmax=255)
+    axes[0].axis("off")
+    axes[0].set_title("Original")
+
+    axes[1].imshow(recon_img, cmap="gray", vmin=0, vmax=255)
+    axes[1].axis("off")
+    axes[1].set_title("Reconstruction")
+
+    plt.tight_layout()
+    plt.show()

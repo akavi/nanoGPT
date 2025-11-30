@@ -42,6 +42,8 @@ class MoL(nn.Module):
         # output head: [mix_logits K | means K | log_scales K] = 3K per step
         self.lm_head = nn.Linear(config.n_embd, 3 * config.n_mix, bias=config.bias)
 
+        self.scale = nn.Parameter(torch.tensor(1.0)) 
+
         self.apply(self._init_weights)
         # print parameter count
         n_params = sum(p.numel() for p in self.parameters())
@@ -76,6 +78,8 @@ class MoL(nn.Module):
         h_out = self.ln_f(h_out)
         y = self.lm_head(h_out)                                      # [B,T,3K]
         mix_logits, mu, log_s = torch.split(y, self.n_mix, dim=-1)
+        mu = mu * self.scale
+        print("SCALE FACTOR", self.scale)
 
         if targets is not None:
             # continuous NLL of mixture of logistics
