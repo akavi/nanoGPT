@@ -16,7 +16,7 @@ from utils import (
     OptimizerConfig,
     DataConfig,
     debug_one_image,
-    get_fixed_batch as get_config_batch,
+    get_fixed_batch,
     get_raw_rows,
     get_sampled_batch,
     plot_log_token_position_means,
@@ -249,7 +249,7 @@ def tokenize(arr: torch.Tensor) -> torch.Tensor:
     coeffs_shifted = np.fft.fftshift(coeffs, axes=(0,))
 
     # Rasterize in Chebyshev shell order and scale by frequency
-    flat = _rasterize_shell_rfft_scaled(coeffs_shifted)
+    flat = _rasterize_shell_rfft_scaled(coeffs_shifted) ) ** (1/3)
 
     # Back to torch
     return torch.from_numpy(flat).to(torch.float32)
@@ -267,7 +267,7 @@ def detokenize(tokens: torch.Tensor) -> torch.Tensor:
     Output:
         1D float32 tensor of length H*W with reconstructed image.
     """
-    coeffs_flat = tokens.detach().cpu().numpy().astype(np.float32)
+    coeffs_flat = tokens.detach().cpu().numpy().astype(np.float32) ** 3
     expected = TOKENS_LINEAR
     assert coeffs_flat.ndim == 1 and coeffs_flat.size == expected, \
         f"actual dim={coeffs_flat.ndim}, actual size={coeffs_flat.size}, expected={expected}"
@@ -288,7 +288,7 @@ def detokenize(tokens: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(img.reshape(H * W))
 
 def get_batch(split, batch_size):
-    rows = get_config_batch(
+    rows = get_fixed_batch(
         split,
         batch_size,
         DataConfig(
@@ -306,6 +306,7 @@ def get_batch(split, batch_size):
     x_out = torch.cat([first_col, tokens[:,:-1]], dim=1)
     y_out = tokens
     return x_out, y_out
+
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
@@ -336,6 +337,7 @@ train_config = TrainConfig(
     compile=False,
 )
 
+"""
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
@@ -364,7 +366,7 @@ else:
     sample_config = SampleConfig(
         num_samples=10,
         max_new_tokens=1088,
-        temperature=0.8,
+        temperature=1,
         seed=1337,
         device=overridable['device'],
         compile=False,
@@ -376,3 +378,18 @@ else:
         detokenize=detokenize_and_save,
         config=sample_config,
     )
+"""
+view_roundtrip(
+        get_batch=lambda: get_fixed_batch(
+        "train",
+        128,
+        DataConfig(
+            dataset=overridable['dataset'],
+            device=overridable['device'],
+        ),
+    ),
+        tokenize=tokenize,
+        detokenize=detokenize,
+)
+
+plot_log_token_position_means(

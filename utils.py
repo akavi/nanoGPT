@@ -351,15 +351,35 @@ def plot_log_token_position_means(
         # (num_samples, TOKENS_PER_ROW)
         tokens = torch.stack([tokenize(row) for row in rows], dim=0).float()
         mean_per_pos_log = tokens.mean(dim=0).cpu().numpy()
+        max_per_pos_log = tokens.max(dim=0).values.cpu().numpy()
+        min_per_pos_log = tokens.min(dim=0).values.cpu().numpy()
 
     _, N = tokens.shape
     positions = np.arange(N)
+    print(max_per_pos_log)
+    print(min_per_pos_log)
 
     plt.figure(figsize=(10, 4))
     plt.plot(positions, mean_per_pos_log)
     plt.xlabel("Token position")
     plt.ylabel("Average value")
-    plt.title(f"Mean log token value per position over {N} samples")
+    plt.title(f"Mean token value per position over {N} samples")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(positions, max_per_pos_log)
+    plt.xlabel("Token position")
+    plt.ylabel("Max value")
+    plt.title(f"Max token value per position over {N} samples")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(positions, min_per_pos_log)
+    plt.xlabel("Token position")
+    plt.ylabel("Min value")
+    plt.title(f"Min token value per position over {N} samples")
     plt.tight_layout()
     plt.show()
 
