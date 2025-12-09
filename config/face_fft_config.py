@@ -6,6 +6,7 @@ from PIL import Image
 import torch
 import math
 import os
+import functools
 
 from models.model import ModuleList
 from models.mol import MoLConfig, MoL
@@ -111,30 +112,6 @@ BOS_ID=0
 
 # ---------- helpers: shell ordering + frequencies ----------
 
-def _chebyshev_shell_indices(h: int, w_rfft: int) -> List[Tuple[int, int]]:
-    """
-    Return (i, j) indices for an h x w_rfft grid ordered by
-    Chebyshev distance from the center (cy = h//2, cx = 0),
-    then by squared Euclidean distance, then by (i, j).
-
-    This gives a deterministic "spiral-ish" ordering outward
-    from DC after fftshift on axis 0 only.
-    """
-    cy, cx = h // 2, 0  # DC index after fftshift along axis 0
-    coords = [(i, j) for i in range(h) for j in range(w_rfft)]
-
-    def key(ij: Tuple[int, int]):
-        i, j = ij
-        ky = i - cy      # vertical frequency index (can be negative)
-        kx = j           # horizontal frequency index, rfft: kx >= 0
-        r_inf = max(abs(ky), abs(kx))      # Chebyshev radius
-        r2 = ky * ky + kx * kx             # Euclidean radius^2 (tie-breaker)
-        return (r_inf, r2, i, j)
-
-    coords.sort(key=key)
-    return coords
-
-
 def _frequency(i: int, j: int, h: int) -> float:
     """
     Euclidean frequency magnitude for index (i, j) in the
@@ -217,6 +194,60 @@ def _derasterize_shell_rfft_scaled(flat: np.ndarray, h: int, w: int) -> np.ndarr
 
 # ---------- main API: tokenize / detokenize ----------
 
+def _chebyshev_shell_indices(h: int, w_rfft: int):
+    """
+    Returns (i, j) indices for rfft2 spectrum in Chebyshev-shell order
+    with DC at (h//2, 0). Should match what `_rasterize_shell_rfft_scaled`
+    is using.
+    """
+    cy, cx = h // 2, 0
+    coords = [(i, j) for i in range(h) for j in range(w_rfft)]
+
+    def key(ij):
+        i, j = ij
+        dy = i - cy
+        dx = j - cx
+        r_inf = max(abs(dy), abs(dx))
+        r2 = dy * dy + dx * dx
+        return (r_inf, r2, i, j)
+
+    coords.sort(key=key)
+    return coords
+
+
+@functools.lru_cache(maxsize=1)
+def _token_frequency_vector() -> torch.Tensor:
+    """
+    Precompute a length-TOKENS_LINEAR vector giving the frequency magnitude
+    for each token position, in the same ordering as the Chebyshev-shell
+    rasterization with Re/Im interleaving.
+
+    We treat frequencies as:
+        fy = (i - H//2) / H         (after fftshift along axis 0)
+        fx = j / W                  (rfft frequencies 0..W/2 mapped to 0..1/2)
+    and use Euclidean magnitude sqrt(fx^2 + fy^2).
+    """
+    indices = _chebyshev_shell_indices(H, W_RFFT)
+    freqs: list[float] = []
+
+    for (i, j) in indices:
+        dy = i - H // 2
+        fy = dy / H
+        fx = j / W
+        mag = float(np.sqrt(fx * fx + fy * fy))
+
+        # We have Re / Im interleaving, so the same frequency applies to both
+        freqs.append(mag)
+        freqs.append(mag)
+
+    freq_arr = np.asarray(freqs, dtype=np.float32)
+    assert freq_arr.shape[0] == TOKENS_LINEAR, (
+        f"freq_arr length {freq_arr.shape[0]} != TOKENS_LINEAR {TOKENS_LINEAR}"
+    )
+
+    return torch.from_numpy(freq_arr)  # (TOKENS_LINEAR,)
+
+
 def tokenize(arr: torch.Tensor) -> torch.Tensor:
     """
     Input:
@@ -249,7 +280,7 @@ def tokenize(arr: torch.Tensor) -> torch.Tensor:
     coeffs_shifted = np.fft.fftshift(coeffs, axes=(0,))
 
     # Rasterize in Chebyshev shell order and scale by frequency
-    flat = _rasterize_shell_rfft_scaled(coeffs_shifted) ) ** (1/3)
+    flat = _rasterize_shell_rfft_scaled(coeffs_shifted)
 
     # Back to torch
     return torch.from_numpy(flat).to(torch.float32)
@@ -267,7 +298,7 @@ def detokenize(tokens: torch.Tensor) -> torch.Tensor:
     Output:
         1D float32 tensor of length H*W with reconstructed image.
     """
-    coeffs_flat = tokens.detach().cpu().numpy().astype(np.float32) ** 3
+    coeffs_flat = tokens.detach().cpu().numpy().astype(np.float32)
     expected = TOKENS_LINEAR
     assert coeffs_flat.ndim == 1 and coeffs_flat.size == expected, \
         f"actual dim={coeffs_flat.ndim}, actual size={coeffs_flat.size}, expected={expected}"
@@ -287,6 +318,7 @@ def detokenize(tokens: torch.Tensor) -> torch.Tensor:
     # Flatten back to 1D
     return torch.from_numpy(img.reshape(H * W))
 
+
 def get_batch(split, batch_size):
     rows = get_fixed_batch(
         split,
@@ -296,17 +328,38 @@ def get_batch(split, batch_size):
             device=overridable['device'],
         ),
     )
+
+    # (B, TOKENS_LINEAR), float32
     tokens = torch.stack(
         [tokenize(row) for row in rows],
         dim=0,
-    ).to(overridable['device'])              # (B, TOKENS_PER_ROW), float32
+    ).to(overridable['device'])
 
-    value = BOS_ID
-    first_col = torch.full((batch_size, 1), value, dtype=tokens.dtype, device=tokens.device)
-    x_out = torch.cat([first_col, tokens[:,:-1]], dim=1)
-    y_out = tokens
+    B, N = tokens.shape
+    assert N == TOKENS_LINEAR
+
+    # --- Frequency vector, aligned with the token ordering ---
+    token_freqs = _token_frequency_vector().to(tokens.device)  # (N,)
+    freq_mat = token_freqs.unsqueeze(0).expand(B, -1)          # (B, N)
+
+    # --- Standard AR shifting for values ---
+    value_bos = BOS_ID
+    bos_values = torch.full(
+        (batch_size, 1),
+        value_bos,
+        dtype=tokens.dtype,
+        device=tokens.device,
+    )
+    values_shifted = torch.cat([bos_values, tokens[:, :-1]], dim=1)  # (B, N)
+
+    # x_out now has both value and frequency per position
+    # shape: (B, N, 2) where last dim = [value, freq]
+    x_out = torch.stack([values_shifted, freq_mat], dim=-1)
+
+    # Targets are still just the token values
+    y_out = tokens  # (B, N)
+
     return x_out, y_out
-
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
@@ -337,7 +390,6 @@ train_config = TrainConfig(
     compile=False,
 )
 
-"""
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
@@ -365,7 +417,7 @@ else:
 
     sample_config = SampleConfig(
         num_samples=10,
-        max_new_tokens=1088,
+        schedule=_token_frequency_vector(),
         temperature=1,
         seed=1337,
         device=overridable['device'],
@@ -378,18 +430,3 @@ else:
         detokenize=detokenize_and_save,
         config=sample_config,
     )
-"""
-view_roundtrip(
-        get_batch=lambda: get_fixed_batch(
-        "train",
-        128,
-        DataConfig(
-            dataset=overridable['dataset'],
-            device=overridable['device'],
-        ),
-    ),
-        tokenize=tokenize,
-        detokenize=detokenize,
-)
-
-plot_log_token_position_means(

@@ -354,32 +354,65 @@ def plot_log_token_position_means(
         max_per_pos_log = tokens.max(dim=0).values.cpu().numpy()
         min_per_pos_log = tokens.min(dim=0).values.cpu().numpy()
 
-    _, N = tokens.shape
+    num_samples, N = tokens.shape
     positions = np.arange(N)
-    print(max_per_pos_log)
-    print(min_per_pos_log)
 
+    print("Max per position:", max_per_pos_log)
+    print("Min per position:", min_per_pos_log)
+
+    # --- line of best fit for max/min, excluding first position (index 0) ---
+    pos_excl0 = positions[1:]
+    max_excl0 = max_per_pos_log[1:]
+    min_excl0 = min_per_pos_log[1:]
+
+    # linear fit: y = m * x + b
+    max_m, max_b = np.polyfit(pos_excl0, max_excl0, 1)
+    min_m, min_b = np.polyfit(pos_excl0, min_excl0, 1)
+
+    abs_excl0 = tokens[:, 1:].abs().flatten()
+    print("ABS SHAPE", abs_excl0.shape)
+    abs_pos = np.tile(np.arange(N - 1), (num_samples, 1)).flatten()
+    print("ABS POS SHAPE", abs_pos.shape)
+    abs_m, abs_b = np.polyfit(abs_pos, abs_excl0, 1)
+
+    print(f"Max best-fit line (excluding pos 0): y = {max_m:.6g} * x + {max_b:.6g}")
+    print(f"Min best-fit line (excluding pos 0): y = {min_m:.6g} * x + {min_b:.6g}")
+    print(f"Abs best-fit line (excluding pos 0): y = {abs_m:.6g} * x + {abs_b:.6g}")
+
+    # Fitted values over all positions (you can start at 1 if you prefer)
+    max_fit = max_m * positions + max_b
+    min_fit = min_m * positions + min_b
+    abs_fit = abs_m * abs_pos + abs_b
+
+    # --- mean plot ---
     plt.figure(figsize=(10, 4))
-    plt.plot(positions, mean_per_pos_log)
+    plt.plot(abs_pos, abs_excl0)
     plt.xlabel("Token position")
     plt.ylabel("Average value")
-    plt.title(f"Mean token value per position over {N} samples")
+    plt.title(f"Mean token value per position over {num_samples} samples")
+    plt.plot(abs_pos, abs_fit, linestyle="--", label="Best-fit (max)")
     plt.tight_layout()
     plt.show()
 
+    # --- max plot + best-fit line ---
     plt.figure(figsize=(10, 4))
-    plt.plot(positions, max_per_pos_log)
+    plt.plot(positions, max_per_pos_log, label="Max per position")
+    plt.plot(positions, max_fit, linestyle="--", label="Best-fit (max)")
     plt.xlabel("Token position")
     plt.ylabel("Max value")
-    plt.title(f"Max token value per position over {N} samples")
+    plt.title(f"Max token value per position over {num_samples} samples")
+    plt.legend()
     plt.tight_layout()
     plt.show()
 
+    # --- min plot + best-fit line ---
     plt.figure(figsize=(10, 4))
-    plt.plot(positions, min_per_pos_log)
+    plt.plot(positions, min_per_pos_log, label="Min per position")
+    plt.plot(positions, min_fit, linestyle="--", label="Best-fit (min)")
     plt.xlabel("Token position")
     plt.ylabel("Min value")
-    plt.title(f"Min token value per position over {N} samples")
+    plt.title(f"Min token value per position over {num_samples} samples")
+    plt.legend()
     plt.tight_layout()
     plt.show()
 

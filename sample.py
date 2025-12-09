@@ -10,11 +10,10 @@ from torch import Tensor
 
 @dataclass
 class SampleConfig:
+    schedule: Tensor
     out_dir: str = "out"
     num_samples: int = 10
-    max_new_tokens: int = 500
     temperature: float = 0.8
-    top_k: int = 200
     seed: int = 1337
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     compile: bool = False 
@@ -80,7 +79,7 @@ def sample(
                 state = model.initial_state(1)
                 y = model.generate(
                     x,
-                    config.max_new_tokens,
+                    config.schedule,
                     state,
                     temperature=config.temperature,
                 )
