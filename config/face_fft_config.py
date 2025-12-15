@@ -4,6 +4,7 @@ from typing import List, Tuple, Any
 import numpy as np
 from PIL import Image
 import torch
+import math
 import os
 
 from models.model import ModuleList
@@ -15,7 +16,7 @@ from utils import (
     OptimizerConfig,
     DataConfig,
     debug_one_image,
-    get_fixed_batch as get_config_batch,
+    get_fixed_batch,
     get_raw_rows,
     get_sampled_batch,
     plot_log_token_position_means,
@@ -43,6 +44,7 @@ overridable = override(sys.argv, {
     "n_embd":384,
     "bias": True,
     "block_size": 1088,
+    "scale_factor": 18,
 })
 
 # -----------------------------------------------------------------------------#
@@ -104,36 +106,71 @@ else:
 # -----------------------------------------------------------------------------#
 
 H, W = 32, 32
-W_RFFT = W // 2 + 1                 # width of rfft2 output
-TOKENS_LINEAR = 2 * H * W_RFFT      # *2 for (real, imag) interleaving
-BOS_ID = 0
+W_RFFT = W // 2 + 1          # width of rfft2 output
+TOKENS_LINEAR = 2 * H * W_RFFT  # *2 for (real, imag) interleaving
+BOS_ID=0
+
+# ---------- helpers: shell ordering + frequencies ----------
 
 def _chebyshev_shell_indices(h: int, w_rfft: int) -> List[Tuple[int, int]]:
-    cy, cx = h // 2, 0
+    """
+    Return (i, j) indices for an h x w_rfft grid ordered by
+    Chebyshev distance from the center (cy = h//2, cx = 0),
+    then by squared Euclidean distance, then by (i, j).
 
+    This gives a deterministic "spiral-ish" ordering outward
+    from DC after fftshift on axis 0 only.
+    """
+    cy, cx = h // 2, 0  # DC index after fftshift along axis 0
     coords = [(i, j) for i in range(h) for j in range(w_rfft)]
 
     def key(ij: Tuple[int, int]):
         i, j = ij
-        dy = i - cy
-        dx = j - cx
-        r_inf = max(abs(dy), abs(dx))   # Chebyshev "radius"
-        r2 = dy * dy + dx * dx         # tie-breaker using Euclidean radius
+        ky = i - cy      # vertical frequency index (can be negative)
+        kx = j           # horizontal frequency index, rfft: kx >= 0
+        r_inf = max(abs(ky), abs(kx))      # Chebyshev radius
+        r2 = ky * ky + kx * kx             # Euclidean radius^2 (tie-breaker)
         return (r_inf, r2, i, j)
 
     coords.sort(key=key)
     return coords
 
 
-def _rasterize_shell_rfft(coeffs: np.ndarray) -> np.ndarray:
-    assert coeffs.shape == (H, W_RFFT), f"expected {(H, W_RFFT)}, got {coeffs.shape}"
+def _frequency(i: int, j: int, h: int) -> float:
+    """
+    Euclidean frequency magnitude for index (i, j) in the
+    rfft half-plane after fftshift along axis 0 only.
+    """
+    cy = h // 2
+    ky = i - cy   # vertical frequency index
+    kx = j        # horizontal frequency index (>= 0)
+    return math.sqrt(ky * ky + kx * kx)
+
+
+def _rasterize_shell_rfft_scaled(coeffs_shifted: np.ndarray) -> np.ndarray:
+    """
+    coeffs_shifted: complex array, shape (H, W_RFFT), after fftshift on axis=0.
+
+    Returns:
+        flat: float32 1D array of length TOKENS_LINEAR
+              with Re/Im interleaved, AFTER scaling each
+              coefficient by its frequency magnitude.
+    """
+    assert coeffs_shifted.shape == (H, W_RFFT), \
+        f"expected {(H, W_RFFT)}, got {coeffs_shifted.shape}"
 
     flat = np.empty(TOKENS_LINEAR, dtype=np.float32)
     idxs = _chebyshev_shell_indices(H, W_RFFT)
 
     k = 0
     for i, j in idxs:
-        c = coeffs[i, j]
+        c = coeffs_shifted[i, j]
+        freq = _frequency(i, j, H)
+
+        # multiply by frequency; leave DC (freq == 0) unscaled
+        if freq != 0.0:
+            c = c * freq
+
         flat[k] = c.real
         flat[k + 1] = c.imag
         k += 2
@@ -141,63 +178,118 @@ def _rasterize_shell_rfft(coeffs: np.ndarray) -> np.ndarray:
     return flat
 
 
-def _derasterize_shell_rfft(flat: np.ndarray, h: int, w: int) -> np.ndarray:
+def _derasterize_shell_rfft_scaled(flat: np.ndarray, h: int, w: int) -> np.ndarray:
+    """
+    flat: 1D float array of length TOKENS_LINEAR
+          containing Re/Im interleaved, each having
+          been multiplied by its frequency magnitude.
+
+    h, w: original spatial image dimensions.
+
+    Returns:
+        coeffs_shifted: complex array, shape (h, w//2 + 1),
+                        after *undoing* the frequency scaling,
+                        still in fftshifted layout along axis 0.
+    """
     w_rfft = w // 2 + 1
     expected = 2 * h * w_rfft
-
     assert flat.ndim == 1 and flat.size == expected, \
         f"expected size {expected}, got {flat.size}"
 
-    coeffs = np.empty((h, w_rfft), dtype=np.complex64)
+    coeffs_shifted = np.empty((h, w_rfft), dtype=np.complex64)
     idxs = _chebyshev_shell_indices(h, w_rfft)
 
     k = 0
     for i, j in idxs:
         re = flat[k]
         im = flat[k + 1]
-        coeffs[i, j] = re + 1j * im
+        c = re + 1j * im
+        freq = _frequency(i, j, h)
+
+        # undo frequency scaling; leave DC unscaled
+        if freq != 0.0:
+            c = c / freq
+
+        coeffs_shifted[i, j] = c
         k += 2
 
-    return coeffs
+    return coeffs_shifted
 
+
+# ---------- main API: tokenize / detokenize ----------
 
 def tokenize(arr: torch.Tensor) -> torch.Tensor:
+    """
+    Input:
+        arr: torch.Tensor, either shape (H*W,) or (H, W).
+             Values are interpreted as a real image.
+
+    Output:
+        1D float32 tensor of length TOKENS_LINEAR containing
+        rfft2 coefficients (after fftshift on axis 0),
+        Chebyshev-shell rasterized, with Re/Im interleaved,
+        and each coefficient multiplied by its frequency magnitude.
+    """
+    # Move to numpy
     pixels = arr.detach().cpu().numpy()
 
+    # Ensure shape (H, W)
     if pixels.ndim == 1:
         assert pixels.size == H * W, f"expected {H*W}, got {pixels.size}"
         pixels = pixels.reshape(H, W)
     else:
         assert pixels.shape == (H, W), f"expected {(H, W)}, got {pixels.shape}"
 
+    # Use float for FFT
     img = pixels.astype(np.float32)
-    coeffs = np.fft.rfft2(img)
+
+    # Forward real FFT: (H, W) -> (H, W_RFFT)
+    coeffs = np.fft.rfft2(img)  # complex64/complex128
+
+    # Shift only along axis 0 so DC goes to (H//2, 0)
     coeffs_shifted = np.fft.fftshift(coeffs, axes=(0,))
-    flat = _rasterize_shell_rfft(coeffs_shifted)
-    N, = flat.shape
-    idx = torch.arange(1, N + 1, device=flat.device).cpu().numpy()   # [1, 2, ..., N]
-    flat = flat * idx / 2**18
+
+    # Rasterize in Chebyshev shell order and scale by frequency
+    flat = _rasterize_shell_rfft_scaled(coeffs_shifted)  / (2.0**overridable['scale_factor'])
+
+    # Back to torch
     return torch.from_numpy(flat).to(torch.float32)
 
 
 def detokenize(tokens: torch.Tensor) -> torch.Tensor:
-    coeffs_flat = tokens.detach().cpu().numpy().astype(np.float32)
+    """
+    Input:
+        tokens: 1D float tensor of length TOKENS_LINEAR.
 
+        Tokens are assumed to come from `tokenize`, i.e.,
+        Chebyshev-shell rasterized rfft2 coefficients with
+        Re/Im interleaved and multiplied by frequency magnitude.
+
+    Output:
+        1D float32 tensor of length H*W with reconstructed image.
+    """
+    coeffs_flat = tokens.detach().cpu().numpy().astype(np.float32) * (2.0**overridable['scale_factor'])
     expected = TOKENS_LINEAR
     assert coeffs_flat.ndim == 1 and coeffs_flat.size == expected, \
         f"actual dim={coeffs_flat.ndim}, actual size={coeffs_flat.size}, expected={expected}"
-    N, = coeffs_flat.shape
-    idx = torch.arange(1, N + 1, device="cpu").numpy()   # [1, 2, ..., N]
-    coeffs_flat = coeffs_flat / idx * 2**18
-    coeffs_shifted = _derasterize_shell_rfft(coeffs_flat, H, W)
+
+    # Recover shifted complex spectrum and undo frequency scaling
+    coeffs_shifted = _derasterize_shell_rfft_scaled(coeffs_flat, H, W)
+
+    # Undo fftshift along axis 0
     coeffs = np.fft.ifftshift(coeffs_shifted, axes=(0,))
-    img = np.fft.irfft2(coeffs, s=(H, W))   # real-valued float64
-    pixels = img.astype(np.float32)
-    print("DETOK SHAPE", pixels.shape)
-    return torch.from_numpy(pixels.reshape(H * W))
+
+    # Inverse real FFT back to spatial domain
+    img = np.fft.irfft2(coeffs, s=(H, W))  # shape (H, W), real
+
+    # Keep as float32 to avoid extra quantization
+    img = img.astype(np.float32)
+
+    # Flatten back to 1D
+    return torch.from_numpy(img.reshape(H * W))
 
 def get_batch(split, batch_size):
-    rows = get_config_batch(
+    rows = get_fixed_batch(
         split,
         batch_size,
         DataConfig(
@@ -215,6 +307,7 @@ def get_batch(split, batch_size):
     x_out = torch.cat([first_col, tokens[:,:-1]], dim=1)
     y_out = tokens
     return x_out, y_out
+
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
@@ -245,6 +338,7 @@ train_config = TrainConfig(
     compile=False,
 )
 
+"""
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
@@ -273,7 +367,7 @@ else:
     sample_config = SampleConfig(
         num_samples=10,
         max_new_tokens=1088,
-        temperature=0.8,
+        temperature=1,
         seed=1337,
         device=overridable['device'],
         compile=False,
@@ -285,3 +379,18 @@ else:
         detokenize=detokenize_and_save,
         config=sample_config,
     )
+"""
+view_roundtrip(
+        get_batch=lambda: get_fixed_batch(
+        "train",
+        128,
+        DataConfig(
+            dataset=overridable['dataset'],
+            device=overridable['device'],
+        ),
+    ),
+        tokenize=tokenize,
+        detokenize=detokenize,
+)
+
+plot_log_token_position_means(
