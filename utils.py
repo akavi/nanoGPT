@@ -350,7 +350,7 @@ def plot_log_token_position_means(
     with torch.no_grad():
         # (num_samples, TOKENS_PER_ROW)
         tokens = torch.stack([tokenize(row) for row in rows], dim=0).float()
-        mean_per_pos_log = tokens.mean(dim=0).cpu().numpy()
+        mean_per_pos_log = tokens.abs().max(dim=0).values.cpu().numpy()
 
     _, N = tokens.shape
     positions = np.arange(N)

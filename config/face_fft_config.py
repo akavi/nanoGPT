@@ -41,10 +41,12 @@ overridable = override(sys.argv, {
     "learning_rate":3e-5,
     "min_lr":3e-6,
     "n_layer": 10,
-    "n_embd":384,
+    "n_embd":512,
     "bias": True,
     "block_size": 1088,
-    "scale_factor": 18,
+    "scale_factor": 14,
+    "max_iters": 5000,
+    "n_mix": 10,
 })
 
 # -----------------------------------------------------------------------------#
@@ -71,7 +73,7 @@ for i in range(overridable['n_layer'])])
 model = MoL(MoLConfig(
     n_block=overridable['block_size'],
     n_embd=overridable['n_embd'],
-    n_mix=10,
+    n_mix=overridable['n_mix'],
     bias=overridable['bias'],
     dropout=0.05,
 ), backbone)
@@ -169,7 +171,9 @@ def _rasterize_shell_rfft_scaled(coeffs_shifted: np.ndarray) -> np.ndarray:
 
         # multiply by frequency; leave DC (freq == 0) unscaled
         if freq != 0.0:
-            c = c * freq
+            c = c * freq  / (2.0**overridable['scale_factor'])
+        else:
+            c = c  / (2.0**overridable['scale_factor'] * 3)
 
         flat[k] = c.real
         flat[k + 1] = c.imag
@@ -208,7 +212,9 @@ def _derasterize_shell_rfft_scaled(flat: np.ndarray, h: int, w: int) -> np.ndarr
 
         # undo frequency scaling; leave DC unscaled
         if freq != 0.0:
-            c = c / freq
+            c = c  / freq * (2.0**overridable['scale_factor'])
+        else:
+            c = c  * (2.0**overridable['scale_factor'] * 3)
 
         coeffs_shifted[i, j] = c
         k += 2
@@ -250,7 +256,7 @@ def tokenize(arr: torch.Tensor) -> torch.Tensor:
     coeffs_shifted = np.fft.fftshift(coeffs, axes=(0,))
 
     # Rasterize in Chebyshev shell order and scale by frequency
-    flat = _rasterize_shell_rfft_scaled(coeffs_shifted)  / (2.0**overridable['scale_factor'])
+    flat = np.tanh(_rasterize_shell_rfft_scaled(coeffs_shifted))
 
     # Back to torch
     return torch.from_numpy(flat).to(torch.float32)
@@ -268,7 +274,7 @@ def detokenize(tokens: torch.Tensor) -> torch.Tensor:
     Output:
         1D float32 tensor of length H*W with reconstructed image.
     """
-    coeffs_flat = tokens.detach().cpu().numpy().astype(np.float32) * (2.0**overridable['scale_factor'])
+    coeffs_flat = np.arctanh(tokens.detach().cpu().numpy().astype(np.float32))
     expected = TOKENS_LINEAR
     assert coeffs_flat.ndim == 1 and coeffs_flat.size == expected, \
         f"actual dim={coeffs_flat.ndim}, actual size={coeffs_flat.size}, expected={expected}"
@@ -330,7 +336,7 @@ train_config = TrainConfig(
     eval_interval=250,
     eval_iters=20,
     warmup_iters=300,
-    max_iters=3000,
+    max_iters=overridable['max_iters'],
 
     log_interval=1,
     always_save_checkpoint=True,
@@ -338,7 +344,6 @@ train_config = TrainConfig(
     compile=False,
 )
 
-"""
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
@@ -379,18 +384,3 @@ else:
         detokenize=detokenize_and_save,
         config=sample_config,
     )
-"""
-view_roundtrip(
-        get_batch=lambda: get_fixed_batch(
-        "train",
-        128,
-        DataConfig(
-            dataset=overridable['dataset'],
-            device=overridable['device'],
-        ),
-    ),
-        tokenize=tokenize,
-        detokenize=detokenize,
-)
-
-plot_log_token_position_means(

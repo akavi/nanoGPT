@@ -4,6 +4,8 @@ import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
+import numpy as np
+import matplotlib.pyplot as plt 
 
 import torch
 from torch import Tensor
@@ -74,6 +76,9 @@ def sample(
         model = torch.compile(model)
 
     x = init_gen(config.device)  # [1, T]
+
+    samples = []
+
     with torch.no_grad():
         with ctx:
             for k in range(config.num_samples):
@@ -83,5 +88,17 @@ def sample(
                     config.max_new_tokens,
                     state,
                     temperature=config.temperature,
-                )
-                detokenize(y[0], str(k))
+                )  # expect shape [1, T] (or similar)
+
+                y0 = y[0]  # [T]
+                samples.append(y0.detach().cpu())
+                detokenize(y0, str(k))
+
+    # [K, T]
+    samples_t = torch.stack(samples, dim=0).float()
+
+    # per-position std over samples -> [T]
+    std_per_pos = samples_t.std(dim=0, unbiased=False)
+
+    n = 1088
+    print(std_per_pos[:n].tolist())

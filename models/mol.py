@@ -48,7 +48,6 @@ class MoL(nn.Module):
         self.apply(self._init_weights)
         # print parameter count
         n_params = sum(p.numel() for p in self.parameters())
-        print(f"number of parameters: {n_params/1e6:.2f}M")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -58,85 +57,74 @@ class MoL(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x_cont: Tensor, state, targets: Tensor | None = None):
+    def forward(self, y_obs: torch.Tensor, state, targets: torch.Tensor | None = None):
         """
-        x_cont:  [B, T] real-valued previous tokens
-        targets: [B, T] real-valued next-token targets (aligned with x_cont positions)
-        Returns:
-          params tuple for last step if targets is None (inference), else full-step loss.
+        y_obs: [B,T] observed *bounded* tokens in (-1,1).
+        targets: if provided, also in (-1,1); train via change-of-variables to latent z.
         """
-        device = x_cont.device
-        B, T = x_cont.shape
-        assert T <= self.n_block, f"seq len {T} > block size {self.n_block}"
+        device = y_obs.device
+        B, T = y_obs.shape
+        assert T <= self.n_block
 
-        pos = torch.arange(0, T, dtype=torch.long, device=device)    # [T]
-        # value embedding
-        tok_emb = self.vte(x_cont.unsqueeze(-1))                     # [B,T,n_embd]
-        pos_emb = self.wpe(pos).unsqueeze(0).expand(B, T, -1)        # [B,T,n_embd]
+        pos = torch.arange(0, T, dtype=torch.long, device=device)
+        # value embedding works on the observed y (bounded); you can embed z instead if you prefer.
+        tok_emb = self.vte(y_obs.unsqueeze(-1))
+        pos_emb = self.wpe(pos).unsqueeze(0).expand(B, T, -1)
         h_in = self.drop(tok_emb + pos_emb)
 
-        h_out, state = self.backbone(h_in, state)                    # [B,T,n_embd], state
+        h_out, state = self.backbone(h_in, state)
         h_out = self.ln_f(h_out)
-        y = self.lm_head(h_out)                                      # [B,T,3K]
-        mix_logits, mu, log_s = torch.split(y, self.n_mix, dim=-1)
-
-        scale_0 = self.scale_0.expand(B, 1)
-        scale_rest = self.scale_rest.expand(B, T - 1)
-        scale = torch.cat([scale_0, scale_rest], dim=1)
-
-        mu = mu * self.scale
-        print("SCALE FACTOR", float(self.scale_0.detach()), float(self.scale_rest.detach()))
+        y_params = self.lm_head(h_out)                     # [B,T,3K]
+        mix_logits, mu, log_s = _pack_params(self.n_mix, y_params)
 
         if targets is not None:
-            # continuous NLL of mixture of logistics
-            logp = mixture_loglik(targets, mix_logits, mu, log_s)    # [B,T]
-            loss_tok = -logp                                          # per-token loss
+            # map bounded targets y -> latent z via atanh, and add log|det J|
+            z_targets = atanh_safe(targets)                # [B,T]
+            logp_z = mixture_loglik(z_targets, mix_logits, mu, log_s)  # [B,T]
+            log_det = log_abs_det_jacobian_tanh_from_y(targets)        # [B,T]
+            logp_y = logp_z + log_det
+            loss_tok = -logp_y
             loss = loss_tok.mean()
             return (mix_logits, mu, log_s), state, loss
         else:
-            # inference: return only last-step params for efficiency
-            mix_logits = mix_logits[:, [-1], :]                      # [B,1,K]
-            mu         = mu[:,       [-1], :]                        # [B,1,K]
-            log_s      = log_s[:,    [-1], :]                        # [B,1,K]
-            return (mix_logits, mu, log_s), state, None
+            # inference-time: return only last-step params
+            return (mix_logits[:, [-1], :],
+                    mu[:,       [-1], :],
+                    log_s[:,    [-1], :]), state, None
+
 
     @torch.no_grad()
-    def generate(self,
-                 x_prefix: Tensor,
-                 max_new_tokens: int,
-                 state,
-                 temperature: float = 1.0) -> Tensor:
+    def generate(self, y_prefix: torch.Tensor, max_new_tokens: int, state,
+                 temperature: float = 1.0) -> torch.Tensor:
         """
-        Autoregressively sample continuous tokens.
-        x_prefix: [B, T0] seed sequence (can be empty T0=0 with a learned BOS if you add one)
-        Returns concatenated sequence [B, T0 + max_new_tokens].
-        Temperature scales *component scales*; 1.0 = nominal, >1.0 = more spread.
+        y_prefix: [B,T0] in (-1,1). We sample latent z from the MoL, then squash with tanh to (-1,1).
         """
-        x = x_prefix
+        y = y_prefix
         for _ in range(max_new_tokens):
-            x_cond = x if x.size(1) <= self.n_block else x[:, -self.n_block:]
-            (mix_logits, mu, log_s), state, _ = self(x_cond, state, targets=None)
-            # shapes [B,1,K]
-            mix_logits = mix_logits[:, -1, :] / 1.0                   # you could divide by a "mixture temp" if desired
-            pi = F.softmax(mix_logits, dim=-1)                        # [B,K]
+            y_cond = y if y.size(1) <= self.n_block else y[:, -self.n_block:]
+            (mix_logits, mu, log_s), state, _ = self(y_cond, state, targets=None)
 
-            # sample mixture indices
-            k = torch.distributions.Categorical(pi).sample()          # [B]
-            k_onehot = F.one_hot(k, num_classes=pi.size(-1)).float()  # [B,K]
+            # mixture weights (optionally sharpen/flatten)
+            pi = torch.softmax(mix_logits[:, -1, :], dim=-1)             # [B,K]
+            k = torch.distributions.Categorical(pi).sample()             # [B]
+            onehot = F.one_hot(k, num_classes=pi.size(-1)).float()
 
-            # select component params
-            mu_k    = (mu[:, -1, :]    * k_onehot).sum(dim=-1)        # [B]
-            log_s_k = (log_s[:, -1, :] * k_onehot).sum(dim=-1)        # [B]
+            mu_k    = (mu[:, -1, :]    * onehot).sum(-1)                 # [B]
+            log_s_k = (log_s[:, -1, :] * onehot).sum(-1)                 # [B]
 
-            # temperature on scale
+            # temperature as scale multiplier in latent space
+            s_k = F.softplus(log_s_k) + 1e-8
             if temperature != 1.0:
-                # equivalent to multiplying s by temperature
-                log_s_k = torch.log(F.softplus(log_s_k) * temperature + 1e-8)
+                s_k = s_k * temperature
 
-            x_next = sample_logistic(mu_k, log_s_k)                   # [B]
-            x = torch.cat([x, x_next.unsqueeze(1)], dim=1)            # [B, T+1]
+            # sample latent z from Logistic(mu_k, s_k)
+            u = torch.rand_like(mu_k).clamp_(1e-6, 1 - 1e-6)
+            z_next = mu_k + s_k * (torch.log(u) - torch.log1p(-u))       # [B]
 
-        return x
+            # squash to (-1,1)
+            y_next = torch.tanh(z_next)
+            y = torch.cat([y, y_next.unsqueeze(1)], dim=1)
+        return y
 
     def initial_state(self, batch_size):
         return self.backbone.initial_state(batch_size)
@@ -163,3 +151,21 @@ def sample_logistic(mu: Tensor, log_s: Tensor) -> Tensor:
     s = F.softplus(log_s) + 1e-8
     return mu + s * (torch.log(u) - torch.log1p(-u))  # logit(u)
 
+def atanh_safe(y: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # keep y strictly inside (-1, 1) to avoid infinities
+    y = y.clamp(-1 + eps, 1 - eps)
+    return 0.5 * (torch.log1p(y) - torch.log1p(-y))  # atanh(y)
+
+def log_abs_det_jacobian_tanh_from_y(y: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # z = atanh(y); dz/dy = 1 / (1 - y^2)
+    return -torch.log1p(-y.mul(y)).clamp_min(eps)  # -log(1 - y^2)
+
+def _pack_params(n_mix: int, y: Tensor):
+    """
+    y: [B,T,3K] -> mix_logits [B,T,K], mu [B,T,K], log_s [B,T,K]
+    """
+    B, T, C = y.shape
+    K = n_mix
+    assert C == 3 * K
+    mix_logits, mu, log_s = torch.split(y, K, dim=-1)
+    return mix_logits, mu, log_s
