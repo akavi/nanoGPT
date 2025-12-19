@@ -57,40 +57,63 @@ class MoL(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, y_obs: torch.Tensor, state, targets: torch.Tensor | None = None):
+    def forward(
+        self,
+        y_obs: torch.Tensor,
+        state,
+        targets: torch.Tensor | None = None,
+    ):
         """
-        y_obs: [B,T] observed *bounded* tokens in (-1,1).
-        targets: if provided, also in (-1,1); train via change-of-variables to latent z.
+        y_obs:    [B,T] observed *bounded* tokens in (-1,1).
+        targets:  if provided, [B,T,2] where:
+                  - targets[..., 0] are bounded y in (-1,1)
+                  - targets[..., 1] are frequencies (>= 0), used to reweight loss
         """
         device = y_obs.device
         B, T = y_obs.shape
         assert T <= self.n_block
 
         pos = torch.arange(0, T, dtype=torch.long, device=device)
-        # value embedding works on the observed y (bounded); you can embed z instead if you prefer.
         tok_emb = self.vte(y_obs.unsqueeze(-1))
         pos_emb = self.wpe(pos).unsqueeze(0).expand(B, T, -1)
         h_in = self.drop(tok_emb + pos_emb)
 
         h_out, state = self.backbone(h_in, state)
         h_out = self.ln_f(h_out)
-        y_params = self.lm_head(h_out)                     # [B,T,3K]
+        y_params = self.lm_head(h_out)  # [B,T,3K]
         mix_logits, mu, log_s = _pack_params(self.n_mix, y_params)
 
         if targets is not None:
+            # 1) accept targets as [B,T,2]
+            assert targets.ndim == 3 and targets.shape[:2] == (B, T) and targets.shape[2] == 2, \
+                f"expected targets [B,T,2], got {tuple(targets.shape)}"
+
+            # 2) compute loss using targets[:,:,0]
+            y_targets = targets[:, :, 0]  # [B,T]
+            # (Note: .squeeze() here can silently drop B or T when they equal 1; avoid unless you truly want that.)
+            # y_targets = targets[:, :, 0].squeeze()
+
             # map bounded targets y -> latent z via atanh, and add log|det J|
-            z_targets = atanh_safe(targets)                # [B,T]
+            z_targets = atanh_safe(y_targets)  # [B,T]
             logp_z = mixture_loglik(z_targets, mix_logits, mu, log_s)  # [B,T]
-            log_det = log_abs_det_jacobian_tanh_from_y(targets)        # [B,T]
+            log_det = log_abs_det_jacobian_tanh_from_y(y_targets)      # [B,T]
             logp_y = logp_z + log_det
-            loss_tok = -logp_y
+            loss_tok = -logp_y  # [B,T]
+
+            # 3) reweight by inverse log frequency: 1 / log(1 + freq)
+            freq = targets[:, :, 1]  # [B,T]
+            weight = 1.0 / (1.0 + torch.log1p(freq))
+            loss_tok = loss_tok * weight
+
             loss = loss_tok.mean()
             return (mix_logits, mu, log_s), state, loss
         else:
             # inference-time: return only last-step params
-            return (mix_logits[:, [-1], :],
-                    mu[:,       [-1], :],
-                    log_s[:,    [-1], :]), state, None
+            return (
+                mix_logits[:, [-1], :],
+                mu[:,       [-1], :],
+                log_s[:,    [-1], :],
+            ), state, None
 
 
     @torch.no_grad()

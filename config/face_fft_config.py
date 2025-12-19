@@ -145,6 +145,7 @@ def _frequency(i: int, j: int, h: int) -> float:
     """
     cy = h // 2
     ky = i - cy   # vertical frequency index
+
     kx = j        # horizontal frequency index (>= 0)
     return math.sqrt(ky * ky + kx * kx)
 
@@ -294,6 +295,17 @@ def detokenize(tokens: torch.Tensor) -> torch.Tensor:
     # Flatten back to 1D
     return torch.from_numpy(img.reshape(H * W))
 
+
+# Length TOKENS_LINEAR; freq duplicated for (Re, Im) for each (i, j)
+_FREQS_LINEAR_CPU = torch.tensor(
+    [
+        f
+        for (i, j) in _chebyshev_shell_indices(H, W_RFFT)
+        for f in (_frequency(i, j, H), _frequency(i, j, H))
+    ],
+    dtype=torch.float32,
+)
+
 def get_batch(split, batch_size):
     rows = get_fixed_batch(
         split,
@@ -310,8 +322,13 @@ def get_batch(split, batch_size):
 
     value = BOS_ID
     first_col = torch.full((batch_size, 1), value, dtype=tokens.dtype, device=tokens.device)
-    x_out = torch.cat([first_col, tokens[:,:-1]], dim=1)
-    y_out = tokens
+    x_out = torch.cat([first_col, tokens[:, :-1]], dim=1)  # unchanged: (B, T)
+
+    # Build y_out: (B, T, 2) = (value, freq)
+    freqs = _FREQS_LINEAR_CPU.to(device=tokens.device, dtype=tokens.dtype)  # (T,)
+    freqs_bt = freqs.unsqueeze(0).expand(batch_size, -1)                    # (B, T)
+    y_out = torch.stack([tokens, freqs_bt], dim=-1)                         # (B, T, 2)
+
     return x_out, y_out
 
 

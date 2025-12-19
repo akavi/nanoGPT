@@ -238,7 +238,6 @@ def estimate_loss(
         for i in range(config.eval_iters):
             x, y = get_batch(split, config.batch_size)  # [B, T]
             B, T = x.shape
-
             state = model.initial_state(B)
             with ctx:
                 _, state, loss = model(x, state, y)
