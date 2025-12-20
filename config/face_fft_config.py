@@ -45,7 +45,7 @@ overridable = override(sys.argv, {
     "bias": True,
     "block_size": 1088,
     "scale_factor": 14,
-    "max_iters": 5000,
+    "max_iters": 3000,
     "n_mix": 10,
 })
 

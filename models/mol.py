@@ -102,7 +102,7 @@ class MoL(nn.Module):
 
             # 3) reweight by inverse log frequency: 1 / log(1 + freq)
             freq = targets[:, :, 1]  # [B,T]
-            weight = 1.0 / (1.0 + torch.log1p(freq))
+            weight = 1.0 / (1.0 + freq)
             loss_tok = loss_tok * weight
 
             loss = loss_tok.mean()

@@ -1,5 +1,5 @@
 tmux
-git clone --depth 1 --branch  trainable-scaling https://github.com/akavi/nanoGPT.git
+git clone --depth 1  trainable-scaling https://github.com/akavi/nanoGPT.git
 cd nanoGPT/
 sudo snap install astral-uv --classic
 uv python install 3.13
