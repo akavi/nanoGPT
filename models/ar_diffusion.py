@@ -127,11 +127,11 @@ class ArDiffusion(nn.Module):
             new_diffusion_state = new_x[:, -self.n_step:, :] if seq_dim >= self.n_step else new_x
             return tok_logits, (new_diffusion_state, new_backbone_state), loss
         else: # self.mode == "sample"
-            # Check if we need to prefill (state should be dim 1 for sequence length)
+            assert toks.size(1) == 1, "Sample mode expects a single token"
+
+            # Prefill if needed: build up the initial diffusion state
             if diffusion_state.shape[1] < self.n_step:
-                # Prefill: build up the initial diffusion state
                 # a) Embed the passed token
-                assert toks.size(1) == 1, "Prefill expects a single token"
                 emb_tok = self.wte(toks.squeeze(1))  # (b, n_embd_per_step)
 
                 # b) Create noise progression as in training
@@ -140,25 +140,21 @@ class ArDiffusion(nn.Module):
                 noi_emb_tok = emb_tok.unsqueeze(1) * (1.0 - w) + noise * w  # (b, n_step, n_embd_per_step)
 
                 # c) Initialize diffusion state - will be built up iteratively
-                # Start from the noisiest step and denoise progressively
                 current_state = torch.zeros(b, 0, self.n_embd, device=device)
                 current_backbone_state = backbone_state
 
                 # d) Iteratively denoise from step n_step down to step 1
                 for step_idx in range(self.n_step):
                     # Build the current latent vector by concatenating sub-latents
-                    # The topmost sub-latent is from the current denoising step
                     topmost = noi_emb_tok[:, step_idx, :]  # (b, n_embd_per_step)
 
-                    # Pad with zeros for the remaining sub-latents (or use previous state)
+                    # Pad with zeros or use previous sub-latents from state
                     if step_idx == 0:
-                        # First step: only topmost sub-latent, rest are zeros
                         current_latent = torch.cat([
                             topmost,
                             torch.zeros(b, self.n_embd - self.n_embd_per_step, device=device)
                         ], dim=-1).unsqueeze(1)  # (b, 1, n_embd)
                     else:
-                        # Subsequent steps: use previous sub-latents from state
                         prev_sublatents = current_state[:, -1, self.n_embd_per_step:]  # (b, remaining_embd)
                         padding_needed = self.n_embd - self.n_embd_per_step - prev_sublatents.size(-1)
                         if padding_needed > 0:
@@ -170,54 +166,42 @@ class ArDiffusion(nn.Module):
                             prev_sublatents = prev_sublatents[:, :self.n_embd - self.n_embd_per_step]
                         current_latent = torch.cat([topmost, prev_sublatents], dim=-1).unsqueeze(1)  # (b, 1, n_embd)
 
-                    # Add positional embedding
+                    # Add positional embedding and pass through backbone
                     pos = torch.tensor([step_idx], dtype=torch.long, device=device)
                     emb_pos = self.wpe(pos)  # (1, n_embd)
                     x = self.drop(current_latent + emb_pos)
-
-                    # Pass through backbone
                     new_x, current_backbone_state = self.backbone(x, current_backbone_state)
-
-                    # Append to state
                     current_state = torch.cat([current_state, new_x], dim=1)
 
-                # Update the diffusion state to the last n_step positions
-                new_diffusion_state = current_state[:, -self.n_step:, :]
-                new_backbone_state = current_backbone_state
+                # Update state after prefill
+                diffusion_state = current_state[:, -self.n_step:, :]
+                backbone_state = current_backbone_state
 
-                # Extract topmost sub-latent for logits
-                topmost_latent = new_diffusion_state[:, -1, :self.n_embd_per_step]  # (b, n_embd_per_step)
-                tok_logits = self.lm_head(topmost_latent).unsqueeze(1)  # (b, 1, n_vocab)
+            # Normal generation (always runs, whether we just prefilled or not)
+            # Embed the newest token as the topmost sub-latent
+            emb_tok = self.wte(toks.squeeze(1))  # (b, n_embd_per_step)
 
-                return tok_logits, (new_diffusion_state, new_backbone_state), None
+            # Use previous sub-latents from diffusion state
+            prev_sublatents = diffusion_state[:, -1, self.n_embd_per_step:]  # (b, remaining_embd)
+            current_latent = torch.cat([emb_tok, prev_sublatents], dim=-1).unsqueeze(1)  # (b, 1, n_embd)
 
-            else:
-                # Normal forward pass after prefill
-                # Embed the newest token as the topmost sub-latent
-                assert toks.size(1) == 1, "Sample mode expects a single token"
-                emb_tok = self.wte(toks.squeeze(1))  # (b, n_embd_per_step)
+            # Add positional embedding
+            seq_pos = diffusion_state.shape[1]
+            pos = torch.tensor([seq_pos], dtype=torch.long, device=device)
+            emb_pos = self.wpe(pos)  # (1, n_embd)
+            x = self.drop(current_latent + emb_pos)
 
-                # Use previous sub-latents from diffusion state
-                prev_sublatents = diffusion_state[:, -1, self.n_embd_per_step:]  # (b, remaining_embd)
-                current_latent = torch.cat([emb_tok, prev_sublatents], dim=-1).unsqueeze(1)  # (b, 1, n_embd)
+            # Pass through backbone
+            new_x, new_backbone_state = self.backbone(x, backbone_state)
 
-                # Add positional embedding
-                seq_pos = diffusion_state.shape[1]
-                pos = torch.tensor([seq_pos], dtype=torch.long, device=device)
-                emb_pos = self.wpe(pos)  # (1, n_embd)
-                x = self.drop(current_latent + emb_pos)
+            # Update diffusion state (shift and append)
+            new_diffusion_state = torch.cat([diffusion_state[:, 1:, :], new_x], dim=1)
 
-                # Pass through backbone
-                new_x, new_backbone_state = self.backbone(x, backbone_state)
+            # Take the topmost sub-latent and output logits
+            topmost_latent = new_x[:, -1, :self.n_embd_per_step]  # (b, n_embd_per_step)
+            tok_logits = self.lm_head(topmost_latent).unsqueeze(1)  # (b, 1, n_vocab)
 
-                # Update diffusion state (shift and append)
-                new_diffusion_state = torch.cat([diffusion_state[:, 1:, :], new_x], dim=1)
-
-                # Take the topmost sub-latent and output logits
-                topmost_latent = new_x[:, -1, :self.n_embd_per_step]  # (b, n_embd_per_step)
-                tok_logits = self.lm_head(topmost_latent).unsqueeze(1)  # (b, 1, n_vocab)
-
-                return tok_logits, (new_diffusion_state, new_backbone_state), None
+            return tok_logits, (new_diffusion_state, new_backbone_state), None
 
     @torch.no_grad()
     def generate(self, tok, max_new_tokens, state, temperature=1.0, top_k=None):
