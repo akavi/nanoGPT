@@ -81,7 +81,8 @@ class ArDiffusion(nn.Module):
         diffusion_state, backbone_state = state
         if self.mode == "train":
             assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
-            assert t >= self.n_step, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
+            # TODO: is this right? 
+            assert t >= self.n_step, f"Cannot train on sequence of length {t}, n_step is {self.n_step}"
 
             emb_toks = self.wte(toks) # token embeddings of shape (b, t, n_embd)
             exp_emb_toks= emb_toks.unsqueeze(-2).expand(
@@ -93,33 +94,39 @@ class ArDiffusion(nn.Module):
             w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device).view(1, 1, self.n_step + 1, 1)[:, :, 1:, :]
             noise = torch.randn(b, t, self.n_step, self.n_embd_per_step, device=device)
             noi_exp_emb_toks = exp_emb_toks * (1.0 - w) + noise * w   
-            left_noise = torch.randn(b, self.n_step, self.n_step, self.n_embd_per_step)
-            right_noise = torch.randn(b, self.n_step, self.n_step, self.n_embd_per_step)
-            # TODO: 1) what's the right dim?
-            cat_noi_exp_emb_toks = torch.concat([left_noise, noi_exp_emb_toks, right_noise], dim=-1)
-            # TODO: 2) what're the right dims?
-            tilt_noi_exp_emb_toks = tilt(cat_noi_exp_emb_toks, tilt_dim=-1, content_dim=-1)
-            # TODO: 3) concat the embeddings along the right dim
-            cat_tilt_noi_exp_emb_toks = tilt_noi_exp_emb_toks
+            left_noise = torch.randn(b, self.n_step - 1, self.n_step, self.n_embd_per_step)
+            right_noise = torch.randn(b, self.n_step - 1, self.n_step, self.n_embd_per_step)
+            # Concat along sequence dimension
+            cat_noi_exp_emb_toks = torch.concat([left_noise, noi_exp_emb_toks, right_noise], dim=1)
+            # Tilt along step dimension, truncate along sequence dimension
+            tilt_noi_exp_emb_toks = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t, n_step, n_embd_per_step)
+            cat_tilt_noi_exp_emb_toks = tilt_noi_exp_emb_toks.reshape(b, t, self.n_embd) # (b, t, n_embd)
 
             # forward the GPT model itself
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             emb_pos = self.wpe(pos) # position embeddings of shape (t, n_embd)
-            x = self.drop(cat_tilt_noi_exp_emb_toks , emb_pos)
+            x = self.drop(cat_tilt_noi_exp_emb_toks + emb_pos)
             new_x, new_backbone_state = self.backbone(x, backbone_state)
+            exp_new_x = new_x.unsqueeze(-2).expand(
+                *new_x.shape[:-1], 
+                self.n_step, 
+                emb_toks.shape[-1]
+            ) # (b, t, n_step, n_embd_per_step)
 
             # TODO:
             # 4) slice the "topmost" sub_latent and use it to generate tok_logits
             # 5) calculate logit loss (KL of tok_logits against tok at previous sequence index)
             # 6) calculate embedding loss (KL of new_x against x at previous sequence index, masking out the right noise)
 
-            # TODO:
-            # 7) what's the actual state to propagate?
-            new_diffusion_state = diffusion_state
+            # TODO: 7) Is this right?
+            new_diffusion_state = exp_new_x
             # TODO:
             return tok_logits, (new_diffusion_state, new_backbone_state), loss
         else: # self.mode == "sample"
-            if diffusion_state.shape[0] < self.n_step
+            state_length = diffusion_state.shape[1]
+            idxs_needing_prefill = max(state_length - (toks.shape[1] + self.n_step - 1), 0)
+            idxs_needing_generation = max(state_length -  (toks.shape[1] + self.n_step - 1), 0) # This is wrong, TODO
+            if diffusion_state.shape[1] < toks.shape[1] + self.n_step - 1
                 # TODO 8) perform prefill of diffusion_state by 
                 # a) embedding the passed token
                 # b) creating a noise progression as before
@@ -148,10 +155,6 @@ class ArDiffusion(nn.Module):
             logits, state, _ = self(tok, state)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
