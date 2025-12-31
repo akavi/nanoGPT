@@ -1,5 +1,5 @@
 tmux
-git clone --depth 1  trainable-scaling https://github.com/akavi/nanoGPT.git
+git clone --depth 1 --branch master https://github.com/akavi/nanoGPT.git
 cd nanoGPT/
 sudo snap install astral-uv --classic
 uv python install 3.13
@@ -15,7 +15,7 @@ uv run python3 sample.py --out_dir=out-image-mdct-even --max_new_tokens=4096
 uv run python3 sample.py --out_dir=out-image-mdct-late --max_new_tokens=4096
 uv run python3 sample.py --out_dir=out-image-mdct-superlate --max_new_tokens=4096
 
-export LOGIN=ubuntu@69.19.137.165
+export LOGIN=root@95.133.252.141
 export DIR=out-face-mdct-zigzag
 scp -r -P 22 $LOGIN:~/nanoGPT/$DIR .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
