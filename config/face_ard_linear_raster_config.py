@@ -67,6 +67,7 @@ model = ArDiffusion(ArDiffusionConfig(
     n_step=8,
     latent_loss_scale=1,
     dropout=0.05,
+    device=overridable['device'],
     mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
 ), backbone)
 

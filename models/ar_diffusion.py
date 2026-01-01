@@ -22,6 +22,7 @@ class ArDiffusionConfig:
     dropout: float
     mode: Literal["train"] | Literal["sample"]
     latent_loss_scale: float
+    device: str
 
 
 class _DiffusionState(TypedDict):
@@ -62,6 +63,7 @@ class ArDiffusion(nn.Module):
 
         self.mode = config.mode
         self.latent_loss_scale = config.latent_loss_scale
+        self.device = config.device
 
         self.n_block = config.n_block
         self.n_step = config.n_step
@@ -260,7 +262,7 @@ class ArDiffusion(nn.Module):
     def initial_state(self, batch_size: int):
         # diffusion_state is a dict in sample mode; in train mode it's ignored.
         diffusion_state: _DiffusionState = {
-            "x": torch.empty(batch_size, self.n_step, self.n_embd_per_step),
+            "x": torch.empty(batch_size, self.n_step, self.n_embd_per_step, device=self.device),
             "pos": 0,
         }
         # allocate proper device later in forward if empty
