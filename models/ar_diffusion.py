@@ -38,11 +38,6 @@ class ArDiffusion(nn.Module):
         self.ln_f = LayerNorm(config.n_embd, bias=False)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -130,19 +125,20 @@ class ArDiffusion(nn.Module):
 
         if self.mode == "train":
             y, y_pre, new_backbone_state = self._one_step(x_in, backbone_state)
-            tok_logits = self.lm_head(y[:, self.n_step:, -1, :])
+            tok_logits = self.lm_head(y[:, (self.n_step - 1):, -1, :])  # (B, T, V)
 
-            ce = F.cross_entropy(
-                tok_logits.reshape(B * (T - 1), -1),
+            ce_loss = F.cross_entropy(
+                tok_logits[:, :-1, :].reshape(B * (T - 1), -1),
                 toks[:, 1:].reshape(B * (T - 1)),
             )
 
-            latent = _latent_mse(
+            latent_loss = _latent_mse(
                 pred=y_pre[:, :-1, :, :],        # pre-LN
                 target=x_in[:, 1:, :, :],
                 real_mask=mask[:, 1:, :, :],
             )
-            loss = ce + self.latent_loss_scale * latent
+            loss = ce_loss + self.latent_loss_scale * latent_loss
+            print(f"ce: {ce_loss}, latent: {latent_loss}")
 
             new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
@@ -152,8 +148,8 @@ class ArDiffusion(nn.Module):
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
                 m = mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
-                y, _, backbone_state = self._one_step(x_in[:, idx:idx+1, :, :], backbone_state)
-                diffusion_state = torch.concat([diffusion_state, y[:, -1, :, :]], dim=1)
+                y, _, backbone_state = self._one_step(x_in[:, idx:idx+1, :, :], backbone_state, pos_offset=idx)
+                diffusion_state = torch.concat([diffusion_state, y[:, -1:, :, :]], dim=1)
 
             tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V) from cleanest sublatent
             return tok_logits, (diffusion_state, backbone_state), None
@@ -203,10 +199,11 @@ class ArDiffusion(nn.Module):
             n_params -= self.wpe.weight.numel()
         return n_params
 
-    def _one_step(self, x: Tensor, backbone_state):
+
+    def _one_step(self, x: Tensor, backbone_state, pos_offset: int = 0):
         B, L, _, _ = x.shape
         x_flat = x.reshape(B, L, self.n_step * self.n_embd_per_step)
-        pos = torch.arange(0, L, dtype=torch.long, device=self.device)  # shape (L)
+        pos = torch.arange(pos_offset, pos_offset + L, device=self.device)
         pos_emb = self.wpe(pos)  # (L, n_embd)
         x_flat = self.drop(pos_emb + x_flat)
 

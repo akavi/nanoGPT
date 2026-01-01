@@ -10,9 +10,11 @@ python -V   # should say 3.13.x
 uv sync
 uv run python3 config/face_ard_linear_raster_config.py
 
+git fetch && git reset origin/master --hard
 
-export LOGIN=root@95.133.252.57
-export DIR=out-face-mdct-zigzag
+
+export LOGIN=root@86.38.238.90
+export DIR=out-face-linear-raster
 scp -r -P 22 $LOGIN:~/nanoGPT/$DIR .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
 scp -r -P 22 out-image-mdct-even $LOGIN:~/nanoGPT
