@@ -1,0 +1,31 @@
+Phase i, block prefill
+A - 3 | B - 3 | C - 3 | 
+Noise | A - 2 | B - 2 | 
+Noise | Noise | A - 1 | 
+Noise | Noise | Noise |
+
+
+Phase ii, iterative prefill
+Step 1,
+D - 3 <- New
+C - 2 <- Input
+B - 1 <- Input
+A - 0 <- Input
+
+Step 2,
+F - 3 <- New
+D - 2 <- New
+C - 1 <- Input
+B - 0 <- Input
+
+Step 3,
+G - 3 <- New
+F - 2 <- New
+D - 1 <- New
+C - 0 <- Input
+
+Phase iii, new tokens
+H - 3 <- New
+G - 2 <- New
+F - 1 <- New
+D - 0 <- New (and the source of our first generated token)
