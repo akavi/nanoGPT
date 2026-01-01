@@ -241,7 +241,11 @@ def ssd(x, A, B, C, chunk_size, initial_states, device = None):
      1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
      2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
     """
-    assert x.shape[1] % chunk_size == 0, f"{x.shape[1]} not chunkable by {chunk_size}"
+    T0 = x.shape[1]
+    x, pad_mask = pad_to_multiple(x, chunk_size, dim=1)
+    A, _ = pad_to_multiple(A, chunk_size, dim=1, value=0.0)
+    B, _ = pad_to_multiple(B, chunk_size, dim=1, value=0.0)
+    C, _ = pad_to_multiple(C, chunk_size, dim=1, value=0.0)
 
     # Rearrange into chunks
     # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
@@ -276,7 +280,7 @@ def ssd(x, A, B, C, chunk_size, initial_states, device = None):
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
-
+    Y = Y[:, :T0, ...]
     return Y, final_state
 
 
@@ -303,3 +307,35 @@ def silu(x):
     """
     return x * F.sigmoid(x)
 
+def pad_to_multiple(
+    x: torch.Tensor,
+    multiple: int,
+    *,
+    dim: int = 0,
+    value: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pads `x` along `dim` on the RIGHT so size becomes divisible by `multiple`.
+    Returns (x_padded, mask) where mask is True for original elements along `dim`.
+    mask shape: (new_len,) if x is 1D else broadcastable with x via unsqueeze on other dims.
+    """
+    assert multiple > 0, f"multiple {multiple} must be > 0"
+    assert x.ndim > dim, f"x must have dim {dim}"
+
+    dim = dim % x.ndim
+    L = x.size(dim)
+    pad = (-L) % multiple
+    if pad == 0:
+        mask = torch.ones((L,), device=x.device, dtype=torch.bool)
+        return x, mask
+
+    # build padding tensor
+    pad_shape = (*x.shape[:dim], pad, *x.shape[dim + 1 :])
+    pad_tensor = x.new_full(pad_shape, value)
+    x_padded = torch.cat([x, pad_tensor], dim=dim)
+
+    # 1D mask over the padded dimension
+    new_L = L + pad
+    mask = torch.zeros((new_L,), device=x.device, dtype=torch.bool)
+    mask[:L] = True
+    return x_padded, mask
