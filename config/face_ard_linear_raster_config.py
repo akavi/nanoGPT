@@ -38,7 +38,7 @@ overridable = override(sys.argv, {
     "bias": True,
     "block_size": 1024,
     "n_step": 1,
-    "latent_loss_scale": 0,
+    "latent_loss_scale": 0.0,
 })
 
 # -----------------------------------------------------------------------------#
