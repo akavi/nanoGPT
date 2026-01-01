@@ -124,7 +124,6 @@ class ArDiffusion(nn.Module):
     # if mode == sample, we need to do prefill for the "triangle" getting the newest tokens and then store it in the state
     # (updating the state for each subsequent sequence position
     def forward(self, toks, state):
-        device = toks.device
         diffusion_state, backbone_state = state
         x_in, mask = self._prep_backbone_inputs(toks)
         (B, T), L = toks.size(), x_in.shape[1]
@@ -149,16 +148,15 @@ class ArDiffusion(nn.Module):
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
         else:  # self.mode == "sample"
-            prefill_length = toks.shape[1] + self.n_step - 1
-            for idx in range(diffusion_state.shape[1], prefill_length):
-                diffusion_state, _, new_backbone_state = self._one_step(x_in[:, idx:, :, :], backbone_state)
-                backbone_state = new_backbone_state
-                x_in = x_in  # TODO
+            fill_length = toks.shape[1] + self.n_step - 1
+            for idx in range(diffusion_state.shape[1] - 1, fill_length):
+                m = mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
+                x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
+                y, _, backbone_state = self._one_step(x_in[:, idx:idx+1, :, :], backbone_state)
+                diffusion_state = torch.concat([diffusion_state, y[:, -1, :, :]], dim=1)
 
-            y, _, new_backbone_state = self._one_step(x_in, backbone_state)
             tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V) from cleanest sublatent
-            diffusion_state = y
-            return tok_logits, (diffusion_state, new_backbone_state), None
+            return tok_logits, (diffusion_state, backbone_state), None
 
 
     @torch.no_grad()
@@ -187,7 +185,7 @@ class ArDiffusion(nn.Module):
     
     
     def initial_state(self, batch_size):
-        diffusion_state = torch.empty(batch_size, 0, 0, 0, device=self.device)
+        diffusion_state = torch.zeros(batch_size, 1, self.n_step, self.n_embd_per_step, device=self.device)
         return (diffusion_state, self.backbone.initial_state(batch_size))
 
     def flops_per_fwdbwd(self):
