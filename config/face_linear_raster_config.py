@@ -14,6 +14,7 @@ from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
+    get_fixed_batch,
     get_sampled_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
@@ -117,17 +118,19 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_config_batch(
+    rows = get_fixed_batch(
         split,
-        batch_size,
+        1,
         DataConfig(
             dataset=overridable['dataset'],
             device=overridable['device'],
         ),
     )
     block_size = overridable['block_size']
-    x_out = rows[:, :block_size]           # (B, 1024)
-    y_out = rows[:, 1:block_size + 1].contiguous()      # (B, 1024)
+    value = BOS_ID
+    first_col = torch.full((batch_size, 1), value, dtype=rows.dtype, device=rows.device)
+    x_out = torch.cat([first_col, rows[:,:-1]], dim=1).long()
+    y_out = rows[:, 0:block_size + 1].contiguous().long()      # (B, 1024)
 
     return x_out, y_out
 
@@ -147,7 +150,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=128,                # also used in get_batch
+    batch_size=1,                # also used in get_batch
 
     eval_only=False,
     eval_interval=250,

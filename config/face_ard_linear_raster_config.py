@@ -37,6 +37,7 @@ overridable = override(sys.argv, {
     "n_embd":384,
     "bias": True,
     "block_size": 1024,
+    "n_step": 1,
 })
 
 # -----------------------------------------------------------------------------#
@@ -64,7 +65,7 @@ model = ArDiffusion(ArDiffusionConfig(
     n_block=overridable['block_size'],
     n_vocab=meta['vocab_size'],
     n_embd=overridable['n_embd'],
-    n_step=8,
+    n_step=overridable['n_step'],
     latent_loss_scale=1,
     dropout=0.05,
     device=overridable['device'],

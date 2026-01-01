@@ -10,12 +10,8 @@ python -V   # should say 3.13.x
 uv sync
 uv run python3 config/face_ard_linear_raster_config.py
 
-uv run python3 sample.py --out_dir=out-image-mdct-early --max_new_tokens=4096
-uv run python3 sample.py --out_dir=out-image-mdct-even --max_new_tokens=4096
-uv run python3 sample.py --out_dir=out-image-mdct-late --max_new_tokens=4096
-uv run python3 sample.py --out_dir=out-image-mdct-superlate --max_new_tokens=4096
 
-export LOGIN=root@95.133.252.141
+export LOGIN=root@95.133.252.57
 export DIR=out-face-mdct-zigzag
 scp -r -P 22 $LOGIN:~/nanoGPT/$DIR .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
