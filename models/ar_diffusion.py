@@ -220,6 +220,7 @@ class ArDiffusion(nn.Module):
 
         # Process only unseen tokens.
         for i in range(start, T):
+            print("Generating index {}", i)
             # Overwrite cleanest slot (s=0) with embedding of the newly seen token.
             cur_x = cur_x.clone()
             cur_x[:, 0, :] = self.wte(toks[:, i])
