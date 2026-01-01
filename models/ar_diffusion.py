@@ -205,6 +205,7 @@ class ArDiffusion(nn.Module):
         # If caller cropped the token context (e.g., generate() cropping to n_block),
         # our cached pos may be invalid. In that case, reset.
         if diffusion_state["pos"] > T:
+            print("Resetting diff state")
             diffusion_state = cast(_DiffusionState, {
                 "x": torch.randn(B, self.n_step, self.n_embd_per_step, device=device),
                 "pos": 0,
