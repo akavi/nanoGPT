@@ -123,7 +123,7 @@ class ArDiffusion(nn.Module):
     #  if mode == train, loss is crossentropy wrt to next position in "diffusion" array
     # if mode == sample, we need to do prefill for the "triangle" getting the newest tokens and then store it in the state
     # (updating the state for each subsequent sequence position
-    def forward(self, toks, state):
+    def forward(self, toks, state, tokens = None):
         diffusion_state, backbone_state = state
         x_in, mask = self._prep_backbone_inputs(toks)
         (B, T), L = toks.size(), x_in.shape[1]
