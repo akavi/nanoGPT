@@ -38,6 +38,7 @@ overridable = override(sys.argv, {
     "bias": True,
     "block_size": 1024,
     "n_step": 1,
+    "latent_loss_scale": 0,
 })
 
 # -----------------------------------------------------------------------------#
@@ -66,7 +67,7 @@ model = ArDiffusion(ArDiffusionConfig(
     n_vocab=meta['vocab_size'],
     n_embd=overridable['n_embd'],
     n_step=overridable['n_step'],
-    latent_loss_scale=1,
+    latent_loss_scale=overridable["latent_loss_scale"],
     dropout=0.05,
     device=overridable['device'],
     mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",

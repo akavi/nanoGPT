@@ -202,15 +202,6 @@ class ArDiffusion(nn.Module):
         # -------------------------
         # Sampling / streaming mode
         # -------------------------
-        # If caller cropped the token context (e.g., generate() cropping to n_block),
-        # our cached pos may be invalid. In that case, reset.
-        if diffusion_state["pos"] > T:
-            print("Resetting diff state")
-            diffusion_state = cast(_DiffusionState, {
-                "x": torch.randn(B, self.n_step, self.n_embd_per_step, device=device),
-                "pos": 0,
-            })
-
         start = diffusion_state["pos"]
         # We'll return logits for all positions, but only fill the newly processed ones.
         tok_logits = torch.zeros(B, T, self.lm_head.out_features, device=device)
