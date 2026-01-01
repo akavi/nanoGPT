@@ -89,8 +89,11 @@ class ArDiffusion(nn.Module):
         right_noise = torch.randn(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
         noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
         # weights: include 0.0 (clean), exclude 1.0 (pure noise)
+
+        # weights: include 0.0 (clean), exclude 1.0 (pure noise)
         w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[: self.n_step]
-        w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,E)
+        w = torch.flip(w, dims=[0])                                       # last step is cleanest
+        w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
         noi_exp_emb_toks = exp_emb_toks * (1.0 - w) + noise * w
 
         cat_noi_exp_emb_toks = torch.concat([left_noise, noi_exp_emb_toks, right_noise], dim=1)
@@ -120,7 +123,6 @@ class ArDiffusion(nn.Module):
     #  if mode == train, loss is crossentropy wrt to next position in "diffusion" array
     # if mode == sample, we need to do prefill for the "triangle" getting the newest tokens and then store it in the state
     # (updating the state for each subsequent sequence position
-
     def forward(self, toks, state):
         device = toks.device
         diffusion_state, backbone_state = state
@@ -128,7 +130,7 @@ class ArDiffusion(nn.Module):
         (B, T), L = toks.size(), x_in.shape[1]
 
         if self.mode == "train":
-            y, new_backbone_state = self._one_step(x_in, backbone_state)
+            y, y_pre, new_backbone_state = self._one_step(x_in, backbone_state)
             tok_logits = self.lm_head(y[:, self.n_step:, -1, :])
 
             ce = F.cross_entropy(
@@ -136,29 +138,28 @@ class ArDiffusion(nn.Module):
                 toks[:, 1:].reshape(B * (T - 1)),
             )
 
-            # Latent loss: y[:, :-1] vs x[:, 1:]
             latent = _latent_mse(
-                pred=y[:, :-1, :, :],          # (B, L-1, S, E)
-                target=x_in[:, 1:, :, :],      # (B, L-1, S, E)
-                real_mask=mask[:, 1:, :, :],   # (1, L-1, S, 1) broadcast over B/E
+                pred=y_pre[:, :-1, :, :],        # pre-LN
+                target=x_in[:, 1:, :, :],
+                real_mask=mask[:, 1:, :, :],
             )
-            loss = ce + self.latent_loss_scale*latent
+            loss = ce + self.latent_loss_scale * latent
 
-            # For training, we don't need to persist diffusion_state; return a lightweight value.
             new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
-        else: # self.mode == "sample"
+
+        else:  # self.mode == "sample"
             prefill_length = toks.shape[1] + self.n_step - 1
             for idx in range(diffusion_state.shape[1], prefill_length):
-                diffusion_state, new_backbone_state = self._one_step(x_in[:, idx:, :, :], backbone_state)
-                # update using mask, x_in, diffusion_state
-                x_in = x_in # TODO
+                diffusion_state, _, new_backbone_state = self._one_step(x_in[:, idx:, :, :], backbone_state)
+                backbone_state = new_backbone_state
+                x_in = x_in  # TODO
 
-            y, new_backbone_state = self._one_step(x_in, backbone_state)
-            # Token logits from cleanest sublatent of y_j, which corresponds to token j+1.
-            tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V)
+            y, _, new_backbone_state = self._one_step(x_in, backbone_state)
+            tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V) from cleanest sublatent
             diffusion_state = y
             return tok_logits, (diffusion_state, new_backbone_state), None
+
 
     @torch.no_grad()
     def generate(self, tok, max_new_tokens, state, temperature=1.0, top_k=None):
@@ -205,17 +206,22 @@ class ArDiffusion(nn.Module):
         return n_params
 
     def _one_step(self, x: Tensor, backbone_state):
-        B, L, _, _ = x.shape()
+        B, L, _, _ = x.shape
         x_flat = x.reshape(B, L, self.n_step * self.n_embd_per_step)
-        pos = torch.arange(0, L, dtype=torch.long, device=self.device) # shape (t)
-        pos_emb = self.wpe(pos) # position embeddings of shape (L, n_embd)
+        pos = torch.arange(0, L, dtype=torch.long, device=self.device)  # shape (L)
+        pos_emb = self.wpe(pos)  # (L, n_embd)
         x_flat = self.drop(pos_emb + x_flat)
 
-        # forward the GPT model itself
         y_flat, new_backbone_state = self.backbone(x_flat, backbone_state)  # (B,L,n_embd)
+
+        # pre-LN version for latent MSE
+        y_pre = y_flat.view(B, L, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
+
+        # post-LN version for logits / state
         y_flat = self.ln_f(y_flat)
-        y = y_flat.view(B, L, self.n_step, self.n_embd_per_step)                        # (B, L, S, E)
-        return y, new_backbone_state
+        y = y_flat.view(B, L, self.n_step, self.n_embd_per_step)            # (B,L,S,E)
+
+        return y, y_pre, new_backbone_state
 
 
 def tilt(
