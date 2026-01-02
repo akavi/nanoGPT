@@ -80,9 +80,6 @@ class ArDiffusion(nn.Module):
             emb_toks.shape[-1]
         ) # (b, t, n_step, n_embd_per_step)
 
-
-        left_noise  = torch.ones(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
-        right_noise = torch.ones(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
         noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
 
         # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
@@ -90,7 +87,9 @@ class ArDiffusion(nn.Module):
         w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
         noi_exp_emb_toks = w*exp_emb_toks + (1.0 - w)*noise
 
-        cat_noi_exp_emb_toks = torch.concat([left_noise, noi_exp_emb_toks, right_noise], dim=1)
+        left_pad  = torch.ones(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
+        right_pad = torch.ones(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
+        cat_noi_exp_emb_toks = torch.concat([left_pad, noi_exp_emb_toks, right_pad], dim=1)
         # Tilt along step dimension, truncate along sequence dimension
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
         x_in = self.in_norm(x_in)
