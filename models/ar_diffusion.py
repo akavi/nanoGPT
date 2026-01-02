@@ -90,9 +90,9 @@ class ArDiffusion(nn.Module):
         w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[: self.n_step]
         w = torch.flip(w, dims=[0])                                       # last step is cleanest
         w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
-        test_mask = torch.zeros_like(exp_emb_toks)
-        test_mask[..., -1, :] = 1
-        noi_exp_emb_toks = exp_emb_toks * test_mask
+        # test_mask = torch.zeros_like(exp_emb_toks)
+        # test_mask[..., -1, :] = 1
+        noi_exp_emb_toks = exp_emb_toks * (1.0 - w) + noise * w
 
         cat_noi_exp_emb_toks = torch.concat([left_noise, noi_exp_emb_toks, right_noise], dim=1)
         # Tilt along step dimension, truncate along sequence dimension
