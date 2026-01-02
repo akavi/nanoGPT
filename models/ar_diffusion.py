@@ -138,7 +138,6 @@ class ArDiffusion(nn.Module):
                 real_mask=mask[:, 1:, :, :],
             )
             loss = ce_loss + self.latent_loss_scale * latent_loss
-            print(f"ce: {ce_loss}, latent: {latent_loss}")
 
             new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
@@ -148,7 +147,8 @@ class ArDiffusion(nn.Module):
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
                 m = mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
-                y, _, backbone_state = self._one_step(x_in[:, idx:idx+1, :, :], backbone_state, pos_offset=idx)
+                print("x_in shape {}", x_in.shape)
+                y, _, backbone_state = self._one_step(x_in[:, :idx+1, :, :], backbone_state)
                 diffusion_state = torch.concat([diffusion_state, y[:, -1:, :, :]], dim=1)
 
             tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V) from cleanest sublatent
@@ -163,7 +163,8 @@ class ArDiffusion(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
+        for idx in range(max_new_tokens):
+            print(f"gen {idx}")
             # if the sequence context is growing too long we must crop it at n_block
             tok = tok if tok.size(1) <= self.n_block else tok[:, -self.n_block:]
             # forward the model to get the logits for the index in the sequence
@@ -200,17 +201,18 @@ class ArDiffusion(nn.Module):
         return n_params
 
 
-    def _one_step(self, x: Tensor, backbone_state, pos_offset: int = 0):
+    def _one_step(self, x: Tensor, backbone_state):
         B, L, _, _ = x.shape
         x_flat = x.reshape(B, L, self.n_step * self.n_embd_per_step)
-        pos = torch.arange(pos_offset, pos_offset + L, device=self.device)
+        pos = torch.arange(0, L, device=self.device)
         pos_emb = self.wpe(pos)  # (L, n_embd)
         x_flat = self.drop(pos_emb + x_flat)
 
         y_flat, new_backbone_state = self.backbone(x_flat, backbone_state)  # (B,L,n_embd)
 
         # pre-LN version for latent MSE
-        y_pre = y_flat.view(B, L, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
+        # TODO: mamba should return the full y, not just the most recent
+        y_pre = y_flat.view(B, 1, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
         # post-LN version for logits / state
         y = self.ln_f(y_pre)
