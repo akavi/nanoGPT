@@ -84,7 +84,7 @@ class ArDiffusion(nn.Module):
         # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
         w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1: ]
         w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
-        noi_exp_emb_toks = w*exp_emb_toks + (1.0 - w)*noise
+        noi_exp_emb_toks = exp_emb_toks # w*exp_emb_toks + (1.0 - w)*noise
         # test_mask = torch.zeros_like(exp_emb_toks)
         #  test_mask[..., -1, :] = 1
         # noi_exp_emb_toks = test_mask*exp_emb_toks
