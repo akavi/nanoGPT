@@ -31,12 +31,12 @@ class ArDiffusion(nn.Module):
         self.device = config.device
 
         self.n_embd_per_step = config.n_embd // config.n_step
-        self.in_norm = LayerNorm(self.n_embd_per_step, bias=False)
+        self.in_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
         self.wte = nn.Embedding(config.n_vocab, self.n_embd_per_step)
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
         self.drop = nn.Dropout(config.dropout)
-        self.ln_f = LayerNorm(self.n_embd_per_step, bias=False)
+        self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
 
@@ -224,7 +224,7 @@ class ArDiffusion(nn.Module):
         y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
         # post-LN version for logits / state
-        y = self.ln_f(y_pre)
+        y = self.out_norm(y_pre)
         return y, y_pre, new_backbone_state
 
 
@@ -292,3 +292,24 @@ def _latent_mse(pred: Tensor, target: Tensor, real_mask: Tensor) -> Tensor:
     m_exp = real_mask.expand_as(pred)
     se = (pred - target).pow(2) * m_exp
     return se.sum() / m_exp.sum()
+
+class SubLatentLayerNorm(nn.Module):
+    def __init__(self, S: int, E: int, eps: float = 1e-5, elementwise_affine: bool = True):
+        super().__init__()
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(S, E))  # gamma per S
+            self.bias   = nn.Parameter(torch.zeros(S, E)) # beta per S
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, S, E)
+        mean = x.mean(dim=-1, keepdim=True)
+        var  = x.var(dim=-1, keepdim=True, unbiased=False)
+        y = (x - mean) * torch.rsqrt(var + self.eps)
+        if self.elementwise_affine:
+            y = y * self.weight[None, None, :, :] + self.bias[None, None, :, :]
+        return y
