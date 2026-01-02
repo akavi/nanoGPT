@@ -39,6 +39,7 @@ overridable = override(sys.argv, {
     "block_size": 1024,
     "n_step": 1,
     "latent_loss_scale": 0.0,
+    "max_iters": 3000,
 })
 
 # -----------------------------------------------------------------------------#
@@ -148,7 +149,7 @@ train_config = TrainConfig(
     device=overridable['device'],
 
     decay_lr=True,
-    lr_decay_iters=3000,
+    lr_decay_iters=overridable['max_iters'],
     learning_rate=overridable['learning_rate'],
     min_lr=overridable['min_lr'],
 
@@ -159,8 +160,8 @@ train_config = TrainConfig(
     eval_only=False,
     eval_interval=250,
     eval_iters=20,
-    warmup_iters=300,
-    max_iters=3000,
+    warmup_iters=overridable['max_iters'] / 10,
+    max_iters=overridable['max_iters'],
 
     log_interval=1,
     always_save_checkpoint=True,
