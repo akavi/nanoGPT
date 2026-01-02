@@ -35,7 +35,7 @@ class ArDiffusion(nn.Module):
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
         self.drop = nn.Dropout(config.dropout)
-        self.ln_f = LayerNorm(config.n_embd, bias=False)
+        self.ln_f = LayerNorm(self.n_embd_per_step, bias=False)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
 
@@ -213,9 +213,7 @@ class ArDiffusion(nn.Module):
         y_pre = y_flat.view(B, L, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
         # post-LN version for logits / state
-        y_flat = self.ln_f(y_flat)
-        y = y_flat.view(B, L, self.n_step, self.n_embd_per_step)            # (B,L,S,E)
-
+        y = self.ln_f(y_pre)
         return y, y_pre, new_backbone_state
 
 
