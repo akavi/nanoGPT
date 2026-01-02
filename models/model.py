@@ -39,6 +39,21 @@ class ModuleList(nn.Module):
     def flops_per_fwdbwd(self):
         return sum(list(map(lambda m: m.flops_per_fwdbwd(), self.inner_list)))
 
+# If you can't be assed to implement initial_state/flops_per_fwdbwd correctly)
+class LazyWrapper(nn.Module):
+    def __init__(self, impl):
+        super().__init__()
+        self.impl = impl
+
+    def forward(self, x, old_state):
+        return self.impl(x), old_state
+
+    def initial_state(self, batch_size):
+        return None
+
+    def flops_per_fwdbwd(self):
+        return 0
+
 
 class CausalSelfAttention(nn.Module):
 
