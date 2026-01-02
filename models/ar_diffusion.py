@@ -81,8 +81,8 @@ class ArDiffusion(nn.Module):
         ) # (b, t, n_step, n_embd_per_step)
 
 
-        left_noise  = torch.randn(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
-        right_noise = torch.randn(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
+        left_noise  = torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
+        right_noise = torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
         noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
 
         # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
