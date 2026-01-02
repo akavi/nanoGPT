@@ -31,6 +31,7 @@ class ArDiffusion(nn.Module):
         self.device = config.device
 
         self.n_embd_per_step = config.n_embd // config.n_step
+        self.in_norm = LayerNorm(self.n_embd_per_step, bias=False)
         self.wte = nn.Embedding(config.n_vocab, self.n_embd_per_step)
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
@@ -94,6 +95,8 @@ class ArDiffusion(nn.Module):
         cat_noi_exp_emb_toks = torch.concat([left_noise, noi_exp_emb_toks, right_noise], dim=1)
         # Tilt along step dimension, truncate along sequence dimension
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
+        x_in = self.in_norm(x_in)
+
         return x_in, mask
 
     # For training
@@ -137,6 +140,7 @@ class ArDiffusion(nn.Module):
                 target=x_in[:, 1:, :, :],
                 real_mask=mask[:, 1:, :, :],
             )
+            print(f"{ce_loss=}, {latent_loss=}")
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             new_diff_state = y
