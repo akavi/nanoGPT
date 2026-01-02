@@ -167,7 +167,6 @@ train_config = TrainConfig(
     out_dir=overridable['out_dir'],
     compile=False,
 )
-
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,

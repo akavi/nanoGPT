@@ -260,7 +260,8 @@ def tilt(
 
     rows = torch.arange(T, device=device).view(T, 1)          # [T,1]
     offs = torch.arange(K, device=device).view(1, K)          # [1,K]
-    idx = (rows + offs)                                       # [T,K]
+    start = (D - K) - rows          # (T,1)
+    idx = start + offs              # (T,K)
 
     idx = idx.view((1,) * len(batch) + (T, K)).expand(*batch, T, K)
     out = ap.gather(-1, idx)
