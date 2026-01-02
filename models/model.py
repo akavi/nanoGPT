@@ -137,6 +137,18 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+@dataclass
+class CsaConfig:
+    n_head: int
+    n_embd: int
+    n_step: int
+    block_size: int
+    bias: bool  
+    bias: bool
+    dropout: float
+    mode: str = "train"
+    use_decay: bool = False
+
 class CsaBlock(nn.Module):
 
     def __init__(self, config, layer):
@@ -157,10 +169,59 @@ class CsaBlock(nn.Module):
     def initial_state(self, batch_size):
         return None
 
+    def get_num_params(self, non_embedding=True):
+        return sum(p.numel() for p in self.parameters())
+
     def flops_per_fwdbwd(self):
         N = self.get_num_params()
         H, Q, T = self.n_head, self.n_embd // self.n_head, self.block_size
         flops_per_token = 6*N + 12*H*Q*T
+        return flops_per_token * T
+
+
+class SubLatentCsaBlock(nn.Module):
+    def __init__(self, config: CsaConfig, layer: int):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.n_step = config.n_step
+        self.block_size = config.block_size
+
+        assert self.n_embd % self.n_step == 0, (self.n_embd, self.n_step)
+        self.n_embd_per_step = self.n_embd // self.n_step
+
+        # LN is now per-latent: normalize over E, not over (S*E)
+        self.ln_1 = LayerNorm(self.n_embd_per_step, bias=config.bias)
+        self.attn = CausalSelfAttention(config, layer)
+        self.ln_2 = LayerNorm(self.n_embd_per_step, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def _per_latent_ln(self, x: torch.Tensor, ln: nn.Module) -> torch.Tensor:
+        """
+        x: (B, T, S*E) -> reshape to (B, T, S, E), LN over E, flatten back.
+        """
+        B, T, D = x.shape
+        S, E = self.n_step, self.n_embd_per_step
+        # view/reshape is fine as long as x is contiguous; reshape handles non-contig safely.
+        x4 = x.reshape(B, T, S, E)
+        x4 = ln(x4)                    # LN over last dim (E)
+        return x4.reshape(B, T, S * E)
+
+    def forward(self, x, state):
+        x = x + self.attn(self._per_latent_ln(x, self.ln_1))
+        x = x + self.mlp(self._per_latent_ln(x, self.ln_2))
+        return x, state
+
+    def initial_state(self, batch_size):
+        return None
+
+    def get_num_params(self, non_embedding=True):
+        return sum(p.numel() for p in self.parameters())
+
+    def flops_per_fwdbwd(self):
+        N = self.get_num_params()
+        H, Q, T = self.n_head, self.n_embd // self.n_head, self.block_size
+        flops_per_token = 6 * N + 12 * H * Q * T
         return flops_per_token * T
 
 @dataclass

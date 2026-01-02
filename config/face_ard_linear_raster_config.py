@@ -10,6 +10,7 @@ import os
 from models.model import ModuleList
 from models.categorical import CategoricalConfig, Categorical
 from models.mamba import Mamba2, MambaConfig
+from models.model import CsaConfig, SubLatentCsaBlock
 from train import train, TrainConfig
 from sample import sample, SampleConfig
 from utils import (
@@ -48,17 +49,13 @@ overridable = override(sys.argv, {
 torch.manual_seed(overridable['seed'])
 meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
 backbone = ModuleList([
-    Mamba2(MambaConfig(
+    SubLatentCsaBlock(CsaConfig(
         n_head=8,
         n_embd=overridable['n_embd'],
-        n_inner=768,
-        n_conv=4,
-        n_state=64,
-
+        n_step=overridable['n_step'],
+        block_size=overridable['block_size'] + overridable['n_step'] - 1,
         bias=False,
-        n_chunk=32,
         dropout=0.05,
-        device=overridable['device'],
         mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
     ), i)
 for i in range(overridable['n_layer'])])
