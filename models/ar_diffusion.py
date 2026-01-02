@@ -62,7 +62,6 @@ class ArDiffusion(nn.Module):
         b, t = toks.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
 
-
         # construct mask
         side_negative_mask = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)
         main_positive_mask = torch.ones(1, t, self.n_step, 1, device=device)
@@ -83,9 +82,12 @@ class ArDiffusion(nn.Module):
         noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
 
         # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
-        w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1: ]
-        w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
-        noi_exp_emb_toks = w*exp_emb_toks + (1.0 - w)*noise
+        # w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1: ]
+        # w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
+        # noi_exp_emb_toks = w*exp_emb_toks + (1.0 - w)*noise
+        test_mask = torch.zeros_like(exp_emb_toks)
+        test_mask[..., -1, :] = 1
+        noi_exp_emb_toks = test_mask*exp_emb_toks
 
         left_pad  = torch.ones(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
         right_pad = torch.ones(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
@@ -132,13 +134,14 @@ class ArDiffusion(nn.Module):
                 toks[:, 1:].reshape(B * (T - 1)),
             )
 
+            """
             latent_loss = _latent_mse(
                 pred=y_pre[:, :-1, :, :],        # pre-LN
                 target=x_in[:, 1:, :, :],
                 real_mask=mask[:, 1:, :, :],
             )
-            loss = ce_loss + self.latent_loss_scale * latent_loss
-
+            """
+            loss = ce_loss #+ self.latent_loss_scale * latent_loss
             new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
