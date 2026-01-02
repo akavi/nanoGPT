@@ -148,7 +148,11 @@ class ArDiffusion(nn.Module):
                 m = mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
                 print("x_in shape {}", x_in.shape)
-                y, _, backbone_state = self._one_step(x_in[:, :idx+1, :, :], backbone_state)
+                y, _, backbone_state = self._one_step(
+                    x_in[:, :idx+1, :, :],
+                    backbone_state,
+                    pos_idx=idx,
+                )
                 diffusion_state = torch.concat([diffusion_state, y[:, -1:, :, :]], dim=1)
 
             tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V) from cleanest sublatent
@@ -201,7 +205,7 @@ class ArDiffusion(nn.Module):
         return n_params
 
 
-    def _one_step(self, x: Tensor, backbone_state):
+    def _one_step(self, x: Tensor, backbone_state, pos_idx=0):
         B, L, _, _ = x.shape
         x_flat = x.reshape(B, L, self.n_step * self.n_embd_per_step)
         pos = torch.arange(0, L, device=self.device)
@@ -212,7 +216,7 @@ class ArDiffusion(nn.Module):
 
         # pre-LN version for latent MSE
         # TODO: mamba should return the full y, not just the most recent
-        y_pre = y_flat.view(B, 1, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
+        y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
         # post-LN version for logits / state
         y = self.ln_f(y_pre)
