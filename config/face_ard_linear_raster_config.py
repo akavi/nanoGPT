@@ -37,7 +37,8 @@ overridable = override(sys.argv, {
     "n_embd":384,
     "bias": True,
     "block_size": 1024,
-    "n_step": 1,
+    "n_step": 4,
+    "n_embd": 8,
     "latent_loss_scale": 0.0,
     "max_iters": 3000,
 })
@@ -208,3 +209,14 @@ else:
         detokenize=detokenize_and_save,
         config=sample_config,
     )
+
+"""
+with torch.no_grad():
+    toks = torch.tensor([[1,2,3]], device=overridable['device'])
+    x_in, _ = model._prep_backbone_inputs(toks)
+    print(x_in)
+    print(x_in[:, :, -1, :])
+    # look at which diffusion indices have nonzero content in the cleanest step
+    clean = x_in[0, :, -1, :].abs().sum(dim=-1)  # (L,)
+    print("L =", x_in.shape[1], "clean-nonzero idx:", clean.nonzero().squeeze(-1).tolist())
+"""
