@@ -31,7 +31,7 @@ class ArDiffusion(nn.Module):
         self.device = config.device
 
         self.n_embd_per_step = config.n_embd // config.n_step
-        self.in_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
+        self.in_norm = nn.LayerNorm(self.n_embd_per_step)
         self.wte = nn.Embedding(config.n_vocab, self.n_embd_per_step)
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
@@ -72,6 +72,7 @@ class ArDiffusion(nn.Module):
         ) # (1, t + n_step - 1, n_step, 1)
 
         emb_toks = self.wte(toks) # token embeddings of shape (b, t, n_embd)
+        emb_toks = self.in_norm(emb_toks)
         # emb_toks = toks.unsqueeze(-1).repeat(1, 1, self.n_embd_per_step)# self.wte(toks) # token embeddings of shape (b, t, n_embd)
         assert emb_toks.shape[-1] == self.n_embd_per_step, (emb_toks.shape, self.n_embd_per_step)
         exp_emb_toks= emb_toks.unsqueeze(-2).expand(
@@ -80,7 +81,8 @@ class ArDiffusion(nn.Module):
             emb_toks.shape[-1]
         ) # (b, t, n_step, n_embd_per_step)
 
-        noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
+        # noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
+        noise = torch.randn_like(exp_emb_toks[..., :1, :]) * emb_toks.std()
 
         # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
         w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1: ]
@@ -93,7 +95,7 @@ class ArDiffusion(nn.Module):
         # Tilt along step dimension, truncate along sequence dimension
         # x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
         x_in = cat_noi_exp_emb_toks[:, :-(self.n_step - 1), :, :]
-        x_in = self.in_norm(x_in)
+        # x_in = self.in_norm(x_in)
 
         return x_in, mask
 
