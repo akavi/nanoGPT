@@ -134,14 +134,13 @@ class ArDiffusion(nn.Module):
                 toks[:, 1:].reshape(B * (T - 1)),
             )
 
-            """
             latent_loss = _latent_mse(
                 pred=y_pre[:, :-1, :, :],        # pre-LN
-                target=x_in[:, 1:, :, :],
+                target=x_in[:, 1:, :, :].detach(),
                 real_mask=mask[:, 1:, :, :],
             )
-            """
-            loss = ce_loss #+ self.latent_loss_scale * latent_loss
+            loss = ce_loss + self.latent_loss_scale * latent_loss
+            print(f"ce_loss: {ce_loss.item()}, latent_loss: {latent_loss.item()}")
             new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
