@@ -135,7 +135,7 @@ class ArDiffusion(nn.Module):
             )
 
             latent_loss = _latent_mse(
-                pred=y_pre[:, :-1, :, :],        # pre-LN
+                pred=y[:, :-1, :, :],        # pre-LN
                 target=x_in[:, 1:, :, :].detach(),
                 real_mask=mask[:, 1:, :, :],
             )
@@ -210,9 +210,9 @@ class ArDiffusion(nn.Module):
     def _one_step(self, x: Tensor, backbone_state, pos_idx=0):
         B, L, _, _ = x.shape
         x_flat = x.reshape(B, L, self.n_step * self.n_embd_per_step)
-        pos = torch.arange(0, L, device=self.device)
-        pos_emb = self.wpe(pos)  # (L, n_embd)
-        x_flat = self.drop(pos_emb + x_flat)
+        #pos = torch.arange(0, L, device=self.device)
+        #pos_emb = self.wpe(pos)  # (L, n_embd)
+        #x_flat = self.drop(pos_emb + x_flat)
 
         y_flat, new_backbone_state = self.backbone(x_flat, backbone_state)  # (B,L,n_embd)
 
