@@ -25,13 +25,14 @@ class ArDiffusion(nn.Module):
         assert config.n_block is not None
         self.mode = config.mode
         self.n_block = config.n_block
+        self.n_vocab = config.n_vocab
         self.n_step = config.n_step
         self.latent_loss_scale = config.latent_loss_scale
         self.n_embd = config.n_embd
         self.device = config.device
 
         self.n_embd_per_step = config.n_embd // config.n_step
-        self.in_norm = nn.LayerNorm(self.n_embd_per_step)
+        self.in_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
         self.wte = nn.Embedding(config.n_vocab, self.n_embd_per_step)
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
@@ -57,7 +58,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
@@ -72,14 +73,14 @@ class ArDiffusion(nn.Module):
         ) # (1, t + n_step - 1, n_step, 1)
 
         emb_toks = self.wte(toks) # token embeddings of shape (b, t, n_embd)
-        emb_toks = self.in_norm(emb_toks)
         # emb_toks = toks.unsqueeze(-1).repeat(1, 1, self.n_embd_per_step)# self.wte(toks) # token embeddings of shape (b, t, n_embd)
         assert emb_toks.shape[-1] == self.n_embd_per_step, (emb_toks.shape, self.n_embd_per_step)
-        exp_emb_toks= emb_toks.unsqueeze(-2).expand(
+        exp_emb_toks = emb_toks.unsqueeze(-2).expand(
             *emb_toks.shape[:-1], 
             self.n_step, 
             emb_toks.shape[-1]
         ) # (b, t, n_step, n_embd_per_step)
+        exp_emb_toks = self.in_norm(exp_emb_toks)
 
         # noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
         noise = torch.randn_like(exp_emb_toks[..., :1, :]) * emb_toks.std()
@@ -96,25 +97,33 @@ class ArDiffusion(nn.Module):
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
         # x_in = cat_noi_exp_emb_toks[:, :-(self.n_step - 1), :, :]
 
-        return x_in, mask
+
+        w_seq = w.expand(1, t, self.n_step, 1)  # (1,T,S,1)
+        w_left  = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)  # (1,S-1,S,1)
+        w_right = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)  # (1,S-1,S,1)
+
+        cat_w = torch.concat([w_left, w_seq, w_right], dim=1)  # (1, T+2(S-1), S, 1)
+        shaped_w = tilt(cat_w, tilt_dim=2, content_dim=1)      # (1, 
+
+        return x_in, mask, shaped_w
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
     # embed(tok):   [emb1, emb2, emb3, emb4, emb5] # each token embedded in n_embd/num_steps 
     # Note, read D(n, m) as "the mth diffusion step of the embedding of the nth token"
     # diffusion [
-    #    [D(1, 1), D(1, 2), D(1, 3), ...D(1, n_steps)]
-    #    [D(2, 1), D(2, 2), D(2, 3), ...D(2, n_steps)]
-    #    [D(3, 1), D(3, 2), D(3, 3), ...D(3, n_steps)]
-    #    [D(4, 1), D(4, 2), D(4, 3), ...D(4, n_steps)]
-    #    [D(5, 1), D(5, 2), D(5, 3), ...D(5, n_steps)]
+    #    [D(1, 1), D(1, 2), D(1, 3), ...D(1, n_step)]
+    #    [D(2, 1), D(2, 2), D(2, 3), ...D(2, n_step)]
+    #    [D(3, 1), D(3, 2), D(3, 3), ...D(3, n_step)]
+    #    [D(4, 1), D(4, 2), D(4, 3), ...D(4, n_step)]
+    #    [D(5, 1), D(5, 2), D(5, 3), ...D(5, n_step)]
     # ] // (B, T, n_embd/num_steps)
     # reshaped [
     #    [0, 0, 0, ..., D(1, 1)]
     #    [0, 0, ..., D(1, 2), D(2, 1)]
     #    [0, ..., D(1, 3), D(2, 2), D(3, 1)]
     #    ...
-    #    [D(1, n_steps), D(2, n_steps -1), D(3, n_steps -2), ..., D(n_steps, 1)]
+    #    [D(1, n_step), D(2, n_step -1), D(3, n_step -2), ..., D(n_step, 1)]
     #    ...and so on
     # ] // (B, T, n_embd/num_steps)
     #  if mode == train, loss is crossentropy wrt to next position in "diffusion" array
@@ -122,25 +131,57 @@ class ArDiffusion(nn.Module):
     # (updating the state for each subsequent sequence position
     def forward(self, toks, state, tokens = None):
         diffusion_state, backbone_state = state
-        x_in, mask = self._prep_backbone_inputs(toks)
-        (B, T), L = toks.size(), x_in.shape[1]
+        x_in, mask, shaped_w = self._prep_backbone_inputs(toks)
+        # Because LLMs are incapable of using multi-letter variable names for
+        # params
+        (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
 
         if self.mode == "train":
             y, y_pre, new_backbone_state = self._one_step(x_in, backbone_state)
-            tok_logits = self.lm_head(y[:, (self.n_step - 1):, -1, :])  # (B, T, V)
 
-            ce_loss = F.cross_entropy(
-                tok_logits[:, :-1, :].reshape(B * (T - 1), -1),
-                toks[:, 1:].reshape(B * (T - 1)),
-            )
+            # logits for all slots
+            tok_logits = self.lm_head(y)  # (B, L, S, V)
+
+            # base weights: (1, L, S)
+            weights = (mask[..., 0] * shaped_w[..., 0]).to(dtype=tok_logits.dtype)  # (1,L,S)
+
+            # map (row r, slot s) -> token_idx = r - s
+            r = torch.arange(L, device=toks.device).view(1, L, 1)    # (1,L,1)
+            s = torch.arange(S, device=toks.device).view(1, 1, S)    # (1,1,S)
+            token_idx = r - s                                        # (1,L,S)
+
+            # only where next-token exists: 0 <= token_idx < T-1
+            valid_next = (token_idx >= 0) & (token_idx < (T - 1))    # (1,L,S)
+            weights = weights * valid_next.to(dtype=weights.dtype)   # (1,L,S)
+
+            # targets: toks[:, token_idx+1] for each (r,s)
+            tgt_idx = (token_idx + 1).clamp(0, T - 1)                # (1,L,S)
+            tgt_idx_flat = tgt_idx.expand(B, L, S).reshape(B, L * S) # (B, L*S)
+            targets = toks.gather(1, tgt_idx_flat).reshape(B, L, S)  # (B, L, S)
+
+            # per-element CE: (B, L, S)
+            ce_per = F.cross_entropy(
+                tok_logits.reshape(B * L * S, V),
+                targets.reshape(B * L * S),
+                reduction="none",
+            ).reshape(B, L, S)
+
+            # weighted mean (include batch in denom!)
+            den = (weights.sum() * B).clamp_min(1.0)
+            ce_loss = (ce_per * weights).sum() / den
 
             latent_loss = _latent_mse(
-                pred=y[:, :-1, :, :],        # pre-LN
+                pred=y[:, :-1, :, :],       
                 target=x_in[:, 1:, :, :].detach(),
                 real_mask=mask[:, 1:, :, :],
             )
             loss = ce_loss + self.latent_loss_scale * latent_loss
-            print(f"ce_loss: {ce_loss.item()}, latent_loss: {latent_loss.item()}")
+
+            ce_clean = F.cross_entropy(
+                tok_logits[:, self.n_step - 1 : self.n_step - 1 + (toks.size(1) - 1), -1, :].reshape(-1, tok_logits.size(-1)),
+                toks[:, 1:].reshape(-1),
+            )
+            print(f"ce_clean: {ce_clean.item()}, ce_loss: {ce_loss.item()}, latent_loss: {latent_loss.item()}")
             new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
@@ -149,7 +190,6 @@ class ArDiffusion(nn.Module):
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
                 m = mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
-                print("x_in shape {}", x_in.shape)
                 y, _, backbone_state = self._one_step(
                     x_in[:, :idx+1, :, :],
                     backbone_state,
