@@ -126,9 +126,9 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_fixed_batch(
+    rows = get_config_batch(
         split,
-        1,
+        batch_size,
         DataConfig(
             dataset=overridable['dataset'],
             device=overridable['device'],
