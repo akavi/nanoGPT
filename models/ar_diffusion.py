@@ -169,9 +169,9 @@ class ArDiffusion(nn.Module):
             ce_loss = (ce_per * weights).sum() / den
 
             latent_loss = _latent_mse(
-                pred=y[:, :-1, :, :],       
-                target=x_in[:, 1:, :, :].detach(),
-                real_mask=mask[:, 1:, :, :],
+                pred=y[:, :-1, 1:, :],       
+                target=x_in[:, 1:, 1:, :].detach(),
+                real_mask=mask[:, 1:, 1:, :],
             )
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
