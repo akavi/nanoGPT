@@ -39,7 +39,7 @@ class ArDiffusion(nn.Module):
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
-        self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -58,16 +58,22 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
 
         # construct mask
         side_negative_mask = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)
+        side_positive_mask = torch.ones(1, self.n_step - 1, self.n_step, 1, device=device)
         main_positive_mask = torch.ones(1, t, self.n_step, 1, device=device)
-        mask = tilt(
+        train_mask = tilt(
             torch.concat([side_negative_mask, main_positive_mask, side_negative_mask], dim=1),
+            tilt_dim=2,
+            content_dim=1,
+        ) # (1, t + n_step - 1, n_step, 1)
+        gen_mask = tilt(
+            torch.concat([side_positive_mask, main_positive_mask, side_negative_mask], dim=1),
             tilt_dim=2,
             content_dim=1,
         ) # (1, t + n_step - 1, n_step, 1)
@@ -103,7 +109,7 @@ class ArDiffusion(nn.Module):
         cat_w = torch.concat([w_left, w_seq, w_right], dim=1)  # (1, T+2(S-1), S, 1)
         shaped_w = tilt(cat_w, tilt_dim=2, content_dim=1)      # (1, 
 
-        return x_in, mask, shaped_w
+        return x_in, train_mask, gen_mask, shaped_w
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
@@ -129,7 +135,7 @@ class ArDiffusion(nn.Module):
     # (updating the state for each subsequent sequence position
     def forward(self, toks, state, tokens = None):
         diffusion_state, backbone_state = state
-        x_in, mask, shaped_w = self._prep_backbone_inputs(toks)
+        x_in, train_mask, gen_mask, shaped_w = self._prep_backbone_inputs(toks)
         # Because LLMs are incapable of using multi-letter variable names for
         # params
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
@@ -141,7 +147,7 @@ class ArDiffusion(nn.Module):
             tok_logits = self.lm_head(y)  # (B, L, S, V)
 
             # base weights: (1, L, S)
-            weights = (mask[..., 0] * shaped_w[..., 0]).to(dtype=tok_logits.dtype)  # (1,L,S)
+            weights = (train_mask[..., 0] * shaped_w[..., 0]).to(dtype=tok_logits.dtype)  # (1,L,S)
 
             # map (row r, slot s) -> token_idx = r - s
             r = torch.arange(L, device=toks.device).view(1, L, 1)    # (1,L,1)
@@ -166,12 +172,12 @@ class ArDiffusion(nn.Module):
 
             # weighted mean (include batch in denom!)
             den = (weights.sum() * B).clamp_min(1.0)
-            ce_loss = (ce_per * weights).sum() / den
+            ce_loss = (ce_per * 1).sum() / B / T / S
 
             latent_loss = _latent_mse(
                 pred=y[:, :-1, 1:, :],       
                 target=x_in[:, 1:, 1:, :].detach(),
-                real_mask=mask[:, 1:, 1:, :],
+                real_mask=train_mask[:, 1:, 1:, :],
             )
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
@@ -186,7 +192,7 @@ class ArDiffusion(nn.Module):
         else:  # self.mode == "sample"
             fill_length = toks.shape[1] + self.n_step - 1
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
-                m = mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
+                m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
                 y, _, backbone_state = self._one_step(
                     x_in[:, :idx+1, :, :],
