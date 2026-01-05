@@ -40,6 +40,7 @@ class ArDiffusion(nn.Module):
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
+        self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -96,7 +97,6 @@ class ArDiffusion(nn.Module):
         # Tilt along step dimension, truncate along sequence dimension
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
         # x_in = cat_noi_exp_emb_toks[:, :-(self.n_step - 1), :, :]
-
 
         w_seq = w.expand(1, t, self.n_step, 1)  # (1,T,S,1)
         w_left  = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)  # (1,S-1,S,1)

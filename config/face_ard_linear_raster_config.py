@@ -135,8 +135,8 @@ def get_batch(split, batch_size):
         ),
     )
     block_size = overridable['block_size']
-    x_out = rows[:, :block_size]           # (B, 1024)
-    y_out = rows[:, 1:block_size + 1].contiguous()      # (B, 1024)
+    x_out = rows[:, :block_size].long()           # (B, 1024)
+    y_out = rows[:, 1:block_size + 1].long().contiguous()      # (B, 1024)
 
     return x_out, y_out
 
