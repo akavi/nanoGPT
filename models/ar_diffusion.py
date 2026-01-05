@@ -32,7 +32,6 @@ class ArDiffusion(nn.Module):
         self.device = config.device
 
         self.n_embd_per_step = config.n_embd // config.n_step
-        self.in_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
         self.wte = nn.Embedding(config.n_vocab, self.n_embd_per_step)
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
@@ -81,7 +80,6 @@ class ArDiffusion(nn.Module):
             self.n_step, 
             emb_toks.shape[-1]
         ) # (b, t, n_step, n_embd_per_step)
-        exp_emb_toks = self.in_norm(exp_emb_toks)
 
         # noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
         noise = torch.randn_like(exp_emb_toks[..., :1, :]) * emb_toks.std()
