@@ -58,7 +58,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
@@ -100,6 +100,9 @@ class ArDiffusion(nn.Module):
         cat_noi_exp_emb_toks = torch.concat([left_pad, noi_exp_emb_toks, right_pad], dim=1)
         # Tilt along step dimension, truncate along sequence dimension
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
+        cat_noi_exp_emb_toks = torch.concat([left_pad, exp_emb_toks, right_pad], dim=1)
+        cat_clean_exp_emb_toks = torch.concat([left_pad, exp_emb_toks, right_pad], dim=1)
+        x_clean = tilt(cat_clean_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
         # x_in = cat_noi_exp_emb_toks[:, :-(self.n_step - 1), :, :]
 
         w_seq = w.expand(1, t, self.n_step, 1)  # (1,T,S,1)
@@ -109,7 +112,7 @@ class ArDiffusion(nn.Module):
         cat_w = torch.concat([w_left, w_seq, w_right], dim=1)  # (1, T+2(S-1), S, 1)
         shaped_w = tilt(cat_w, tilt_dim=2, content_dim=1)      # (1, 
 
-        return x_in, train_mask, gen_mask, shaped_w
+        return x_in, x_clean, train_mask, gen_mask, shaped_w
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
@@ -135,7 +138,7 @@ class ArDiffusion(nn.Module):
     # (updating the state for each subsequent sequence position
     def forward(self, toks, state, tokens = None):
         diffusion_state, backbone_state = state
-        x_in, train_mask, gen_mask, shaped_w = self._prep_backbone_inputs(toks)
+        x_in, x_clean, train_mask, gen_mask, shaped_w = self._prep_backbone_inputs(toks)
         # Because LLMs are incapable of using multi-letter variable names for
         # params
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
@@ -180,28 +183,22 @@ class ArDiffusion(nn.Module):
 
             # latent loss scalar (unchanged)
             latent_loss = _latent_mse(
-                pred=y[:, :-1, 1:, :],
-                target=x_in[:, 1:, 1:, :].detach(),
-                real_mask=train_mask[:, 1:, 1:, :],
+                pred=y[:, :-1, :, :],
+                target=x_in[:, 1:, :, :].detach(),
+                real_mask=train_mask[:, 1:, :, :],
             )
 
             # ---- per-step latent diagnostics (S,) ----
             # latent term is only defined for steps 1..S-1 given your slicing (1:),
             # so we pad step 0 with NaN for alignment.
-            pred_lat = y[:, :-1, 1:, :]                 # (B, L-1, S-1, E)
-            tgt_lat  = x_in[:, 1:, 1:, :].detach()      # (B, L-1, S-1, E)
-            m_lat    = train_mask[:, 1:, 1:, :].expand_as(pred_lat)  # (B, L-1, S-1, E)
+            pred_lat = y[:, :-1, :, :]                 # (B, L-1, S-1, E)
+            tgt_lat  = x_in[:, 1:, :, :].detach()      # (B, L-1, S-1, E)
+            m_lat    = train_mask[:, 1:, :, :].expand_as(pred_lat)  # (B, L-1, S-1, E)
 
             se = (pred_lat - tgt_lat).pow(2)
             lat_num = (se * m_lat).sum(dim=(0, 1, 3))                  # (S-1,)
             lat_den = m_lat.sum(dim=(0, 1, 3)).clamp_min(1.0)          # (S-1,)
-            latent_loss_per_step = torch.full(
-                (S,),
-                float("nan"),
-                device=lat_num.device,
-                dtype=lat_num.dtype,
-            )
-            latent_loss_per_step[1:] = lat_num / lat_den               # (S,)
+            latent_loss_per_step = lat_num / lat_den               # (S,)
 
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
