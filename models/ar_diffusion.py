@@ -184,7 +184,7 @@ class ArDiffusion(nn.Module):
             # latent loss scalar (unchanged)
             latent_loss = _latent_mse(
                 pred=y[:, :-1, :, :],
-                target=x_in[:, 1:, :, :].detach(),
+                target=x_in[:, 1:, :, :],
                 real_mask=train_mask[:, 1:, :, :],
             )
 
