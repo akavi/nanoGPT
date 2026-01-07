@@ -39,7 +39,7 @@ class ArDiffusion(nn.Module):
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
-        # self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -146,7 +146,7 @@ class ArDiffusion(nn.Module):
             # logits for all slots
             tok_logits = self.lm_head(y)  # (B, L, S, V)
 
-            # base weights: (1, L, S)
+            # base weights: (1, L, S)  (intentionally NOT used in loss right now)
             weights = (train_mask[..., 0] * shaped_w[..., 0]).to(dtype=tok_logits.dtype)  # (1,L,S)
 
             # map (row r, slot s) -> token_idx = r - s
@@ -156,7 +156,6 @@ class ArDiffusion(nn.Module):
 
             # only where next-token exists: 0 <= token_idx < T-1
             valid_next = (token_idx >= 0) & (token_idx < (T - 1))    # (1,L,S)
-            weights = weights * valid_next.to(dtype=weights.dtype)   # (1,L,S)
 
             # targets: toks[:, token_idx+1] for each (r,s)
             tgt_idx = (token_idx + 1).clamp(0, T - 1)                # (1,L,S)
@@ -170,22 +169,64 @@ class ArDiffusion(nn.Module):
                 reduction="none",
             ).reshape(B, L, S)
 
-            # weighted mean (include batch in denom!)
-            den = (weights.sum() * B).clamp_min(1.0)
+            # ---- per-step CE diagnostics (S,) ----
+            valid_next_b = valid_next.expand(B, L, S)                 # (B,L,S)
+            ce_num = (ce_per * valid_next_b.to(ce_per.dtype)).sum(dim=(0, 1))          # (S,)
+            ce_den = valid_next_b.to(ce_per.dtype).sum(dim=(0, 1)).clamp_min(1.0)      # (S,)
+            ce_loss_per_step = ce_num / ce_den                                         # (S,)
+
+            # your current (intentionally unweighted) CE scalar
             ce_loss = (ce_per * 1).sum() / B / T / S
 
+            # latent loss scalar (unchanged)
             latent_loss = _latent_mse(
-                pred=y[:, :-1, 1:, :],       
+                pred=y[:, :-1, 1:, :],
                 target=x_in[:, 1:, 1:, :].detach(),
                 real_mask=train_mask[:, 1:, 1:, :],
             )
+
+            # ---- per-step latent diagnostics (S,) ----
+            # latent term is only defined for steps 1..S-1 given your slicing (1:),
+            # so we pad step 0 with NaN for alignment.
+            pred_lat = y[:, :-1, 1:, :]                 # (B, L-1, S-1, E)
+            tgt_lat  = x_in[:, 1:, 1:, :].detach()      # (B, L-1, S-1, E)
+            m_lat    = train_mask[:, 1:, 1:, :].expand_as(pred_lat)  # (B, L-1, S-1, E)
+
+            se = (pred_lat - tgt_lat).pow(2)
+            lat_num = (se * m_lat).sum(dim=(0, 1, 3))                  # (S-1,)
+            lat_den = m_lat.sum(dim=(0, 1, 3)).clamp_min(1.0)          # (S-1,)
+            latent_loss_per_step = torch.full(
+                (S,),
+                float("nan"),
+                device=lat_num.device,
+                dtype=lat_num.dtype,
+            )
+            latent_loss_per_step[1:] = lat_num / lat_den               # (S,)
+
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             ce_clean = F.cross_entropy(
                 tok_logits[:, self.n_step - 1 : self.n_step - 1 + (toks.size(1) - 1), -1, :].reshape(-1, tok_logits.size(-1)),
                 toks[:, 1:].reshape(-1),
             )
-            print(f"ce_clean: {ce_clean.item()}, ce_loss: {ce_loss.item()}, latent_loss: {latent_loss.item()}")
+
+            print(
+                "ce_clean:",
+                float(ce_clean.detach().cpu()),
+                "ce_loss:",
+                float(ce_loss.detach().cpu()),
+                "latent_loss:",
+                float(latent_loss.detach().cpu()),
+            )
+            print(
+                "ce_loss_per_step:",
+                [float(x) for x in ce_loss_per_step.detach().cpu().tolist()],
+            )
+            print(
+                "latent_loss_per_step:",
+                [float(x) for x in latent_loss_per_step.detach().cpu().tolist()],
+            )
+
             new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
