@@ -39,7 +39,6 @@ class ArDiffusion(nn.Module):
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
-        self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
