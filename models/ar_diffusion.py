@@ -58,7 +58,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
@@ -100,19 +100,8 @@ class ArDiffusion(nn.Module):
         cat_noi_exp_emb_toks = torch.concat([left_pad, noi_exp_emb_toks, right_pad], dim=1)
         # Tilt along step dimension, truncate along sequence dimension
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
-        cat_noi_exp_emb_toks = torch.concat([left_pad, exp_emb_toks, right_pad], dim=1)
-        cat_clean_exp_emb_toks = torch.concat([left_pad, exp_emb_toks, right_pad], dim=1)
-        x_clean = tilt(cat_clean_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
-        # x_in = cat_noi_exp_emb_toks[:, :-(self.n_step - 1), :, :]
 
-        w_seq = w.expand(1, t, self.n_step, 1)  # (1,T,S,1)
-        w_left  = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)  # (1,S-1,S,1)
-        w_right = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)  # (1,S-1,S,1)
-
-        cat_w = torch.concat([w_left, w_seq, w_right], dim=1)  # (1, T+2(S-1), S, 1)
-        shaped_w = tilt(cat_w, tilt_dim=2, content_dim=1)      # (1, 
-
-        return x_in, x_clean, train_mask, gen_mask, shaped_w
+        return x_in, train_mask, gen_mask
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
@@ -136,51 +125,41 @@ class ArDiffusion(nn.Module):
     #  if mode == train, loss is crossentropy wrt to next position in "diffusion" array
     # if mode == sample, we need to do prefill for the "triangle" getting the newest tokens and then store it in the state
     # (updating the state for each subsequent sequence position
-    def forward(self, toks, state, tokens = None):
+    def forward(self, toks, state, targets = None):
         diffusion_state, backbone_state = state
-        x_in, x_clean, train_mask, gen_mask, shaped_w = self._prep_backbone_inputs(toks)
+        # shaped_w intentionally
+        x_in, train_mask, gen_mask = self._prep_backbone_inputs(toks)
         # Because LLMs are incapable of using multi-letter variable names for
         # params
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
 
         if self.mode == "train":
-            # y_pre intentionally ignored
-            y, _, new_backbone_state = self._one_step(x_in, backbone_state)
-
-            # logits for all slots
+            y, new_backbone_state = self._one_step(x_in, backbone_state)
             tok_logits = self.lm_head(y)  # (B, L, S, V)
+            new_diff_state = y
 
-            # base weights: (1, L, S)  (intentionally NOT used in loss right now)
-            weights = (train_mask[..., 0] * shaped_w[..., 0]).to(dtype=tok_logits.dtype)  # (1,L,S)
+            side_target_mask = torch.zeros(B, S - 1, S, dtype=toks.dtype, device=toks.device)  # (B, S-1, S)
 
-            # map (row r, slot s) -> token_idx = r - s
-            r = torch.arange(L, device=toks.device).view(1, L, 1)    # (1,L,1)
-            s = torch.arange(S, device=toks.device).view(1, 1, S)    # (1,1,S)
-            token_idx = r - s                                        # (1,L,S)
+            targets = toks.unsqueeze(-1).expand(B, T, S)  # (B, T, S)
+            targets = tilt(
+                torch.concat([side_target_mask, targets, side_target_mask], dim=1),
+                tilt_dim=2,
+                content_dim=1,
+            ) # (1, t + n_step - 1, n_step)
 
-            # only where next-token exists: 0 <= token_idx < T-1
-            valid_next = (token_idx >= 0) & (token_idx < (T - 1))    # (1,L,S)
-
-            # targets: toks[:, token_idx+1] for each (r,s)
-            tgt_idx = (token_idx + 1).clamp(0, T - 1)                # (1,L,S)
-            tgt_idx_flat = tgt_idx.expand(B, L, S).reshape(B, L * S) # (B, L*S)
-            targets = toks.gather(1, tgt_idx_flat).reshape(B, L, S)  # (B, L, S)
-
-            # per-element CE: (B, L, S)
+            Ln = L - 1
+            # logits for all slots
             ce_per = F.cross_entropy(
-                tok_logits.reshape(B * L * S, V),
-                targets.reshape(B * L * S),
+                tok_logits[:, :-1, :, :].reshape(B * Ln * S, V),
+                targets[:, 1:, :].reshape(B * Ln * S),
                 reduction="none",
-            ).reshape(B, L, S)
+            ).reshape(B, Ln, S)  # (B, Ln, S)
 
-            # ---- per-step CE diagnostics (S,) ----
-            valid_next_b = valid_next.expand(B, L, S)                 # (B,L,S)
-            ce_num = (ce_per * valid_next_b.to(ce_per.dtype)).sum(dim=(0, 1))          # (S,)
-            ce_den = valid_next_b.to(ce_per.dtype).sum(dim=(0, 1)).clamp_min(1.0)      # (S,)
-            ce_loss_per_step = ce_num / ce_den                                         # (S,)
+            # ---- mask: only count "real" ladder slots (and only where next-token exists) ----
+            m = (train_mask[:, :-1, :, :] * train_mask[:, 1:, :, :]).squeeze(-1)          # (1, Ln, S)
+            m_b = m.expand(B, Ln, S).to(ce_per.dtype)         # (B, Ln, S)
 
-            # your current (intentionally unweighted) CE scalar
-            ce_loss = (ce_per * 1).sum() / B / T / S
+            ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
             # latent loss scalar (unchanged)
             latent_loss = _latent_mse(
@@ -189,43 +168,7 @@ class ArDiffusion(nn.Module):
                 real_mask=train_mask[:, 1:, :, :],
             )
 
-            # ---- per-step latent diagnostics (S,) ----
-            # latent term is only defined for steps 1..S-1 given your slicing (1:),
-            # so we pad step 0 with NaN for alignment.
-            pred_lat = y[:, :-1, :, :]                 # (B, L-1, S-1, E)
-            tgt_lat  = x_in[:, 1:, :, :].detach()      # (B, L-1, S-1, E)
-            m_lat    = train_mask[:, 1:, :, :].expand_as(pred_lat)  # (B, L-1, S-1, E)
-
-            se = (pred_lat - tgt_lat).pow(2)
-            lat_num = (se * m_lat).sum(dim=(0, 1, 3))                  # (S-1,)
-            lat_den = m_lat.sum(dim=(0, 1, 3)).clamp_min(1.0)          # (S-1,)
-            latent_loss_per_step = lat_num / lat_den               # (S,)
-
             loss = ce_loss + self.latent_loss_scale * latent_loss
-
-            ce_clean = F.cross_entropy(
-                tok_logits[:, self.n_step - 1 : self.n_step - 1 + (toks.size(1) - 1), -1, :].reshape(-1, tok_logits.size(-1)),
-                toks[:, 1:].reshape(-1),
-            )
-
-            print(
-                "ce_clean:",
-                float(ce_clean.detach().cpu()),
-                "ce_loss:",
-                float(ce_loss.detach().cpu()),
-                "latent_loss:",
-                float(latent_loss.detach().cpu()),
-            )
-            print(
-                "ce_loss_per_step:",
-                [float(x) for x in ce_loss_per_step.detach().cpu().tolist()],
-            )
-            print(
-                "latent_loss_per_step:",
-                [float(x) for x in latent_loss_per_step.detach().cpu().tolist()],
-            )
-
-            new_diff_state = y
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
         else:  # self.mode == "sample"
@@ -233,7 +176,7 @@ class ArDiffusion(nn.Module):
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
                 m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
-                y, _, backbone_state = self._one_step(
+                y, backbone_state = self._one_step(
                     x_in[:, :idx+1, :, :],
                     backbone_state,
                     pos_idx=idx,
@@ -299,13 +242,13 @@ class ArDiffusion(nn.Module):
 
         y_flat, new_backbone_state = self.backbone(x_flat, backbone_state)  # (B,L,n_embd)
 
-        # pre-LN version for latent MSE
-        # TODO: mamba should return the full y, not just the most recent
+        suffix_len = L - pos_idx
+        y_flat = y_flat[:, -suffix_len:, :]
+
         y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
-        # post-LN version for logits / state
         y = self.out_norm(y_pre)
-        return y, y_pre, new_backbone_state
+        return y, new_backbone_state
 
 
 def tilt(
