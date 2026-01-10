@@ -39,6 +39,7 @@ class ArDiffusion(nn.Module):
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
+        # weight intentionally untied
 
         # init all weights
         self.apply(self._init_weights)
@@ -143,7 +144,8 @@ class ArDiffusion(nn.Module):
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
 
         if self.mode == "train":
-            y, y_pre, new_backbone_state = self._one_step(x_in, backbone_state)
+            # y_pre intentionally ignored
+            y, _, new_backbone_state = self._one_step(x_in, backbone_state)
 
             # logits for all slots
             tok_logits = self.lm_head(y)  # (B, L, S, V)
