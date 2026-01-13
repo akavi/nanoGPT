@@ -17,6 +17,7 @@ class ArDiffusionConfig:
     mode: Literal["train"] | Literal["sample"]
     latent_loss_scale: float
     device: str
+    gamma: float
 
 class ArDiffusion(nn.Module):
     """
@@ -58,6 +59,7 @@ class ArDiffusion(nn.Module):
         self.n_vocab = config.n_vocab
         self.n_step = config.n_step
         self.latent_loss_scale = config.latent_loss_scale
+        self.gamma = config.gamma
         self.n_embd = config.n_embd
         self.device = config.device
 
@@ -122,7 +124,10 @@ class ArDiffusion(nn.Module):
 
         # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
         w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1: ]
-        w = w.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
+
+        w_base = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1:]  # [1/n, 2/n, ..., 1]
+        w_base = w_base.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
+        w = w_base ** (1 - self.gamma)
         noi_exp_emb_toks = w*exp_emb_toks + (1.0 - w)*noise
 
         left_pad  = torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
