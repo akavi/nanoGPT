@@ -19,6 +19,17 @@ class ArDiffusionConfig:
     device: str
 
 class ArDiffusion(nn.Module):
+    """
+    ArDiffusion: Autoregressive language model with per-token diffusion refinement.
+
+    Each token embedding is refined through `n_step` diffusion steps. The sequence
+    is restructured via diagonal "tilting" so that position i observes a ladder of
+    diffusion states: token i-S+1 at step S (cleanest), token i-S+2 at step S-1, ...,
+    token i at step 1 (noisiest). This maintains causality while enabling iterative
+    refinement within the autoregressive framework.
+
+    Loss: cross-entropy on token predictions + scaled MSE on latent reconstructions.
+    """
     def __init__(self, config, backbone: nn.Module):
         super().__init__()
         assert config.n_vocab is not None
@@ -39,7 +50,7 @@ class ArDiffusion(nn.Module):
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
-        # weight intentionally untied
+        self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -169,6 +180,8 @@ class ArDiffusion(nn.Module):
             )
 
             loss = ce_loss + self.latent_loss_scale * latent_loss
+
+            print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
         else:  # self.mode == "sample"
