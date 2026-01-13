@@ -20,15 +20,34 @@ class ArDiffusionConfig:
 
 class ArDiffusion(nn.Module):
     """
-    ArDiffusion: Autoregressive language model with per-token diffusion refinement.
-
-    Each token embedding is refined through `n_step` diffusion steps. The sequence
-    is restructured via diagonal "tilting" so that position i observes a ladder of
-    diffusion states: token i-S+1 at step S (cleanest), token i-S+2 at step S-1, ...,
-    token i at step 1 (noisiest). This maintains causality while enabling iterative
-    refinement within the autoregressive framework.
-
-    Loss: cross-entropy on token predictions + scaled MSE on latent reconstructions.
+    Autoregressive model with diagonal diffusion ladders.
+    
+    At each sequence position i, the model sees a "ladder" of S tokens at 
+    decreasing noise levels:
+        input[i] = [tok_{i-S+1} @ step S-1 (cleanest),
+                    tok_{i-S+2} @ step S-2,
+                    ...,
+                    tok_i @ step 0 (noisiest)]
+    
+    The model outputs the *next* ladder:
+        output[i] = [tok_{i-S+2} @ step S-1,
+                     tok_{i-S+3} @ step S-2,
+                     ...,
+                     tok_{i+1} @ step 0]
+    
+    Each token thus "ascends" the ladder across sequence positions: appearing 
+    first at step 0 (noisy), then at step 1 (cleaner) in the next position, 
+    etc., until reaching step S-1 (clean) S-1 positions later.
+    
+    Losses:
+        - CE on tok_{i+1} from the cleanest output slot (step S-1)
+        - MSE between output ladder and next position's input ladder, 
+          encouraging the model to predict the partially-denoised versions
+          that will appear in subsequent inputs
+    
+    At inference, the model fills each rung by re-using its own outputs from
+    previous positions, so rungs below S-1 contain model predictions rather
+    than noised ground truth.
     """
     def __init__(self, config, backbone: nn.Module):
         super().__init__()
@@ -148,6 +167,25 @@ class ArDiffusion(nn.Module):
             y, new_backbone_state = self._one_step(x_in, backbone_state)
             tok_logits = self.lm_head(y)  # (B, L, S, V)
             new_diff_state = y
+
+            # In training forward, after computing y and before loss aggregation:
+            with torch.no_grad():
+                for s in range(S):
+                    mask_s = train_mask[:, 1:, s:s+1, :]  # (1, Ln, 1, 1)
+                    
+                    # What model actually outputs
+                    pred_s = y[:, :-1, s, :]
+                    # What it's trying to match
+                    target_s = x_in[:, 1:, s, :].detach()
+                    # What input was at this rung
+                    input_s = x_in[:, :-1, s, :]
+                    
+                    # Model's MSE
+                    model_mse = ((pred_s - target_s).pow(2) * mask_s.squeeze(-1)).sum() / mask_s.sum()
+                    # Passthrough MSE (just copying input)
+                    passthrough_mse = ((input_s - target_s).pow(2) * mask_s.squeeze(-1)).sum() / mask_s.sum()
+        
+                    print(f"step {s}: model_mse={model_mse:.4f}, passthrough_mse={passthrough_mse:.4f}, ratio={model_mse/passthrough_mse:.4f}")
 
             side_target_mask = torch.zeros(B, S - 1, S, dtype=toks.dtype, device=toks.device)  # (B, S-1, S)
 

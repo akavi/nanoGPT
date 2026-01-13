@@ -6,9 +6,8 @@ uv python install 3.13
 rm -rf .venv
 uv venv --python 3.13
 source .venv/bin/activate
-python -V   # should say 3.13.x
 uv sync
-uv run python3 config/face_ard_linear_raster_config.py --n_step=1 --latent_loss_scale=1.0 --n_embd=384
+uv run python3 config/face_ard_linear_raster_config.py --n_step=2 --latent_loss_scale=0.0 --n_embd=384
 
 git fetch && git reset origin/master --hard
 
