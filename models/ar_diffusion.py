@@ -121,8 +121,7 @@ class ArDiffusion(nn.Module):
             emb_toks.shape[-1]
         ) # (b, t, n_step, n_embd_per_step)
 
-        # noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
-        noise = torch.randn_like(exp_emb_toks[..., :1, :]) * emb_toks.std()
+        noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device)   # (B,T,1,E)
 
         # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
         w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1: ]
