@@ -181,24 +181,16 @@ class ArDiffusion(nn.Module):
             tok_logits = self.lm_head(y)  # (B, L, S, V)
             new_diff_state = y
 
-            # In training forward, after computing y and before loss aggregation:
             with torch.no_grad():
-                for s in range(S):
-                    mask_s = train_mask[:, 1:, s:s+1, :]  # (1, Ln, 1, 1)
+                for s in range(S - 1):  # can't go beyond S-1
+                    input_s = x_in[:, :-1, s, :]          # (B, L-1, E) - noisy
+                    gt_cleaner = x_in[:, 1:, s+1, :]      # (B, L-1, E) - same token, cleaner
+                    output_cleaner = y[:, :-1, s+1, :]    # (B, L-1, E) - model's attempt
                     
-                    # What model actually outputs
-                    pred_s = y[:, :-1, s, :]
-                    # What it's trying to match
-                    target_s = x_in[:, 1:, s, :].detach()
-                    # What input was at this rung
-                    input_s = x_in[:, :-1, s, :]
+                    input_to_gt = ((input_s - gt_cleaner)**2).mean()
+                    output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
                     
-                    # Model's MSE
-                    model_mse = ((pred_s - target_s).pow(2) * mask_s.squeeze(-1)).sum() / mask_s.sum()
-                    # Passthrough MSE (just copying input)
-                    passthrough_mse = ((input_s - target_s).pow(2) * mask_s.squeeze(-1)).sum() / mask_s.sum()
-        
-                    print(f"step {s}: model_mse={model_mse:.4f}, passthrough_mse={passthrough_mse:.4f}, ratio={model_mse/passthrough_mse:.4f}")
+                    print(f"step {s}->{s+1}: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
 
             side_target_mask = torch.zeros(B, S - 1, S, dtype=toks.dtype, device=toks.device)  # (B, S-1, S)
 
@@ -224,18 +216,11 @@ class ArDiffusion(nn.Module):
             ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
             # MSE toward target (want to minimize)
-            toward_target_mse = _latent_mse(
+            latent_loss = _latent_mse(
                 pred=y[:, :-1, :, :],
                 target=x_in[:, 1:, :, :].detach(),
                 real_mask=train_mask[:, 1:, :, :],
             )
-            away_from_noise_mse = _latent_mse(
-                pred=y[:, :-1, :, :],
-                target=noise_tilted[:, 1:, :, :].detach(),
-                real_mask=train_mask[:, 1:, :, :],
-            )
-
-            latent_loss = toward_target_mse - 0*away_from_noise_mse
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
