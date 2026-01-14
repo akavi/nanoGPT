@@ -90,7 +90,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
@@ -136,7 +136,15 @@ class ArDiffusion(nn.Module):
         # Tilt along step dimension, truncate along sequence dimension
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
 
-        return x_in, train_mask, gen_mask
+        noise_exp = noise.expand(*exp_emb_toks.shape)
+        cat_noise = torch.concat([
+            torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device),
+            noise_exp,
+            torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
+        ], dim=1)
+        noise_tilted = tilt(cat_noise, tilt_dim=2, content_dim=1)
+        
+        return x_in, train_mask, gen_mask, noise_tilted
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
@@ -163,7 +171,7 @@ class ArDiffusion(nn.Module):
     def forward(self, toks, state, targets = None):
         diffusion_state, backbone_state = state
         # shaped_w intentionally
-        x_in, train_mask, gen_mask = self._prep_backbone_inputs(toks)
+        x_in, train_mask, gen_mask, noise_tilted = self._prep_backbone_inputs(toks)
         # Because LLMs are incapable of using multi-letter variable names for
         # params
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
@@ -215,13 +223,19 @@ class ArDiffusion(nn.Module):
 
             ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
-            # latent loss scalar (unchanged)
-            latent_loss = _latent_mse(
+            # MSE toward target (want to minimize)
+            toward_target_mse = _latent_mse(
                 pred=y[:, :-1, :, :],
                 target=x_in[:, 1:, :, :].detach(),
                 real_mask=train_mask[:, 1:, :, :],
             )
+            away_from_noise_mse = _latent_mse(
+                pred=y[:, :-1, :, :],
+                target=noise_tilted[:, 1:, :, :].detach(),
+                real_mask=train_mask[:, 1:, :, :],
+            )
 
+            latent_loss = toward_target_mse - away_from_noise_mse
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
