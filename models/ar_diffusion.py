@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Literal, Optional, Any
+from models.model import MLP
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -70,8 +71,9 @@ class ArDiffusion(nn.Module):
         self.drop = nn.Dropout(config.dropout)
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
-        self.lm_head = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
-        self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.pre_lm_head = MLP(self.n_embd_per_step)
+        self.lm_projection = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
+        self.wte.weight = self.lm_projection.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -241,6 +243,10 @@ class ArDiffusion(nn.Module):
             tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V) from cleanest sublatent
             return tok_logits, (diffusion_state, backbone_state), None
 
+
+    def lm_head(self, x: Tensor) -> Tensor:
+        x = self.pre_lm_head(x)  # (B,L,E)
+        return self.lm_projection(x)  # (B,L,V)
 
     @torch.no_grad()
     def generate(self, tok, max_new_tokens, state, temperature=1.0, top_k=None):

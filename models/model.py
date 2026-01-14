@@ -138,12 +138,12 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, n_embd, bias = False, dropout = 0.0):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(n_embd, 4 * n_embd, bias=bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.c_proj  = nn.Linear(4 * n_embd, n_embd, bias=bias)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -174,7 +174,7 @@ class CsaBlock(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config, layer)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config.n_embd, bias=config.bias, dropout=config.dropout)
 
     def forward(self, x, state):
         x = x + self.attn(self.ln_1(x))
@@ -209,7 +209,7 @@ class SubLatentCsaBlock(nn.Module):
         self.ln_1 = LayerNorm(self.n_embd_per_step, bias=config.bias)
         self.attn = CausalSelfAttention(config, layer)
         self.ln_2 = LayerNorm(self.n_embd_per_step, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config.n_embd, bias=config.bias, dropout=config.dropout)
 
     def _per_latent_ln(self, x: torch.Tensor, ln: nn.Module) -> torch.Tensor:
         """
