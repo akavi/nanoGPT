@@ -235,7 +235,7 @@ class ArDiffusion(nn.Module):
                 real_mask=train_mask[:, 1:, :, :],
             )
 
-            latent_loss = toward_target_mse - away_from_noise_mse
+            latent_loss = toward_target_mse - 0*away_from_noise_mse
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
