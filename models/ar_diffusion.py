@@ -178,7 +178,7 @@ class ArDiffusion(nn.Module):
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
 
         if self.mode == "train":
-            y, new_backbone_state = self._one_step(x_in, backbone_state)
+            y, y_pre, new_backbone_state = self._one_step(x_in, backbone_state)
             tok_logits = self.lm_head(y)  # (B, L, S, V)
             new_diff_state = y
 
@@ -186,7 +186,7 @@ class ArDiffusion(nn.Module):
                 for s in range(S - 1):  # can't go beyond S-1
                     input_s = x_in[:, :-1, s, :]          # (B, L-1, E) - noisy
                     gt_cleaner = x_in[:, 1:, s+1, :]      # (B, L-1, E) - same token, cleaner
-                    output_cleaner = y[:, :-1, s+1, :]    # (B, L-1, E) - model's attempt
+                    output_cleaner = y_pre[:, :-1, s+1, :]    # (B, L-1, E) - model's attempt
                     
                     input_to_gt = ((input_s - gt_cleaner)**2).mean()
                     output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
@@ -218,7 +218,7 @@ class ArDiffusion(nn.Module):
 
             # MSE toward target (want to minimize)
             latent_loss = _latent_mse(
-                pred=y[:, :-1, :, :],
+                pred=y_pre[:, :-1, :, :],
                 target=x_in[:, 1:, :, :].detach(),
                 real_mask=train_mask[:, 1:, :, :],
             )
@@ -232,12 +232,12 @@ class ArDiffusion(nn.Module):
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
                 m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
-                y, backbone_state = self._one_step(
+                y, y_pre, backbone_state = self._one_step(
                     x_in[:, :idx+1, :, :],
                     backbone_state,
                     pos_idx=idx,
                 )
-                diffusion_state = torch.concat([diffusion_state, y[:, -1:, :, :]], dim=1)
+                diffusion_state = torch.concat([diffusion_state, y_pre[:, -1:, :, :]], dim=1)
 
             tok_logits = self.lm_head(y[:, :, -1, :])  # (B,T,V) from cleanest sublatent
             return tok_logits, (diffusion_state, backbone_state), None
@@ -308,7 +308,7 @@ class ArDiffusion(nn.Module):
         y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
         y = self.out_norm(y_pre)
-        return y, new_backbone_state
+        return y, y_pre, new_backbone_state
 
 
 def tilt(
