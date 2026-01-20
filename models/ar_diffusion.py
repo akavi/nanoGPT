@@ -213,7 +213,6 @@ class ArDiffusion(nn.Module):
             # ---- mask: only count "real" ladder slots (and only where next-token exists) ----
             m = (train_mask[:, :-1, :, :] * train_mask[:, 1:, :, :]).squeeze(-1)          # (1, Ln, S)
             m_b = m.expand(B, Ln, S).to(ce_per.dtype)         # (B, Ln, S)
-
             ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
             # MSE toward target (want to minimize)
@@ -307,8 +306,8 @@ class ArDiffusion(nn.Module):
 
         y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
-        y = self.out_norm(y_pre)
-        return y, new_backbone_state
+        # y = self.out_norm(y_pre)
+        return y_pre, new_backbone_state
 
 
 def tilt(
