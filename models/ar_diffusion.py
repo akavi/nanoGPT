@@ -69,6 +69,7 @@ class ArDiffusion(nn.Module):
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
         self.drop = nn.Dropout(config.dropout)
+        self.in_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.pre_lm_head = MLP(self.n_embd_per_step)
@@ -136,6 +137,7 @@ class ArDiffusion(nn.Module):
         cat_noi_exp_emb_toks = torch.concat([left_pad, noi_exp_emb_toks, right_pad], dim=1)
         # Tilt along step dimension, truncate along sequence dimension
         x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
+        x_in = self.in_norm(x_in)
 
         noise_exp = noise.expand(*exp_emb_toks.shape)
         cat_noise = torch.concat([
@@ -243,7 +245,7 @@ class ArDiffusion(nn.Module):
 
 
     def lm_head(self, x: Tensor) -> Tensor:
-        x = self.pre_lm_head(x)  # (B,L,E)
+        # x = self.pre_lm_head(x)  # (B,L,E)
         return self.lm_projection(x)  # (B,L,V)
 
     @torch.no_grad()
@@ -306,8 +308,8 @@ class ArDiffusion(nn.Module):
 
         y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
 
-        # y = self.out_norm(y_pre)
-        return y_pre, new_backbone_state
+        y = self.out_norm(y_pre)
+        return y, new_backbone_state
 
 
 def tilt(
