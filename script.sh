@@ -12,7 +12,7 @@ uv run python3 config/face_ard_linear_raster_config.py --n_step=2 --latent_loss_
 git fetch && git reset origin/master --hard
 
 
-export LOGIN=root@31.22.104.32
+export LOGIN=root@86.38.238.87
 export DIR=out-face-linear-raster
 scp -r -P 22 $LOGIN:~/nanoGPT/$DIR .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
