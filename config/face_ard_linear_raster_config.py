@@ -41,7 +41,8 @@ overridable = override(sys.argv, {
     "n_embd": 8,
     "latent_loss_scale": 0.0,
     "max_iters": 3000,
-    "gamma": 0.0
+    "gamma": 0.0,
+    "batch_size": 64,
 })
 
 # -----------------------------------------------------------------------------#
@@ -158,7 +159,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=128,                # also used in get_batch
+    batch_size=overridable['batch_size'],
 
     eval_only=False,
     eval_interval=250,

@@ -93,7 +93,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
@@ -140,8 +140,8 @@ class ArDiffusion(nn.Module):
         right_pad = torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
         cat_noi_exp_emb_toks = torch.concat([left_pad, noi_exp_emb_toks, right_pad], dim=1)
         # Tilt along step dimension, truncate along sequence dimension
-        x_in = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
-        x_in = self.in_norm(x_in)
+        x_raw = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
+        x_in = self.in_norm(x_raw)
 
         noise_exp = noise.expand(*exp_emb_toks.shape)
         cat_noise = torch.concat([
@@ -151,7 +151,17 @@ class ArDiffusion(nn.Module):
         ], dim=1)
         noise_tilted = tilt(cat_noise, tilt_dim=2, content_dim=1)
         
-        return x_in, train_mask, gen_mask, noise_tilted
+        # noi_exp_emb_toks: (B, T, S, E)
+        raw_step_mse = ((noi_exp_emb_toks[:,:,1:,:] - noi_exp_emb_toks[:,:,:-1,:])**2).mean(dim=(0,1,3))
+        w0 = 1/ self.n_step
+        m0 = w0*emb_toks + (1-w0)*noise.squeeze(2)   # shapes (B,T,E)
+        mse_noise_to_m0 = ((noise.squeeze(2) - m0)**2).mean()
+
+        # construct a ladder that is pure noise in every rung (or at least rung 0)
+        cat_noise = torch.cat([left_pad, noise_exp, right_pad], dim=1)
+        noise_tilted_raw = tilt(cat_noise, tilt_dim=2, content_dim=1)   # (B, L, S, E)
+        noise_tilted_normed = self.in_norm(noise_tilted_raw)
+        return x_in, train_mask, gen_mask, noise_tilted_normed, x_raw, noise_tilted_raw
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
@@ -178,18 +188,35 @@ class ArDiffusion(nn.Module):
     def forward(self, toks, state, targets = None):
         diffusion_state, backbone_state = state
         # shaped_w intentionally
-        x_in, train_mask, gen_mask, noise_tilted = self._prep_backbone_inputs(toks)
+        x_in, train_mask, gen_mask, noise, x_raw, noise_raw = self._prep_backbone_inputs(toks)
         # Because LLMs are incapable of using multi-letter variable names for
         # params
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
 
         if self.mode == "train":
-            y, new_backbone_state = self._one_step(x_in, backbone_state)
+            y, y_raw, new_backbone_state = self._one_step(x_in, backbone_state)
             tok_logits = self.lm_head(y)  # (B, L, S, V)
             new_diff_state = y
 
             with torch.no_grad():
-                input_s = noise_tilted[:, :-1, 0, :]  # (B, L-1, E) - pure noise
+                print("RAW")
+                input_s = noise_raw[:, 1:, 0, :]
+                gt_cleaner = x_raw[:, 1:, 0, :]      # (B, L-1, E) - same token, cleaner
+                output_cleaner = y_raw[:, :-1, 0, :]    # (B, L-1, E) - model's attempt
+                input_to_gt = ((input_s - gt_cleaner)**2).mean()
+                output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
+                print(f"noise->0: input_to_gt={input_to_gt:.8f}, output_to_gt={output_to_gt:.8f}, ratio={output_to_gt/input_to_gt:.4f}")
+                for s in range(S - 1):  # can't go beyond S-1
+                    input_s = x_raw[:, :-1, s, :]          # (B, L-1, E) - noisy
+                    gt_cleaner = x_raw[:, 1:, s+1, :]      # (B, L-1, E) - same token, cleaner
+                    output_cleaner = y_raw[:, :-1, s+1, :]    # (B, L-1, E) - model's attempt
+                    
+                    input_to_gt = ((input_s - gt_cleaner)**2).mean()
+                    output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
+                    
+                    print(f"step {s}->{s+1}: input_to_gt={input_to_gt:.8f}, output_to_gt={output_to_gt:.8f}, ratio={output_to_gt/input_to_gt:.4f}")
+                print("NORMED")
+                input_s = noise[:, 1:, 0, :]
                 gt_cleaner = x_in[:, 1:, 0, :]      # (B, L-1, E) - same token, cleaner
                 output_cleaner = y[:, :-1, 0, :]    # (B, L-1, E) - model's attempt
                 input_to_gt = ((input_s - gt_cleaner)**2).mean()
@@ -317,9 +344,8 @@ class ArDiffusion(nn.Module):
         y_flat = y_flat[:, -suffix_len:, :]
 
         y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
-
         y = self.out_norm(y_pre)
-        return y, new_backbone_state
+        return y, y_pre, new_backbone_state
 
 
 def tilt(

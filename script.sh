@@ -7,7 +7,7 @@ rm -rf .venv
 uv venv --python 3.13
 source .venv/bin/activate
 uv sync
-uv run python3 config/face_ard_linear_raster_config.py --n_step=2 --latent_loss_scale=1.0 --n_embd=384
+uv run python3 config/face_ard_linear_raster_config.py --n_step=4 --latent_loss_scale=1.0 --n_embd=384
 
 git fetch && git reset origin/master --hard
 
