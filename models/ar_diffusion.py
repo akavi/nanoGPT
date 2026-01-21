@@ -93,10 +93,10 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
-        assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
+        assert t <= self.n_block
 
         # construct mask
         side_negative_mask = torch.zeros(1, self.n_step - 1, self.n_step, 1, device=device)
@@ -113,55 +113,51 @@ class ArDiffusion(nn.Module):
             content_dim=1,
         ) # (1, t + n_step - 1, n_step, 1)
 
-        emb_toks = self.wte(toks) # token embeddings of shape (b, t, n_embd)
-        # emb_toks = toks.unsqueeze(-1).repeat(1, 1, self.n_embd_per_step)# self.wte(toks) # token embeddings of shape (b, t, n_embd)
-        assert emb_toks.shape[-1] == self.n_embd_per_step, (emb_toks.shape, self.n_embd_per_step)
+        emb_toks = self.wte(toks)  # (b, t, E)
         exp_emb_toks = emb_toks.unsqueeze(-2).expand(
-            *emb_toks.shape[:-1], 
-            self.n_step, 
+            *emb_toks.shape[:-1],
+            self.n_step,
             emb_toks.shape[-1]
-        ) # (b, t, n_step, n_embd_per_step)
+        )  # (b, t, S, E)
 
         if self.mode == "sample":
             scale = 1
         else:
-            scale = emb_toks.std(dim=(0,1), keepdim=True)
-        noise = torch.randn(b, t, 1, self.n_embd_per_step, device=device) * scale  # (b, t, 1, n_embd_per_step)
+            scale = emb_toks.std(dim=(0, 1), keepdim=True)
 
-        # weight on clean: goes from 1/self.n_step to 1.0, excludes 0.0 (no clean)
-        w = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1: ]
+        # --- independent noise streams ---
+        noise_in  = torch.randn(b, t, 1, self.n_embd_per_step, device=device) * scale
+        noise_tgt = torch.randn(b, t, 1, self.n_embd_per_step, device=device) * scale
 
-        w_base = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1:]  # [1/n, 2/n, ..., 1]
-        w_base = w_base.view(1, 1, self.n_step, 1)                                  # (1,1,S,1)
-        w = w_base ** (1 - self.gamma)
-        noi_exp_emb_toks = w*exp_emb_toks + (1.0 - w)*noise
+        w_base = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1:]  # [1/S, ..., 1]
+        w_base = w_base.view(1, 1, self.n_step, 1)
+        w = w_base ** (1 - self.gamma)  # if gamma=0, identical to w_base
+
+        # input ladder uses noise_in
+        noi_exp_emb_toks_in = w * exp_emb_toks + (1.0 - w) * noise_in
+
+        # target ladder uses noise_tgt (independent)
+        noi_exp_emb_toks_tgt = w * exp_emb_toks + (1.0 - w) * noise_tgt
 
         left_pad  = torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
         right_pad = torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
-        cat_noi_exp_emb_toks = torch.concat([left_pad, noi_exp_emb_toks, right_pad], dim=1)
-        # Tilt along step dimension, truncate along sequence dimension
-        x_raw = tilt(cat_noi_exp_emb_toks, tilt_dim=2, content_dim=1) # (b, t + n_step - 1, n_step, n_embd_per_step)
-        x_in = self.in_norm(x_raw)
 
-        noise_exp = noise.expand(*exp_emb_toks.shape)
-        cat_noise = torch.concat([
-            torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device),
-            noise_exp,
-            torch.zeros(b, self.n_step - 1, self.n_step, self.n_embd_per_step, device=device)
-        ], dim=1)
+        # --- x_in ---
+        cat_in = torch.concat([left_pad, noi_exp_emb_toks_in, right_pad], dim=1)
+        x_in = tilt(cat_in, tilt_dim=2, content_dim=1)            # (b, L, S, E)
+        x_in = self.in_norm(x_in)
+
+        # --- x_tgt (independent-noise “teacher”) ---
+        cat_tgt = torch.concat([left_pad, noi_exp_emb_toks_tgt, right_pad], dim=1)
+        x_tgt = tilt(cat_tgt, tilt_dim=2, content_dim=1)          # (b, L, S, E)
+        x_tgt = self.in_norm(x_tgt)
+
+        # keep your diagnostics noise ladder (based on noise_in)
+        noise_exp = noise_in.expand(*exp_emb_toks.shape)
+        cat_noise = torch.concat([left_pad, noise_exp, right_pad], dim=1)
         noise_tilted = tilt(cat_noise, tilt_dim=2, content_dim=1)
-        
-        # noi_exp_emb_toks: (B, T, S, E)
-        raw_step_mse = ((noi_exp_emb_toks[:,:,1:,:] - noi_exp_emb_toks[:,:,:-1,:])**2).mean(dim=(0,1,3))
-        w0 = 1/ self.n_step
-        m0 = w0*emb_toks + (1-w0)*noise.squeeze(2)   # shapes (B,T,E)
-        mse_noise_to_m0 = ((noise.squeeze(2) - m0)**2).mean()
 
-        # construct a ladder that is pure noise in every rung (or at least rung 0)
-        cat_noise = torch.cat([left_pad, noise_exp, right_pad], dim=1)
-        noise_tilted_raw = tilt(cat_noise, tilt_dim=2, content_dim=1)   # (B, L, S, E)
-        noise_tilted_normed = self.in_norm(noise_tilted_raw)
-        return x_in, train_mask, gen_mask, noise_tilted_normed, x_raw, noise_tilted_raw
+        return x_in, train_mask, gen_mask, noise_tilted, x_tgt
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
@@ -188,7 +184,7 @@ class ArDiffusion(nn.Module):
     def forward(self, toks, state, targets = None):
         diffusion_state, backbone_state = state
         # shaped_w intentionally
-        x_in, train_mask, gen_mask, noise, x_raw, noise_raw = self._prep_backbone_inputs(toks)
+        x_in, train_mask, gen_mask, noise_tilted, x_tgt = self._prep_backbone_inputs(toks)
         # Because LLMs are incapable of using multi-letter variable names for
         # params
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
@@ -199,24 +195,7 @@ class ArDiffusion(nn.Module):
             new_diff_state = y
 
             with torch.no_grad():
-                print("RAW")
-                input_s = noise_raw[:, 1:, 0, :]
-                gt_cleaner = x_raw[:, 1:, 0, :]      # (B, L-1, E) - same token, cleaner
-                output_cleaner = y_raw[:, :-1, 0, :]    # (B, L-1, E) - model's attempt
-                input_to_gt = ((input_s - gt_cleaner)**2).mean()
-                output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
-                print(f"noise->0: input_to_gt={input_to_gt:.8f}, output_to_gt={output_to_gt:.8f}, ratio={output_to_gt/input_to_gt:.4f}")
-                for s in range(S - 1):  # can't go beyond S-1
-                    input_s = x_raw[:, :-1, s, :]          # (B, L-1, E) - noisy
-                    gt_cleaner = x_raw[:, 1:, s+1, :]      # (B, L-1, E) - same token, cleaner
-                    output_cleaner = y_raw[:, :-1, s+1, :]    # (B, L-1, E) - model's attempt
-                    
-                    input_to_gt = ((input_s - gt_cleaner)**2).mean()
-                    output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
-                    
-                    print(f"step {s}->{s+1}: input_to_gt={input_to_gt:.8f}, output_to_gt={output_to_gt:.8f}, ratio={output_to_gt/input_to_gt:.4f}")
-                print("NORMED")
-                input_s = noise[:, 1:, 0, :]
+                input_s = noise_tilted[:, 1:, 0, :]
                 gt_cleaner = x_in[:, 1:, 0, :]      # (B, L-1, E) - same token, cleaner
                 output_cleaner = y[:, :-1, 0, :]    # (B, L-1, E) - model's attempt
                 input_to_gt = ((input_s - gt_cleaner)**2).mean()
@@ -254,13 +233,18 @@ class ArDiffusion(nn.Module):
             m_b = m.expand(B, Ln, S).to(ce_per.dtype)         # (B, Ln, S)
             ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
-            # MSE toward target (want to minimize)
-            latent_loss = _latent_mse(
-                pred=y[:, :-1, :, :],
-                target=x_in[:, 1:, :, :].detach(),
-                real_mask=train_mask[:, 1:, :, :],
+
+            root_latent_loss = _latent_mse(
+                pred=y[:, :-1, 0, :],
+                target=x_tgt[:, 1:, 0, :].detach(),
+                real_mask=train_mask[:, 1:, 0, :],
             )
-            loss = ce_loss + self.latent_loss_scale * latent_loss
+            latent_loss = _latent_mse(
+                pred=y[:, :-1, 1:, :],
+                target=x_in[:, 1:, 1:, :].detach(),
+                real_mask=train_mask[:, 1:, 1:, :],
+            )
+            loss = ce_loss + self.latent_loss_scale * (latent_loss + root_latent_loss)
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
             return tok_logits, (new_diff_state, new_backbone_state), loss
@@ -270,7 +254,7 @@ class ArDiffusion(nn.Module):
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
                 m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1) broadcast over B/E
                 x_in[:, idx:idx+1, :, :] = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
-                y, backbone_state = self._one_step(
+                y, _y_raw, backbone_state = self._one_step(
                     x_in[:, :idx+1, :, :],
                     backbone_state,
                     pos_idx=idx,
