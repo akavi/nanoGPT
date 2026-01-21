@@ -234,16 +234,19 @@ class ArDiffusion(nn.Module):
             ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
 
+            root_latent_loss = 0.0
+            """
             root_latent_loss = _latent_mse(
                 pred=y[:, :-1, 0, :],
                 target=x_tgt[:, 1:, 0, :].detach(),
                 real_mask=train_mask[:, 1:, 0, :],
-            )
+            ) * 1.0 / S
+            """
             latent_loss = _latent_mse(
                 pred=y[:, :-1, 1:, :],
                 target=x_in[:, 1:, 1:, :].detach(),
                 real_mask=train_mask[:, 1:, 1:, :],
-            )
+            ) * (S - 1) / S
             loss = ce_loss + self.latent_loss_scale * (latent_loss + root_latent_loss)
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
