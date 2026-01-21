@@ -189,6 +189,12 @@ class ArDiffusion(nn.Module):
             new_diff_state = y
 
             with torch.no_grad():
+                input_s = noise_tilted[:, :-1, 0, :]  # (B, L-1, E) - pure noise
+                gt_cleaner = x_in[:, 1:, 0, :]      # (B, L-1, E) - same token, cleaner
+                output_cleaner = y[:, :-1, 0, :]    # (B, L-1, E) - model's attempt
+                input_to_gt = ((input_s - gt_cleaner)**2).mean()
+                output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
+                print(f"noise->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
                 for s in range(S - 1):  # can't go beyond S-1
                     input_s = x_in[:, :-1, s, :]          # (B, L-1, E) - noisy
                     gt_cleaner = x_in[:, 1:, s+1, :]      # (B, L-1, E) - same token, cleaner
