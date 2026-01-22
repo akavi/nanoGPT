@@ -93,7 +93,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block
@@ -133,6 +133,10 @@ class ArDiffusion(nn.Module):
         w_base = w_base.view(1, 1, self.n_step, 1)
         w = w_base ** (1 - self.gamma)  # if gamma=0, identical to w_base
 
+        # sigma for the "freshest rung mean supervision" (principled default)
+        # forward process: x = w*emb + (1-w)*eps => irreducible std = (1-w)
+        sigma0 = (1.0 - w[:, :, 0:1, :]).clamp_min(1e-4)  # (1,1,1,1)
+
         # input ladder uses noise_in
         noi_exp_emb_toks_in = w * exp_emb_toks + (1.0 - w) * noise_in
 
@@ -156,8 +160,10 @@ class ArDiffusion(nn.Module):
         noise_exp = noise_in.expand(*exp_emb_toks.shape)
         cat_noise = torch.concat([left_pad, noise_exp, right_pad], dim=1)
         noise_tilted = tilt(cat_noise, tilt_dim=2, content_dim=1)
+        noise_tilted = self.in_norm(noise_tilted)
 
-        return x_in, train_mask, gen_mask, noise_tilted, x_tgt
+        return x_in, train_mask, gen_mask, noise_tilted, x_tgt, sigma0
+
 
     # For training
     # tok:   [tok1, tok2, tok3, tok4, tok5]
@@ -183,10 +189,8 @@ class ArDiffusion(nn.Module):
     # (updating the state for each subsequent sequence position
     def forward(self, toks, state, targets = None):
         diffusion_state, backbone_state = state
-        # shaped_w intentionally
-        x_in, train_mask, gen_mask, noise_tilted, x_tgt = self._prep_backbone_inputs(toks)
-        # Because LLMs are incapable of using multi-letter variable names for
-        # params
+        x_in, train_mask, gen_mask, noise_tilted, x_tgt, sigma0 = self._prep_backbone_inputs(toks)
+
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
 
         if self.mode == "train":
@@ -211,9 +215,8 @@ class ArDiffusion(nn.Module):
                     
                     print(f"step {s}->{s+1}: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
 
-            side_target_mask = torch.zeros(B, S - 1, S, dtype=toks.dtype, device=toks.device)  # (B, S-1, S)
-
-            targets = toks.unsqueeze(-1).expand(B, T, S)  # (B, T, S)
+            side_target_mask = torch.zeros(B, S - 1, S, dtype=toks.dtype, device=toks.device)
+            targets = toks.unsqueeze(-1).expand(B, T, S)
             targets = tilt(
                 torch.concat([side_target_mask, targets, side_target_mask], dim=1),
                 tilt_dim=2,
@@ -233,15 +236,17 @@ class ArDiffusion(nn.Module):
             m_b = m.expand(B, Ln, S).to(ce_per.dtype)         # (B, Ln, S)
             ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
+            # --- root_latent_loss: "rough stab" supervision toward mean target with fixed sigma ---
+            # We supervise y_raw (pre-out-norm) against x_tgt on step 0, weighted by 1/sigma0^2.
+            # sigma0 is the forward-process irreducible std for step 0: (1-w0), clamped.
+            root_mask = train_mask[:, 1:, 0, :]  # (1, Ln, 1)
+            root_m = root_mask.expand_as(y_raw[:, :-1, 0, :]).to(y_raw.dtype)  # (B, Ln, E)
 
-            root_latent_loss = 0.0
-            """
-            root_latent_loss = _latent_mse(
-                pred=y[:, :-1, 0, :],
-                target=x_tgt[:, 1:, 0, :].detach(),
-                real_mask=train_mask[:, 1:, 0, :],
-            ) * 1.0 / S
-            """
+            root_se = (y_raw[:, :-1, 0, :] - x_tgt[:, 1:, 0, :].detach()).pow(2)
+            root_weighted = (root_se / (2.0 * (sigma0.to(y_raw.dtype) ** 2))) * root_m
+            root_latent_loss = (root_weighted.sum() / root_m.sum().clamp_min(1.0)) * (1.0 / S)
+
+            # --- remaining ladder loss (your existing one) ---
             latent_loss = _latent_mse(
                 pred=y[:, :-1, 1:, :],
                 target=x_in[:, 1:, 1:, :].detach(),
