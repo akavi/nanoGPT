@@ -238,6 +238,8 @@ class ArDiffusion(nn.Module):
             m_b = m.expand(B, Ln, S).to(ce_per.dtype)         # (B, Ln, S)
             ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
 
+            ce0_loss = (ce_per[:, :, 0] * m_b[:, :, 0]).sum() / m_b[:, :, 0].sum().clamp_min(1.0)
+
             # --- root_latent_loss: "rough stab" supervision toward mean target with fixed sigma ---
             # We supervise y_raw (pre-out-norm) against x_tgt on step 0, weighted by 1/sigma0^2.
             # sigma0 is the forward-process irreducible std for step 0: (1-w0), clamped.
@@ -254,7 +256,7 @@ class ArDiffusion(nn.Module):
                 target=x_in[:, 1:, 1:, :].detach(),
                 real_mask=train_mask[:, 1:, 1:, :],
             ) * (S - 1) / S
-            loss = ce_loss + self.latent_loss_scale * (latent_loss + root_latent_loss)
+            loss = ce_loss + ce0_loss + self.latent_loss_scale * (latent_loss + root_latent_loss)
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
             return tok_logits, (new_diff_state, new_backbone_state), loss
