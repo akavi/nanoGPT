@@ -129,9 +129,10 @@ class ArDiffusion(nn.Module):
         noise_in  = torch.randn(b, t, 1, self.n_embd_per_step, device=device) * scale
         noise_tgt = torch.randn(b, t, 1, self.n_embd_per_step, device=device) * scale
 
-        w_base = torch.linspace(0.0, 1.0, steps=self.n_step + 1, device=device)[1:]  # [1/S, ..., 1]
-        w_base = w_base.view(1, 1, self.n_step, 1)
-        w = w_base ** (1 - self.gamma)  # if gamma=0, identical to w_base
+        u = torch.linspace(1/self.n_step, 1.0, steps=S, device=device)
+        theta = u * (torch.pi/2 - 1e-4)  # theta in (0, ~pi/2]
+        r = torch.tan(theta)
+        w = r / (1.0 + r)
 
         # sigma for the "freshest rung mean supervision" (principled default)
         # forward process: x = w*emb + (1-w)*eps => irreducible std = (1-w)
