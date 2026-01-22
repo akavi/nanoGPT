@@ -93,7 +93,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         device = toks.device
         b, t = toks.size()
         assert t <= self.n_block
@@ -164,7 +164,12 @@ class ArDiffusion(nn.Module):
         noise_tilted = tilt(cat_noise, tilt_dim=2, content_dim=1)
         noise_tilted = self.in_norm(noise_tilted)
 
-        return x_in, train_mask, gen_mask, noise_tilted, x_tgt, sigma0
+        noise_tgt_exp = noise_tgt.expand(*exp_emb_toks.shape)
+        cat_noise_tgt = torch.concat([left_pad, noise_tgt_exp, right_pad], dim=1)
+        noise_tgt_tilted = tilt(cat_noise_tgt, tilt_dim=2, content_dim=1)
+        noise_tgt_tilted = self.in_norm(noise_tgt_tilted)
+
+        return x_in, train_mask, gen_mask, noise_tilted, x_tgt, sigma0, noise_tgt_tilted
 
 
     # For training
@@ -191,7 +196,7 @@ class ArDiffusion(nn.Module):
     # (updating the state for each subsequent sequence position
     def forward(self, toks, state, targets = None):
         diffusion_state, backbone_state = state
-        x_in, train_mask, gen_mask, noise_tilted, x_tgt, sigma0 = self._prep_backbone_inputs(toks)
+        x_in, train_mask, gen_mask, noise_tilted, x_tgt, sigma0, noise_tgt_tilted = self._prep_backbone_inputs(toks)
 
         (B, T), L, S, V = toks.size(), x_in.shape[1], self.n_step, self.n_vocab
 
@@ -207,6 +212,12 @@ class ArDiffusion(nn.Module):
                 input_to_gt = ((input_s - gt_cleaner)**2).mean()
                 output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
                 print(f"noise->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
+                input_s = noise_tgt_tilted[:, 1:, 0, :]
+                gt_cleaner = x_in[:, 1:, 0, :]      # (B, L-1, E) - same token, cleaner
+                output_cleaner = y[:, :-1, 0, :]    # (B, L-1, E) - model's attempt
+                input_to_gt = ((input_s - gt_cleaner)**2).mean()
+                output_to_gt = ((output_cleaner - gt_cleaner)**2).mean()
+                print(f"NOISE->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
                 for s in range(S - 1):  # can't go beyond S-1
                     input_s = x_in[:, :-1, s, :]          # (B, L-1, E) - noisy
                     gt_cleaner = x_in[:, 1:, s+1, :]      # (B, L-1, E) - same token, cleaner
@@ -256,7 +267,7 @@ class ArDiffusion(nn.Module):
                 target=x_in[:, 1:, 1:, :].detach(),
                 real_mask=train_mask[:, 1:, 1:, :],
             ) * (S - 1) / S
-            loss = ce_loss + ce0_loss + self.latent_loss_scale * (latent_loss + root_latent_loss)
+            loss = ce_loss + self.latent_loss_scale * (latent_loss + root_latent_loss)
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
             return tok_logits, (new_diff_state, new_backbone_state), loss
