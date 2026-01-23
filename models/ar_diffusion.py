@@ -244,11 +244,15 @@ class ArDiffusion(nn.Module):
             root_weighted = (root_se / (2.0 * (sigma0.to(y_raw.dtype) ** 2))) * root_m
             root_latent_loss = (root_weighted.sum() / root_m.sum().clamp_min(1.0)) * (1.0 / S)
 
-            latent_loss = _latent_mse(
-                pred=y[:, :-1, 1:, :],
-                target=x_in[:, 1:, 1:, :].detach(),
-                real_mask=train_mask[:, 1:, 1:, :],
-            ) * (S - 1) / S
+            if self.n_step > 1:
+                    # --- latent_loss: MSE toward next position's ladder (all steps) ---
+                latent_loss = _latent_mse(
+                    pred=y[:, :-1, 1:, :],
+                    target=x_in[:, 1:, 1:, :].detach(),
+                    real_mask=train_mask[:, 1:, 1:, :],
+                ) * (S - 1) / S
+            else:
+                latent_loss = torch.tensor(0.0, device=toks.device)
             loss = ce_loss + self.latent_loss_scale * (latent_loss + root_latent_loss)
 
             print(f"ce_loss={ce_loss.item()}, latent_loss={latent_loss.item()}")
