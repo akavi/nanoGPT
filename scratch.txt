@@ -1,3 +1,175 @@
+https://www.hilton.com/en/?WT.mc_id=zLADA0WW1XX2OLA3DA4Aff5Aff6MULTIBR7_138624670_2116208&ranMID=41650&ranEAID=2116208&ranSiteID=TnL5HPStwNw-BhSUadLLkcLCqYMDLId4zw&gad_source=7&dclid=CK_CpNTIo5IDFcZrKwMdc_YfHg
+https://www.hilton.com/en/?WT.mc_id=zLADA0WW1XX2OLA3DA4Aff5Aff6MULTIBR7_138624670_2116208&ranMID=41650&ranEAID=2116208&ranSiteID=TnL5HPStwNw-BhSUadLLkcLCqYMDLId4zw&gad_source=7&dclid=CK_CpNTIo5IDFcZrKwMdc_YfHg
+    def _alpha_schedule(self, device: torch.device) -> Tensor:
+        """
+        SNR/variance-space ladder: alpha_s is the *signal variance fraction*.
+        alpha in (0,1], increasing with s, with alpha[S-1]=1 (clean).
+        """
+        S = self.n_step
+        # If you want exactly your old "no pure noise" semantics:
+        alpha = torch.linspace(1.0 / S, 1.0, steps=S, device=device)  # shape (S,)
+        # Optional shaping knob using gamma (keep gamma=0 for linear):
+        if getattr(self, "gamma", 0.0) != 0.0:
+            # This is a mild heuristic; feel free to replace with logSNR shaping.
+            alpha = alpha ** (1.0 - self.gamma)
+            alpha[-1] = 1.0
+        return alpha
+
+    def _make_masks(self, t: int, device: torch.device):
+        # construct mask (unchanged)
+        S = self.n_step
+        side_negative_mask = torch.zeros(1, S - 1, S, 1, device=device)
+        side_positive_mask = torch.ones(1, S - 1, S, 1, device=device)
+        main_positive_mask = torch.ones(1, t, S, 1, device=device)
+        train_mask = tilt(
+            torch.concat([side_negative_mask, main_positive_mask, side_negative_mask], dim=1),
+            tilt_dim=2,
+            content_dim=1,
+        )  # (1, t + S - 1, S, 1)
+        gen_mask = tilt(
+            torch.concat([side_positive_mask, main_positive_mask, side_negative_mask], dim=1),
+            tilt_dim=2,
+            content_dim=1,
+        )  # (1, t + S - 1, S, 1)
+        return train_mask, gen_mask
+
+    def _prep_backbone_inputs(
+        self,
+        toks: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        Returns:
+          x_in:      (B, L, S, E) normed ladder inputs
+          train_mask (1, L, S, 1)
+          gen_mask   (1, L, S, 1)
+          x_raw      (B, L, S, E) pre-in_norm ladder (useful for debug)
+        """
+        device = toks.device
+        B, t = toks.size()
+        assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
+
+        S = self.n_step
+        E = self.n_embd_per_step
+        L = t + S - 1  # ladder-length after tilt
+
+        train_mask, gen_mask = self._make_masks(t, device)
+
+        # ----- clean token embeddings, tilted into ladder coordinates -----
+        emb_toks = self.wte(toks)  # (B, t, E)
+        assert emb_toks.shape[-1] == E, (emb_toks.shape, E)
+
+        exp_emb = emb_toks.unsqueeze(-2).expand(B, t, S, E)  # (B, t, S, E)
+
+        left_pad  = torch.zeros(B, S - 1, S, E, device=device)
+        right_pad = torch.zeros(B, S - 1, S, E, device=device)
+        cat_emb = torch.concat([left_pad, exp_emb, right_pad], dim=1)  # (B, t+2(S-1), S, E)
+        emb_tilted = tilt(cat_emb, tilt_dim=2, content_dim=1)          # (B, L, S, E)
+
+        # ----- per-AR-position increments n_p and normalized window-sum epsilon_{p,s} -----
+        # We need increments for p in [0 .. L-1] and lookahead up to (S-2), so length L+(S-1) is safe.
+        inc_len = L + (S - 1)  # == t + 2(S-1)
+        if self.mode == "sample":
+            # Deterministic ladder conditioning; you can flip this to random if you want stochastic conditioning.
+            n_inc = torch.zeros(B, inc_len, E, device=device)
+        else:
+            # match embedding scale per-dim (same idea you had)
+            scale = emb_toks.std(dim=(0, 1), keepdim=True).clamp_min(1e-8)  # (1,1,E)
+            n_inc = torch.randn(B, inc_len, E, device=device) * scale
+
+        # prefix sums for O(1) window sums
+        prefix = torch.zeros(B, inc_len + 1, E, device=device)
+        prefix[:, 1:, :] = n_inc.cumsum(dim=1)
+
+        eps_list = []
+        for s in range(S):
+            k = (S - 1) - s  # number of increments to include
+            if k == 0:
+                eps = torch.zeros(B, L, E, device=device)
+            else:
+                # window sum: sum_{u=0..k-1} n_{p+u} for p=0..L-1
+                win = prefix[:, k:k+L, :] - prefix[:, 0:L, :]  # (B, L, E)
+                eps = win / math.sqrt(k)  # normalize to keep eps ~ N(0,I) marginally
+            eps_list.append(eps)
+
+        eps_tilted = torch.stack(eps_list, dim=2)  # (B, L, S, E)
+
+        # zero out pads (avoid injecting noise into masked-off ladder slots)
+        slot_mask = train_mask.to(dtype=emb_tilted.dtype)  # (1, L, S, 1)
+        eps_tilted = eps_tilted * slot_mask
+        emb_tilted = emb_tilted * slot_mask
+
+        # ----- SNR/variance-space mix -----
+        alpha = self._alpha_schedule(device)               # (S,)
+        sqrt_a = torch.sqrt(alpha).view(1, 1, S, 1)         # (1,1,S,1)
+        sqrt_1ma = torch.sqrt(1.0 - alpha).view(1, 1, S, 1) # (1,1,S,1)
+
+        x_raw = sqrt_a * emb_tilted + sqrt_1ma * eps_tilted  # (B, L, S, E)
+        x_in = self.in_norm(x_raw)
+
+        return x_in, train_mask, gen_mask, x_raw
+
+    def forward(self, toks, state, targets=None):
+        diffusion_state, backbone_state = state
+
+        x_in, train_mask, gen_mask, x_raw = self._prep_backbone_inputs(toks)
+
+        (B, T) = toks.size()
+        L = x_in.shape[1]
+        S = self.n_step
+        V = self.n_vocab
+
+        if self.mode == "train":
+            y, new_backbone_state = self._one_step(x_in, backbone_state)
+            tok_logits = self.lm_head(y)  # (B, L, S, V)
+            new_diff_state = y
+
+            # ----- targets (unchanged) -----
+            side_target_mask = torch.zeros(B, S - 1, S, dtype=toks.dtype, device=toks.device)
+            targets = toks.unsqueeze(-1).expand(B, T, S)  # (B, T, S)
+            targets = tilt(
+                torch.concat([side_target_mask, targets, side_target_mask], dim=1),
+                tilt_dim=2,
+                content_dim=1,
+            )  # (B, L, S)
+
+            Ln = L - 1
+            ce_per = F.cross_entropy(
+                tok_logits[:, :-1, :, :].reshape(B * Ln * S, V),
+                targets[:, 1:, :].reshape(B * Ln * S),
+                reduction="none",
+            ).reshape(B, Ln, S)
+
+            # mask: only count "real" ladder slots (and only where next-token exists)
+            m = (train_mask[:, :-1, :, :] * train_mask[:, 1:, :, :]).squeeze(-1)  # (1, Ln, S)
+            m_b = m.expand(B, Ln, S).to(ce_per.dtype)
+            ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
+
+            # latent MSE (predict next ladder input)
+            latent_loss = _latent_mse(
+                pred=y[:, :-1, :, :],
+                target=x_in[:, 1:, :, :].detach(),
+                real_mask=train_mask[:, 1:, :, :],
+            )
+
+            loss = ce_loss + self.latent_loss_scale * latent_loss
+            return tok_logits, (new_diff_state, new_backbone_state), loss
+
+        else:  # sample
+            fill_length = toks.shape[1] + self.n_step - 1
+            for idx in range(diffusion_state.shape[1] - 1, fill_length):
+                m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1)
+                x_in[:, idx:idx+1, :, :] = (
+                    m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
+                )
+                y, backbone_state = self._one_step(
+                    x_in[:, :idx+1, :, :],
+                    backbone_state,
+                    pos_idx=idx,
+                )
+                diffusion_state = torch.concat([diffusion_state, y[:, -1:, :, :]], dim=1)
+
+            tok_logits = self.lm_head(y[:, :, -1, :])  # (B, T, V) from cleanest sublatent
+            return tok_logits, (diffusion_state, backbone_state), None
 Phase i, block prefill
 A - 3 | B - 3 | C - 3 | 
 Noise | A - 2 | B - 2 | 
