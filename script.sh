@@ -1,7 +1,7 @@
 tmux
 git clone --depth 1 --branch master https://github.com/akavi/nanoGPT.git
 cd nanoGPT/
-sudo snap install astral-uv --classic
+snap install astral-uv --classic
 uv python install 3.13
 rm -rf .venv
 uv venv --python 3.13
@@ -12,9 +12,10 @@ uv run python3 config/face_ard_linear_raster_config.py --n_step=4 --latent_loss_
 git fetch && git reset origin/master --hard
 
 
-export LOGIN=ubuntu@216.81.248.153
+export LOGIN=root@216.81.245.34
+export PORT=16376
 export DIR=out-face-linear-raster
-scp -r -P 22 $LOGIN:~/nanoGPT/$DIR .
+scp -r -P $PORT $LOGIN:~/nanoGPT/$DIR .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
 scp -r -P 22 out-image-mdct-even $LOGIN:~/nanoGPT
 scp -r -P 22 out-image-mdct-late $LOGIN:~/nanoGPT

@@ -281,13 +281,26 @@ class ArDiffusion(nn.Module):
 
             m = (train_mask[:, :-1, :, :] * train_mask[:, 1:, :, :]).squeeze(-1)  # (1, Ln, S)
             m_b = m.expand(B, Ln, S).to(ce_per.dtype)
-            ce_loss = (ce_per * m_b).sum() / m_b.sum().clamp_min(1.0)
+
+            alpha = self._alpha_schedule(device)  # (S,)
+            snr = alpha / (1.0 - alpha).clamp_min(1e-8)  # (S,)
+
+            # Option B: capped-SNR weights (more "diffusion-y" control)
+            tau = 10.0  # pick a cap in SNR units; 5-20 is a decent starting band
+            w_s = torch.clamp(snr, max=tau) / tau
+
+            w = w_s.view(1, 1, S).to(dtype=ce_per.dtype)  # broadcast over (B, Ln, S)
+
+            num = (ce_per * m_b * w).sum()
+            den = (m_b * w).sum().clamp_min(1.0)
+            ce_loss = num / den
 
             latent_loss = _latent_mse(
                 pred=y[:, :-1, :, :],
                 target=x_in[:, 1:, :, :].detach(),
                 real_mask=train_mask[:, 1:, :, :],
             )
+            print(f"CE loss: {ce_loss.item():.4f}")
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             return tok_logits, (new_diff_state, new_backbone_state), loss
@@ -310,7 +323,7 @@ class ArDiffusion(nn.Module):
             return tok_logits, (diffusion_state, backbone_state), None
 
     def lm_head(self, x: Tensor) -> Tensor:
-        # x = self.pre_lm_head(x)  # (B,L,E)
+        x = self.pre_lm_head(x)  # (B,L,E)
         return self.lm_projection(x)  # (B,L,V)
 
     @torch.no_grad()
