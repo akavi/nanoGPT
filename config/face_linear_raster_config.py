@@ -118,7 +118,7 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_config_batch(
+    rows = get_fixed_batch(
         split,
         batch_size,
         DataConfig(
@@ -150,7 +150,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=128,                # also used in get_batch
+    batch_size=1,                # also used in get_batch
 
     eval_only=False,
     eval_interval=250,
