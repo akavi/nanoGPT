@@ -20,6 +20,7 @@ class ArDiffusionConfig:
     latent_loss_scale: float
     device: str
     gamma: float
+    snr_eps: float = 0.1
 
 class ArDiffusion(nn.Module):
     """
@@ -62,6 +63,7 @@ class ArDiffusion(nn.Module):
         self.n_step = config.n_step
         self.latent_loss_scale = config.latent_loss_scale
         self.gamma = config.gamma
+        self.snr_eps = config.snr_eps
         self.n_embd = config.n_embd
         self.device = config.device
 
@@ -199,7 +201,7 @@ class ArDiffusion(nn.Module):
 
             # ---- denoising ratio diagnostics (NORMED space) ----
             with torch.no_grad():
-                input_s = torch.randn_like(x_raw[:, 1:, 0:, :])  # (B, L-1, E)
+                input_s = torch.randn_like(x_raw[:, 1:, 0, :])  # (B, L-1, E)
                 target = x_raw[:, 1:, 0, :]  # (B, L-1, E)
                 output_cleaner = y[:, :-1, 1, :] # (B, L-1, E)
                 input_to_gt = ((input_s - target) ** 2).mean()
@@ -236,10 +238,11 @@ class ArDiffusion(nn.Module):
                 real_mask=train_mask[:, 1:, :, :],
             )
 
-            # Weight CE losses by schedule (cleaner steps get higher weight)
-            weights = schedule[:, :, :, 0]  # (1, 1, S)
+            # Weight CE losses by SNR with offset (cleaner steps get higher weight)
+            alpha = schedule[:, :, :, 0]  # (1, 1, S)
+            snr = (alpha + self.snr_eps) / (1 - alpha + self.snr_eps)  # (1, 1, S)
             mask = train_mask[:, 1:, :, 0]  # (1, Ln, S)
-            ce_loss = (ce_loss_per * weights * mask).sum() / (B * (weights * mask).sum()).clamp(min=1e-8)
+            ce_loss = (ce_loss_per * snr * mask).sum() / (B * (snr * mask).sum()).clamp(min=1e-8)
             latent_loss = latent_loss_per
             loss = ce_loss + self.latent_loss_scale * latent_loss
 

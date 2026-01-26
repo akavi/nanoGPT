@@ -42,6 +42,7 @@ overridable = override(sys.argv, {
     "latent_loss_scale": 0.0,
     "max_iters": 3000,
     "gamma": 0.0,
+    "snr_eps": 0.1,
     "batch_size": 64,
 })
 
@@ -75,7 +76,8 @@ model = ArDiffusion(ArDiffusionConfig(
     dropout=0.05,
     device=overridable['device'],
     mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
-    gamma=overridable['gamma']
+    gamma=overridable['gamma'],
+    snr_eps=overridable['snr_eps'],
 ), backbone)
 
 optimizer_config = OptimizerConfig(
