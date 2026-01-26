@@ -244,6 +244,19 @@ class ArDiffusion(nn.Module):
             latent_loss = latent_loss_per
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
+            # ---- gradient alignment diagnostic ----
+            if self.latent_loss_scale > 0:
+                grad_ce = torch.autograd.grad(ce_loss, y, retain_graph=True)[0]
+                grad_latent = torch.autograd.grad(latent_loss, y, retain_graph=True)[0]
+                # Flatten and compute cosine similarity
+                g_ce = grad_ce.flatten()
+                g_lat = grad_latent.flatten()
+                cos_sim = F.cosine_similarity(g_ce.unsqueeze(0), g_lat.unsqueeze(0)).item()
+                # Also compute relative magnitudes
+                ce_norm = g_ce.norm().item()
+                latent_norm = g_lat.norm().item()
+                print(f"grad alignment: cos_sim={cos_sim:.4f}, ce_norm={ce_norm:.4f}, latent_norm={latent_norm:.4f}, ratio={ce_norm/latent_norm:.4f}")
+
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
         else:  # sample
