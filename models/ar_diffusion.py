@@ -249,7 +249,7 @@ class ArDiffusion(nn.Module):
         else:  # sample
             fill_length = toks.shape[1] + self.n_step - 1
             for idx in range(diffusion_state.shape[1] - 1, fill_length):
-                m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1)
+                m = train_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1)
                 x_in[:, idx:idx+1, :, :] = (
                     m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * diffusion_state[:, idx:idx+1, :, :]
                 )
