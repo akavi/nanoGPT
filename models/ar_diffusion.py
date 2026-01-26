@@ -191,8 +191,6 @@ class ArDiffusion(nn.Module):
         L = x_in.shape[1]
         S = self.n_step
         V = self.n_vocab
-        E = self.n_embd_per_step
-        device = toks.device
 
         if self.mode == "train":
             y, new_backbone_state = self._one_step(x_in, backbone_state)
@@ -209,7 +207,7 @@ class ArDiffusion(nn.Module):
                 print(f"NOISE->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
                 for s in range(S - 1):
                     input_s = x_in[:, :-1, s, :]         # (B, L-1, E)
-                    target = x_raw[:, 1:, s, :]  # (B, L-1, E)
+                    target = x_raw[:, :-1, s, :]  # (B, L-1, E)
                     output_cleaner = y[:, :-1, s + 1, :] # (B, L-1, E)
 
                     input_to_gt = ((input_s - target) ** 2).mean()
