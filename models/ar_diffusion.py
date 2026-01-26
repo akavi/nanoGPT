@@ -106,28 +106,10 @@ class ArDiffusion(nn.Module):
             alpha[-1] = 1.0
         return alpha
 
-    def _make_masks(self, t: int, device: torch.device):
-        # construct mask (unchanged)
-        S = self.n_step
-        side_negative_mask = torch.zeros(1, S - 1, S, 1, device=device)
-        side_positive_mask = torch.ones(1, S - 1, S, 1, device=device)
-        main_positive_mask = torch.ones(1, t, S, 1, device=device)
-        train_mask = tilt(
-            torch.concat([side_negative_mask, main_positive_mask, side_negative_mask], dim=1),
-            tilt_dim=2,
-            content_dim=1,
-        )  # (1, t + S - 1, S, 1)
-        gen_mask = tilt(
-            torch.concat([side_positive_mask, main_positive_mask, side_negative_mask], dim=1),
-            tilt_dim=2,
-            content_dim=1,
-        )  # (1, t + S - 1, S, 1)
-        return train_mask, gen_mask
-
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         LN-space noising with per-AR-position Gaussian increments.
 
@@ -153,9 +135,7 @@ class ArDiffusion(nn.Module):
 
         S = self.n_step
         E = self.n_embd_per_step
-        L = t + S - 1
 
-        # ---- masks (unchanged) ----
         side_negative_mask = torch.zeros(1, S - 1, S, 1, device=device)
         side_positive_mask = torch.ones(1, S - 1, S, 1, device=device)
         main_positive_mask = torch.ones(1, t, S, 1, device=device)
@@ -172,91 +152,38 @@ class ArDiffusion(nn.Module):
             content_dim=1,
         )  # (1, L, S, 1)
 
-        slot_mask = train_mask.to(dtype=torch.float32)  # (1,L,S,1)
-
-        # ---- helpers: LN-no-affine and orth projection ----
-        eps = 1e-5
-
-        def ln_noaffine(x: Tensor) -> Tensor:
-            # x: (..., E)
-            m = x.mean(dim=-1, keepdim=True)
-            v = x.var(dim=-1, keepdim=True, unbiased=False)
-            return (x - m) * torch.rsqrt(v + eps)
-
-        def proj_orth(a: Tensor, u: Tensor) -> Tensor:
-            # Remove component of a along u (no need for u to be unit)
-            # a,u: (..., E)
-            uu = (u * u).sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            coeff = (a * u).sum(dim=-1, keepdim=True) / uu
-            return a - coeff * u
-
         # ---- clean embeddings, tilted ----
         emb_toks = self.wte(toks)  # (B, t, E)
-
         exp_emb = emb_toks.unsqueeze(-2).expand(B, t, S, E)  # (B, t, S, E)
+        exp_emb = self.in_norm(exp_emb)
 
-        left_pad  = torch.zeros(B, S - 1, S, E, device=device)
-        right_pad = torch.zeros(B, S - 1, S, E, device=device)
+        left_pad  = self.in_norm(torch.ones(B, S - 1, S, E, device=device))
+        right_pad = self.in_norm(torch.ones(B, S - 1, S, E, device=device))
         cat_emb = torch.cat([left_pad, exp_emb, right_pad], dim=1)          # (B, t+2(S-1), S, E)
         emb_tilted = tilt(cat_emb, tilt_dim=2, content_dim=1)               # (B, L, S, E)
-        emb_tilted = emb_tilted * slot_mask                                 # zero masked slots
 
-        # ---- map clean embeddings into LN-space (no affine) ----
-        u = ln_noaffine(emb_tilted)                                         # (B, L, S, E)
-        u = u * slot_mask
+        Ln = t + S - 1
+        # Make noise isotropic in LN space, orthogonal to clean embedding
+        noise = torch.randn(B, Ln, S, E, device=device)
+        # Project out the component parallel to emb_tilted
+        dot = (noise * emb_tilted).sum(dim=-1, keepdim=True)
+        norm_sq = (emb_tilted * emb_tilted).sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        noise = noise - (dot / norm_sq) * emb_tilted
+        # Normalize to unit variance in LN space
+        noise = self.in_norm(noise)
 
-        # ---- per-AR-position increments -> window-sum eps_tilted ----
-        # increments length needs lookahead up to (S-2)
-        inc_len = L + (S - 1)  # == t + 2(S-1)
+        alpha = self._alpha_schedule(device)  # (S,)
+        schedule = alpha.view(1, 1, S, 1)  # (1, 1, S, 1) for broadcasting
 
-        if self.mode == "sample":
-            n_inc = torch.zeros(B, inc_len, E, device=device)
-        else:
-            # match embedding scale per-dim as before
-            scale = emb_toks.std(dim=(0, 1), keepdim=True).clamp_min(1e-8)  # (1,1,E)
-            n_inc = torch.randn(B, inc_len, E, device=device) * scale
-
-        prefix = torch.zeros(B, inc_len + 1, E, device=device)
-        prefix[:, 1:, :] = n_inc.cumsum(dim=1)
-
-        eps_list = []
-        for s in range(S):
-            k = (S - 1) - s  # noisier rungs use more increments
-            if k == 0:
-                eps_ps = torch.zeros(B, L, E, device=device)
-            else:
-                win = prefix[:, k:k+L, :] - prefix[:, 0:L, :]  # sum_{u=0..k-1} n_{p+u}
-                eps_ps = win / math.sqrt(k)                    # keep marginal ~N(0, scale^2 I)
-            eps_list.append(eps_ps)
-
-        eps_tilted = torch.stack(eps_list, dim=2)  # (B, L, S, E)
-        eps_tilted = eps_tilted * slot_mask
-
-        # ---- build LN-space orthogonal noise direction v ----
-        # center eps, remove component along u, then re-center + unit-variance
-        eps_c = eps_tilted - eps_tilted.mean(dim=-1, keepdim=True)
-        v_orth = proj_orth(eps_c, u)
-        v = v_orth - v_orth.mean(dim=-1, keepdim=True)
-        v = v * torch.rsqrt(v.var(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-8) + eps)
-        v = v * slot_mask
-
-        # ---- SNR/variance-space ladder in LN-space ----
-        alpha = self._alpha_schedule(device)                              # (S,)
-        sqrt_a = torch.sqrt(alpha).view(1, 1, S, 1)                        # (1,1,S,1)
-        sqrt_1ma = torch.sqrt((1.0 - alpha).clamp_min(0.0)).view(1, 1, S, 1)
-
-        x_raw = sqrt_a * u + sqrt_1ma * v                                  # (B, L, S, E)
-        x_raw = x_raw * slot_mask                                          # ensure pads are zero
-
-        # Keep drop-in behavior: still pass through your (possibly affine) SubLatentLayerNorm
-        x_in = self.in_norm(x_raw)
-
-        return x_in, train_mask, gen_mask, x_raw
+        # Mix emb_tilted and noise via variance-preserving interpolation (slerp in variance space)
+        # x = sqrt(alpha) * clean + sqrt(1 - alpha) * noise
+        x_in = torch.sqrt(schedule) * emb_tilted + torch.sqrt(1 - schedule) * noise
+        return x_in, emb_tilted, schedule, train_mask, gen_mask
 
     def forward(self, toks, state, targets=None):
         diffusion_state, backbone_state = state
 
-        x_in, train_mask, gen_mask, x_raw = self._prep_backbone_inputs(toks)
+        x_in, x_raw, schedule, train_mask, gen_mask = self._prep_backbone_inputs(toks)
 
         (B, T) = toks.size()
         L = x_in.shape[1]
@@ -272,48 +199,19 @@ class ArDiffusion(nn.Module):
 
             # ---- denoising ratio diagnostics (NORMED space) ----
             with torch.no_grad():
-                # Rebuild emb_tilted so we can recover eps_tilted from x_raw
-                emb_toks = self.wte(toks)                              # (B, T, E)
-                exp_emb = emb_toks.unsqueeze(-2).expand(B, T, S, E)     # (B, T, S, E)
-
-                left_pad  = torch.zeros(B, S - 1, S, E, device=device)
-                right_pad = torch.zeros(B, S - 1, S, E, device=device)
-                cat_emb = torch.cat([left_pad, exp_emb, right_pad], dim=1)  # (B, T+2(S-1), S, E)
-                emb_tilted = tilt(cat_emb, tilt_dim=2, content_dim=1)       # (B, L, S, E)
-                slot_mask = train_mask.to(dtype=emb_tilted.dtype)           # (1, L, S, 1)
-                emb_tilted = emb_tilted * slot_mask
-
-                alpha = self._alpha_schedule(device)                        # (S,)
-                sqrt_a = torch.sqrt(alpha).view(1, 1, S, 1)                 # (1,1,S,1)
-                sqrt_1ma = torch.sqrt(1.0 - alpha).view(1, 1, S, 1)         # (1,1,S,1)
-
-                # Recover eps_tilted (only valid where sqrt_1ma>0)
-                eps_tilted = torch.zeros_like(x_raw)
-                denom = sqrt_1ma.expand_as(x_raw)
-                good = denom > 0
-                eps_tilted[good] = (x_raw[good] - (sqrt_a.expand_as(x_raw)[good] * emb_tilted[good])) / denom[good]
-                eps_tilted = eps_tilted * slot_mask
-
-                # "Pure noise" ladder in the *same* normalized space as x_in
-                eps_normed = self.in_norm(eps_tilted)
-
-                print("DENOISE (NORMED)")
-                # noise -> rung0 baseline (consistent space)
-                input_s = eps_normed[:, :-1, 0, :]      # (B, L-1, E) "pure noise"
-                gt_cleaner = x_in[:, 1:, 0, :]          # (B, L-1, E) rung0 next position
-                output_cleaner = y[:, :-1, 0, :]        # (B, L-1, E) model's rung0 output
-                input_to_gt = ((input_s - gt_cleaner) ** 2).mean()
-                output_to_gt = ((output_cleaner - gt_cleaner) ** 2).mean()
-                print(f"noise->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
-
-                # rung s -> s+1 transitions (the important ones)
+                input_s = torch.randn_like(x_raw[:, 1:, 0:, :])  # (B, L-1, E)
+                target = x_raw[:, 1:, 0, :]  # (B, L-1, E)
+                output_cleaner = y[:, :-1, 1, :] # (B, L-1, E)
+                input_to_gt = ((input_s - target) ** 2).mean()
+                output_to_gt = ((output_cleaner - target) ** 2).mean()
+                print(f"NOISE->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
                 for s in range(S - 1):
                     input_s = x_in[:, :-1, s, :]         # (B, L-1, E)
-                    gt_cleaner = x_in[:, 1:, s + 1, :]   # (B, L-1, E)
+                    target = x_raw[:, 1:, s, :]  # (B, L-1, E)
                     output_cleaner = y[:, :-1, s + 1, :] # (B, L-1, E)
 
-                    input_to_gt = ((input_s - gt_cleaner) ** 2).mean()
-                    output_to_gt = ((output_cleaner - gt_cleaner) ** 2).mean()
+                    input_to_gt = ((input_s - target) ** 2).mean()
+                    output_to_gt = ((output_cleaner - target) ** 2).mean()
                     print(f"step {s}->{s+1}: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
 
             # ---- targets / losses (unchanged) ----
@@ -326,34 +224,23 @@ class ArDiffusion(nn.Module):
             )  # (B, L, S)
 
             Ln = L - 1
-            ce_per = F.cross_entropy(
+            ce_loss_per = F.cross_entropy(
                 tok_logits[:, :-1, :, :].reshape(B * Ln * S, V),
                 targets[:, 1:, :].reshape(B * Ln * S),
                 reduction="none",
             ).reshape(B, Ln, S)
 
-            m = (train_mask[:, :-1, :, :] * train_mask[:, 1:, :, :]).squeeze(-1)  # (1, Ln, S)
-            m_b = m.expand(B, Ln, S).to(ce_per.dtype)
-
-            alpha = self._alpha_schedule(device)  # (S,)
-            snr = alpha / (1.0 - alpha).clamp_min(1e-8)  # (S,)
-
-            # Option B: capped-SNR weights (more "diffusion-y" control)
-            tau = 10.0  # pick a cap in SNR units; 5-20 is a decent starting band
-            w_s = torch.clamp(snr, max=tau) / tau
-
-            w = w_s.view(1, 1, S).to(dtype=ce_per.dtype)  # broadcast over (B, Ln, S)
-
-            num = (ce_per * m_b * w).sum()
-            den = (m_b * w).sum().clamp_min(1.0)
-            ce_loss = num / den
-
-            latent_loss = _latent_mse(
+            latent_loss_per = _latent_mse(
                 pred=y[:, :-1, :, :],
                 target=x_in[:, 1:, :, :].detach(),
                 real_mask=train_mask[:, 1:, :, :],
             )
-            print(f"CE loss: {ce_loss.item():.4f}")
+
+            # Weight CE losses by schedule (cleaner steps get higher weight)
+            weights = schedule[:, :, :, 0]  # (1, 1, S)
+            mask = train_mask[:, 1:, :, 0]  # (1, Ln, S)
+            ce_loss = (ce_loss_per * weights * mask).sum() / (B * (weights * mask).sum()).clamp(min=1e-8)
+            latent_loss = latent_loss_per
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             return tok_logits, (new_diff_state, new_backbone_state), loss
@@ -508,22 +395,14 @@ def _latent_mse(pred: Tensor, target: Tensor, real_mask: Tensor) -> Tensor:
     return se.sum() / m_exp.sum()
 
 class SubLatentLayerNorm(nn.Module):
-    def __init__(self, S: int, E: int, eps: float = 1e-5, elementwise_affine: bool = True):
+    def __init__(self, S: int, E: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(S, E))  # gamma per S
-            self.bias   = nn.Parameter(torch.zeros(S, E)) # beta per S
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
+        self.register_parameter("weight", None)
+        self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, S, E)
         mean = x.mean(dim=-1, keepdim=True)
         var  = x.var(dim=-1, keepdim=True, unbiased=False)
-        y = (x - mean) * torch.rsqrt(var + self.eps)
-        if self.elementwise_affine:
-            y = y * self.weight[None, None, :, :] + self.bias[None, None, :, :]
-        return y
+        return (x - mean) * torch.rsqrt(var + self.eps)
