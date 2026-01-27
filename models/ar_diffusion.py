@@ -176,10 +176,11 @@ class ArDiffusion(nn.Module):
 
         alpha = self._alpha_schedule(device)  # (S,)
         schedule = alpha.view(1, 1, S, 1)  # (1, 1, S, 1) for broadcasting
+        noised_schedule = (schedule * (1 + 0.2 * torch.randn(1, device=device))).clamp(0, 1)
 
         # Mix emb_tilted and noise via variance-preserving interpolation (slerp in variance space)
         # x = sqrt(alpha) * clean + sqrt(1 - alpha) * noise
-        x_in = torch.sqrt(schedule) * emb_tilted + torch.sqrt(1 - schedule) * noise
+        x_in = torch.sqrt(noised_schedule) * emb_tilted + torch.sqrt(1 - noised_schedule) * noise
         return x_in, emb_tilted, schedule, train_mask, gen_mask
 
     def forward(self, toks, state, targets=None):
@@ -199,12 +200,13 @@ class ArDiffusion(nn.Module):
 
             # ---- denoising ratio diagnostics (NORMED space) ----
             with torch.no_grad():
-                input_s = torch.randn_like(x_raw[:, 1:, 0, :])  # (B, L-1, E)
-                target = x_raw[:, 1:, 0, :]  # (B, L-1, E)
-                output_cleaner = y[:, :-1, 1, :] # (B, L-1, E)
-                input_to_gt = ((input_s - target) ** 2).mean()
-                output_to_gt = ((output_cleaner - target) ** 2).mean()
-                print(f"NOISE->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
+                if self.n_step > 1:
+                    input_s = torch.randn_like(x_raw[:, 1:, 0, :])  # (B, L-1, E)
+                    target = x_raw[:, 1:, 0, :]  # (B, L-1, E)
+                    output_cleaner = y[:, :-1, 1, :] # (B, L-1, E)
+                    input_to_gt = ((input_s - target) ** 2).mean()
+                    output_to_gt = ((output_cleaner - target) ** 2).mean()
+                    print(f"NOISE->0: input_to_gt={input_to_gt:.4f}, output_to_gt={output_to_gt:.4f}, ratio={output_to_gt/input_to_gt:.4f}")
                 for s in range(S - 1):
                     input_s = x_in[:, :-1, s, :]         # (B, L-1, E)
                     target = x_raw[:, :-1, s, :]  # (B, L-1, E)
@@ -245,7 +247,7 @@ class ArDiffusion(nn.Module):
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             # ---- gradient alignment diagnostic ----
-            if self.latent_loss_scale > 0:
+            if self.latent_loss_scale > 0 and torch.is_grad_enabled():
                 grad_ce = torch.autograd.grad(ce_loss, y, retain_graph=True)[0]
                 grad_latent = torch.autograd.grad(latent_loss, y, retain_graph=True)[0]
                 # Flatten and compute cosine similarity
@@ -256,6 +258,7 @@ class ArDiffusion(nn.Module):
                 ce_norm = g_ce.norm().item()
                 latent_norm = g_lat.norm().item()
                 print(f"grad alignment: cos_sim={cos_sim:.4f}, ce_norm={ce_norm:.4f}, latent_norm={latent_norm:.4f}, ratio={ce_norm/latent_norm:.4f}")
+
 
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
@@ -277,7 +280,7 @@ class ArDiffusion(nn.Module):
             return tok_logits, (diffusion_state, backbone_state), None
 
     def lm_head(self, x: Tensor) -> Tensor:
-        x = self.pre_lm_head(x)  # (B,L,E)
+        # x = self.pre_lm_head(x)  # (B,L,E)
         return self.lm_projection(x)  # (B,L,V)
 
     @torch.no_grad()

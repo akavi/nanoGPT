@@ -43,7 +43,7 @@ overridable = override(sys.argv, {
     "max_iters": 3000,
     "gamma": 0.0,
     "snr_eps": 0.1,
-    "batch_size": 64,
+    "batch_size": 1,
 })
 
 # -----------------------------------------------------------------------------#
@@ -131,7 +131,7 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_config_batch(
+    rows = get_fixed_batch(
         split,
         batch_size,
         DataConfig(
