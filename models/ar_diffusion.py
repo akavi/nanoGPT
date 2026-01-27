@@ -176,7 +176,7 @@ class ArDiffusion(nn.Module):
 
         alpha = self._alpha_schedule(device)  # (S,)
         schedule = alpha.view(1, 1, S, 1)  # (1, 1, S, 1) for broadcasting
-        noised_schedule = (schedule + (1 - schedule) * (1 + 0.2 * torch.randn(1, device=device))).clamp(0, 1)
+        noised_schedule = schedule #(schedule + (1 - schedule) * (1 + 0.0 * torch.randn(1, device=device))).clamp(0, 1)
         print(f"noised_schedule: {noised_schedule.flatten().tolist()}")
 
         # Mix emb_tilted and noise via variance-preserving interpolation (slerp in variance space)
