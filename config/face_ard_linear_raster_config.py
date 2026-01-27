@@ -189,6 +189,7 @@ if mode == "resume" or mode == "from_scratch":
         ),
         config=train_config,
     )
+    model.check_embedding_collisions()
 else:
     def init_gen(device):
         return torch.zeros((1, 1), dtype=int, device=device)

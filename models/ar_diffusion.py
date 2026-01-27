@@ -72,7 +72,7 @@ class ArDiffusion(nn.Module):
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
         self.drop = nn.Dropout(config.dropout)
-        self.in_norm = nn.Identity(self.n_step, self.n_embd_per_step)
+        self.in_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.pre_lm_head = MLP(self.n_embd_per_step)
@@ -316,6 +316,32 @@ class ArDiffusion(nn.Module):
 
     def flops_per_fwdbwd(self):
         return self.backbone.flops_per_fwdbwd()
+
+    @torch.no_grad()
+    def check_embedding_collisions(self, threshold=0.99):
+        """Check if in_norm causes distinct tokens to have near-identical representations."""
+        emb = self.wte.weight  # (V, E)
+        normed = self.in_norm(emb.unsqueeze(0).unsqueeze(0)).squeeze()  # (V, E)
+        # Normalize for cosine similarity
+        normed = normed / (normed.norm(dim=-1, keepdim=True) + 1e-8)
+        sims = torch.mm(normed, normed.t())  # (V, V)
+
+        # Find near-duplicate pairs (excluding diagonal)
+        mask = torch.triu(torch.ones_like(sims, dtype=torch.bool), diagonal=1)
+        high_sim = (sims > threshold) & mask
+        n_collisions = high_sim.sum().item()
+
+        if n_collisions > 0:
+            indices = high_sim.nonzero()
+            print(f"Found {n_collisions} token pairs with cosine similarity > {threshold}:")
+            for i, j in indices[:10]:  # show first 10
+                print(f"  tokens {i.item()} and {j.item()}: sim={sims[i, j].item():.4f}")
+            if n_collisions > 10:
+                print(f"  ... and {n_collisions - 10} more")
+        else:
+            print(f"No token pairs with cosine similarity > {threshold}")
+
+        return n_collisions, sims
 
     def get_num_params(self, non_embedding=True):
         """
