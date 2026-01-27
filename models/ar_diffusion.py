@@ -72,7 +72,7 @@ class ArDiffusion(nn.Module):
         self.wpe = nn.Embedding(config.n_block + config.n_step - 1, self.n_embd)
         self.backbone = backbone
         self.drop = nn.Dropout(config.dropout)
-        self.in_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
+        self.in_norm = nn.Identity(self.n_step, self.n_embd_per_step)
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.pre_lm_head = MLP(self.n_embd_per_step)
@@ -176,7 +176,8 @@ class ArDiffusion(nn.Module):
 
         alpha = self._alpha_schedule(device)  # (S,)
         schedule = alpha.view(1, 1, S, 1)  # (1, 1, S, 1) for broadcasting
-        noised_schedule = (schedule * (1 + 0.2 * torch.randn(1, device=device))).clamp(0, 1)
+        noised_schedule = (schedule + (1 - schedule) * (1 + 0.2 * torch.randn(1, device=device))).clamp(0, 1)
+        print(f"noised_schedule: {noised_schedule.flatten().tolist()}")
 
         # Mix emb_tilted and noise via variance-preserving interpolation (slerp in variance space)
         # x = sqrt(alpha) * clean + sqrt(1 - alpha) * noise

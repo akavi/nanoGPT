@@ -7,7 +7,7 @@ rm -rf .venv
 uv venv --python 3.13
 source .venv/bin/activate
 uv sync
-uv run python3 config/face_ard_linear_raster_config.py --n_step=4 --latent_loss_scale=1.0 --n_embd=384
+uv run python3 config/face_ard_linear_raster_config.py --n_step=1 --latent_loss_scale=0.0 --n_embd=384
 
 git clone --depth 1 --branch master https://github.com/akavi/nanoGPT.git
 cd nanoGPT/
@@ -21,8 +21,9 @@ uv run python3 config/face_ard_linear_raster_config.py --n_step=4 --latent_loss_
 
 git fetch && git reset origin/master --hard
 
-export LOGIN=root@185.216.21.214
-export PORT=48788
+
+export LOGIN=root@86.38.238.59
+export PORT=22
 export DIR=out-face-linear-raster
 scp -r -P $PORT $LOGIN:~/nanoGPT/$DIR .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
