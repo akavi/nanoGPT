@@ -241,10 +241,11 @@ class ArDiffusion(nn.Module):
 
             # Weight CE losses by SNR with offset (cleaner steps get higher weight)
             alpha = schedule[:, :, :, 0]  # (1, 1, S)
-            snr = (alpha + self.snr_eps) / (1 - alpha + self.snr_eps)  # (1, 1, S)
+            snr = torch.ones(1, 1, 1, 1, device=self.device) # (alpha + self.snr_eps) / (1 - alpha + self.snr_eps)  # (1, 1, S)
+            # snr = (alpha + self.snr_eps) / (1 - alpha + self.snr_eps)  # (1, 1, S)
             mask = train_mask[:, 1:, :, 0]  # (1, Ln, S)
             ce_loss = (ce_loss_per * snr * mask).sum() / (B * (snr * mask).sum()).clamp(min=1e-8)
-            latent_loss = latent_loss_per
+            latent_loss = (latent_loss_per * snr * mask).sum() / (B * (snr * mask).sum()).clamp(min=1e-8)
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
             # ---- gradient alignment diagnostic ----
