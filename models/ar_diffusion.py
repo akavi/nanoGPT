@@ -361,6 +361,10 @@ class ArDiffusion(nn.Module):
         x_flat = x.reshape(B, L, self.n_step * self.n_embd_per_step)
         pos = torch.arange(0, L, device=self.device)
         pos_emb = self.wpe(pos)  # (L, n_embd)
+        # Normalize pos_emb to zero mean, unit variance (matching in_norm on token embeddings)
+        pos_emb = (pos_emb - pos_emb.mean(dim=-1, keepdim=True)) * torch.rsqrt(
+            pos_emb.var(dim=-1, keepdim=True, unbiased=False) + 1e-5
+        )
         x_flat = self.drop(pos_emb + x_flat)
 
         y_flat, new_backbone_state = self.backbone(x_flat, backbone_state)  # (B,L,n_embd)
