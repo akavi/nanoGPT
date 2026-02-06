@@ -9,7 +9,6 @@ from models.model import ModuleList
 from models.mamba import Mamba2, MambaConfig
 from models.mol import MoLConfig, MoL
 from train import train, TrainConfig
-from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
@@ -131,7 +130,7 @@ def get_batch(split, batch_size):
     x_out = rows[:, :block_size].to(dtype=torch.float) / 127.5 - 1.0
     y_out = rows[:, 1:block_size + 1].to(dtype=torch.float) / 127.5 - 1.0
 
-    return x_out, y_out
+    return x_out.unsqueeze(-1), y_out.unsqueeze(-1)
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
@@ -179,26 +178,51 @@ if mode == "resume" or mode == "from_scratch":
         config=train_config,
     )
 else:
-    def init_gen(device):
-        return torch.zeros((1, 1), dtype=torch.bfloat16, device=device)
+    from contextlib import nullcontext
+    from torch.nn import functional as F
 
-    def detokenize_and_save(tokens: np.ndarray, path: str):
-        img = detokenize(tokens)
-        path = os.path.join(overridable['out_dir'], str(Path(path).with_suffix(".png")))
-        img.save(path, format="PNG")
+    device = overridable['device']
+    num_samples = 10
+    temperature = 0.8
+    block_size = overridable['block_size']
 
-    sample_config = SampleConfig(
-        num_samples=10,
-        max_new_tokens=1024,
-        temperature=0.8,
-        seed=1337,
-        device=overridable['device'],
-        compile=False,
-    )
+    torch.manual_seed(1337)
+    model.to(device)
+    model.eval()
     os.makedirs(overridable['out_dir'], exist_ok=True)
-    sample(
-        model=model,
-        init_gen=init_gen,
-        detokenize=detokenize_and_save,
-        config=sample_config,
-    )
+
+    device_type = "cuda" if "cuda" in device else "cpu"
+    if device_type == "cuda" and torch.cuda.is_bf16_supported():
+        ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    elif device_type == "cuda":
+        ctx = torch.amp.autocast(device_type=device_type, dtype=torch.float16)
+    else:
+        ctx = nullcontext()
+
+    with torch.no_grad(), ctx:
+        for k in range(num_samples):
+            seq = torch.zeros(1, 1, 1, device=device)  # BOS
+
+            for _ in range(TOKENS_LINEAR):
+                y_cond = seq if seq.size(1) <= block_size else seq[:, -block_size:]
+                (ml, m, ls), _, _ = model(y_cond, model.initial_state(1), targets=None)
+                ml, m, ls = ml[:, -1, :, :], m[:, -1, :, :], ls[:, -1, :, :]
+
+                pi = torch.softmax(ml, dim=-1)
+                comp = torch.distributions.Categorical(pi).sample()
+                oh = F.one_hot(comp, num_classes=pi.size(-1)).float()
+
+                mu_k = (m * oh).sum(-1)
+                log_s_k = (ls * oh).sum(-1)
+                s_k = (F.softplus(log_s_k) + 1e-8) * temperature
+
+                u = torch.rand_like(mu_k).clamp_(1e-6, 1 - 1e-6)
+                z = mu_k + s_k * (torch.log(u) - torch.log1p(-u))
+
+                seq = torch.cat([seq, z.unsqueeze(1)], dim=1)
+
+            tokens = seq[0, :, 0]  # [T+1] with BOS at front
+            img = detokenize(tokens)
+            path = os.path.join(overridable['out_dir'], f"{k}.png")
+            img.save(path, format="PNG")
+            print(f"Saved sample {k}")

@@ -145,7 +145,7 @@ def train(
             break
 
         for _micro_step in range(config.gradient_accumulation_steps):
-            B, T = x.shape
+            B = x.shape[0]
             state = model.initial_state(B)
             with ctx:
                 _, state, loss = model(x, state, y)
@@ -236,8 +236,8 @@ def estimate_loss(
         total_tokens = 0
 
         for i in range(config.eval_iters):
-            x, y = get_batch(split, config.batch_size)  # [B, T]
-            B, T = x.shape
+            x, y = get_batch(split, config.batch_size)
+            B, T = x.shape[0], x.shape[1]
             state = model.initial_state(B)
             with ctx:
                 _, state, loss = model(x, state, y)
