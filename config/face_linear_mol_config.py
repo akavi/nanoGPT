@@ -12,7 +12,7 @@ from train import train, TrainConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_sampled_batch as get_config_batch,
+    get_fixed_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
     load_checkpoint,
@@ -148,7 +148,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=128,                
+    batch_size=1,                
 
     eval_only=False,
     eval_interval=250,
