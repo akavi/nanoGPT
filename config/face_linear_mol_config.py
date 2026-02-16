@@ -129,8 +129,10 @@ def get_batch(split, batch_size):
     block_size = overridable['block_size']
     x_out = rows[:, :block_size].to(dtype=torch.float) / 127.5 - 1.0
     y_out = rows[:, 1:block_size + 1].to(dtype=torch.float) / 127.5 - 1.0
+    print("x_out shape: ", x_out.shape)
+    print("y_out shape: ", y_out.shape)
 
-    return x_out.unsqueeze(-1), y_out.unsqueeze(-1)
+    return x_out, y_out
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call

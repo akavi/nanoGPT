@@ -7,10 +7,9 @@ from models.layer_norm import LayerNorm
 
 @dataclass
 class MoLConfig:
-    n_block: int = 1024
+    n_block: int = 1024      
     n_embd: int = 768
-    n_mix: int = 10
-    n_tokens: int = 1
+    n_mix: int = 10          
     bias: bool = True
     dropout: float = 0.0
     n_mlp_hidden: int = 128
@@ -24,12 +23,11 @@ class MoL(nn.Module):
         super().__init__()
         self.n_block = config.n_block
         self.n_mix = config.n_mix
-        self.n_tokens = config.n_tokens
 
         # Chagpt claims this is better than a linear embedding
         # idk tho
         self.vte = nn.Sequential(
-            nn.Linear(config.n_tokens, config.n_mlp_hidden, bias=config.bias),
+            nn.Linear(1, config.n_mlp_hidden, bias=config.bias),
             nn.GELU(),
             nn.Linear(config.n_mlp_hidden, config.n_embd, bias=config.bias),
         )
@@ -41,16 +39,13 @@ class MoL(nn.Module):
         self.drop = nn.Dropout(config.dropout)
         self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
 
-        # output head: n_tokens * [mix_logits K | means K | log_scales K] = n_tokens * 3K per step
-        self.lm_head = nn.Linear(config.n_embd, config.n_tokens * 3 * config.n_mix, bias=config.bias)
-
-        self.scale_0 = nn.Parameter(torch.tensor(1.0)) 
-        self.scale_rest = nn.Parameter(torch.tensor(1.0)) 
+        # output head: [mix_logits K | means K | log_scales K] = 3K per step
+        self.lm_head = nn.Linear(config.n_embd, 3 * config.n_mix, bias=config.bias)
 
         self.apply(self._init_weights)
         # print parameter count
         n_params = sum(p.numel() for p in self.parameters())
-        print("number of parameters: %.2fM" % (n_params/1e6,))
+        print(f"number of parameters: {n_params/1e6:.2f}M")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -60,77 +55,81 @@ class MoL(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(
-        self,
-        y_obs: torch.Tensor,
-        state,
-        targets: torch.Tensor | None = None,
-    ):
+    def forward(self, x: Tensor, state, targets: Tensor | None = None):
         """
-        y_obs:    [B, T, n_tokens] observed *bounded* tokens in (-1,1).
-        targets:  if provided, [B, T, n_tokens] bounded y in (-1,1).
+        x_cont:  [B, T] real-valued previous tokens
+        targets: [B, T] real-valued next-token targets (aligned with x_cont positions)
+        Returns:
+          params tuple for last step if targets is None (inference), else full-step loss.
         """
-        device = y_obs.device
-        B, T, N = y_obs.shape
-        assert T <= self.n_block
-        assert N == self.n_tokens
+        device = x.device
+        B, T = x.shape
+        print("x shape: ", x.shape)
+        assert T <= self.n_block, f"seq len {T} > block size {self.n_block}"
 
-        pos = torch.arange(0, T, dtype=torch.long, device=device)
-        tok_emb = self.vte(y_obs)                                      # [B,T,n_embd]
-        pos_emb = self.wpe(pos).unsqueeze(0).expand(B, T, -1)
+        pos = torch.arange(0, T, dtype=torch.long, device=device)    # [T]
+        # value embedding
+        tok_emb = self.vte(x.unsqueeze(-1))                     # [B,T,n_embd]
+        pos_emb = self.wpe(pos).unsqueeze(0).expand(B, T, -1)        # [B,T,n_embd]
         h_in = self.drop(tok_emb + pos_emb)
 
-        h_out, state = self.backbone(h_in, state)
+        h_out, state = self.backbone(h_in, state)                    # [B,T,n_embd], state
         h_out = self.ln_f(h_out)
-        y_params = self.lm_head(h_out)                                 # [B,T,N*3K]
-        y_params = y_params.view(B, T, self.n_tokens, 3 * self.n_mix)  # [B,T,N,3K]
-        mix_logits, mu, log_s = _pack_params(self.n_mix, y_params)     # each [B,T,N,K]
+        y = self.lm_head(h_out)                                      # [B,T,3K]
+        print("y shape: ", y.shape)
+        print("targets shape: ", targets.shape if targets is not None else None)
+        mix_logits, mu, log_s = torch.split(y, self.n_mix, dim=-1)
 
         if targets is not None:
-            assert targets.shape == (B, T, self.n_tokens), \
-                f"expected targets [B,T,{self.n_tokens}], got {tuple(targets.shape)}"
-
-            logp = mixture_loglik(targets, mix_logits, mu, log_s)       # [B,T,N]
-            loss = (-logp).mean()
+            # continuous NLL of mixture of logistics
+            logp = mixture_loglik(targets, mix_logits, mu, log_s)    # [B,T]
+            loss_tok = -logp                                          # per-token loss
+            loss = loss_tok.mean()
             return (mix_logits, mu, log_s), state, loss
         else:
-            return (
-                mix_logits[:, [-1], :, :],
-                mu[:,       [-1], :, :],
-                log_s[:,    [-1], :, :],
-            ), state, None
-
+            # inference: return only last-step params for efficiency
+            mix_logits = mix_logits[:, [-1], :]                      # [B,1,K]
+            mu         = mu[:,       [-1], :]                        # [B,1,K]
+            log_s      = log_s[:,    [-1], :]                        # [B,1,K]
+            return (mix_logits, mu, log_s), state, None
 
     @torch.no_grad()
-    def generate(self, y_prefix: torch.Tensor, max_new_tokens: int, state,
-                 temperature: float = 1.0) -> torch.Tensor:
+    def generate(self,
+                 x_prefix: Tensor,
+                 max_new_tokens: int,
+                 state,
+                 temperature: float = 1.0) -> Tensor:
         """
-        y_prefix: [B, T0, n_tokens] in (-1,1).
-        Returns:  [B, T0+max_new_tokens, n_tokens] in (-1,1).
+        Autoregressively sample continuous tokens.
+        x_prefix: [B, T0] seed sequence (can be empty T0=0 with a learned BOS if you add one)
+        Returns concatenated sequence [B, T0 + max_new_tokens].
+        Temperature scales *component scales*; 1.0 = nominal, >1.0 = more spread.
         """
-        y = y_prefix
+        x = x_prefix
         for _ in range(max_new_tokens):
-            y_cond = y if y.size(1) <= self.n_block else y[:, -self.n_block:]
-            (mix_logits, mu, log_s), state, _ = self(y_cond, state, targets=None)
+            x_cond = x if x.size(1) <= self.n_block else x[:, -self.n_block:]
+            (mix_logits, mu, log_s), state, _ = self(x_cond, state, targets=None)
+            # shapes [B,1,K]
+            mix_logits = mix_logits[:, -1, :] / 1.0                   # you could divide by a "mixture temp" if desired
+            pi = F.softmax(mix_logits, dim=-1)                        # [B,K]
 
-            # mix_logits/mu/log_s: [B, 1, N, K] -> take last step -> [B, N, K]
-            pi = torch.softmax(mix_logits[:, -1, :, :], dim=-1)          # [B,N,K]
-            k = torch.distributions.Categorical(pi).sample()             # [B,N]
-            onehot = F.one_hot(k, num_classes=pi.size(-1)).float()       # [B,N,K]
+            # sample mixture indices
+            k = torch.distributions.Categorical(pi).sample()          # [B]
+            k_onehot = F.one_hot(k, num_classes=pi.size(-1)).float()  # [B,K]
 
-            mu_k    = (mu[:, -1, :, :]    * onehot).sum(-1)              # [B,N]
-            log_s_k = (log_s[:, -1, :, :] * onehot).sum(-1)              # [B,N]
+            # select component params
+            mu_k    = (mu[:, -1, :]    * k_onehot).sum(dim=-1)        # [B]
+            log_s_k = (log_s[:, -1, :] * k_onehot).sum(dim=-1)        # [B]
 
-            s_k = F.softplus(log_s_k) + 1e-8
+            # temperature on scale
             if temperature != 1.0:
-                s_k = s_k * temperature
+                # equivalent to multiplying s by temperature
+                log_s_k = torch.log(F.softplus(log_s_k) * temperature + 1e-8)
 
-            u = torch.rand_like(mu_k).clamp_(1e-6, 1 - 1e-6)
-            z_next = mu_k + s_k * (torch.log(u) - torch.log1p(-u))      # [B,N]
+            x_next = sample_logistic(mu_k, log_s_k)                   # [B]
+            x = torch.cat([x, x_next.unsqueeze(1)], dim=1)            # [B, T+1]
 
-            y_next = z_next                                                # [B,N]
-            y = torch.cat([y, y_next.unsqueeze(1)], dim=1)               # [B,T+1,N]
-        return y
+        return x
 
     def initial_state(self, batch_size):
         return self.backbone.initial_state(batch_size)
@@ -157,11 +156,3 @@ def sample_logistic(mu: Tensor, log_s: Tensor) -> Tensor:
     s = F.softplus(log_s) + 1e-8
     return mu + s * (torch.log(u) - torch.log1p(-u))  # logit(u)
 
-def _pack_params(n_mix: int, y: Tensor):
-    """
-    y: [..., 3K] -> mix_logits [..., K], mu [..., K], log_s [..., K]
-    """
-    K = n_mix
-    assert y.shape[-1] == 3 * K
-    mix_logits, mu, log_s = torch.split(y, K, dim=-1)
-    return mix_logits, mu, log_s
