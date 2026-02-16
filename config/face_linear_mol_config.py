@@ -108,10 +108,10 @@ TOKENS_PER_ROW = TOKENS_LINEAR + 1
 def detokenize(tokens: torch.Tensor) -> Image.Image:
     """
     Inverse of the linear row-major rasterization (grayscale).
-    tokens: length TOKENS_LINEAR+1 tensor of floats in [-1,1], BOS at front.
+    tokens: [TOKENS_LINEAR+1, 1] floats in [-1,1], BOS at front.
     Returns PIL.Image (mode 'L') of shape HxW.
     """
-    t = (tokens[1:].cpu() + 1.0) * 127.5
+    t = (tokens[1:, 0].cpu() + 1.0) * 127.5
     t = t.clamp(0, 255).numpy().astype(np.uint8)
     if t.ndim != 1 or t.size != TOKENS_LINEAR:
         raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
@@ -133,7 +133,7 @@ def get_batch(split, batch_size):
     x_out = rows[:, 0:block_size].to(dtype=torch.float) / 127.5 - 1.0
     y_out = rows[:, 1:block_size + 1].to(dtype=torch.float) / 127.5 - 1.0
 
-    return x_out, y_out
+    return x_out.unsqueeze(-1), y_out.unsqueeze(-1)
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
@@ -202,11 +202,11 @@ else:
 
     with torch.no_grad(), ctx:
         for k in range(num_samples):
-            bos = torch.zeros(1, 1, device=device)
+            bos = torch.zeros(1, 1, 1, device=device)
             state = model.initial_state(1)
             seq = model.generate(bos, TOKENS_LINEAR, state, temperature=temperature)
 
-            tokens = seq[0, :]
+            tokens = seq[0, :, :]
             img = detokenize(tokens)
             path = os.path.join(overridable['out_dir'], f"{k}.png")
             img.save(path, format="PNG")
