@@ -65,6 +65,7 @@ class MoL(nn.Module):
         device = x.device
         B, T, N = x.shape
         assert T <= self.n_block, f"seq len {T} > block size {self.n_block}"
+        assert N == self.n_tokens, f"expected {self.n_tokens} tokens per step, got {N}"
 
         pos = torch.arange(0, T, dtype=torch.long, device=device)
         tok_emb = self.vte(x)                                            # [B,T,n_embd]
@@ -73,20 +74,19 @@ class MoL(nn.Module):
 
         h_out, state = self.backbone(h_in, state)
         h_out = self.ln_f(h_out)
-        y = self.lm_head(h_out)                                          # [B,T,3*K*N]
 
         K = self.n_mix
-        y = y.view(B, T, N, 3 * K)
-        mix_logits, mu, log_s = torch.split(y, K, dim=-1)               # each [B,T,N,K]
-
         if targets is not None:
+            y = self.lm_head(h_out)                                      # [B,T,3*K*N]
+            y = y.view(B, T, self.n_tokens, 3 * K)
+            mix_logits, mu, log_s = torch.split(y, K, dim=-1)           # each [B,T,N,K]
             logp = mixture_loglik(targets, mix_logits, mu, log_s)        # [B,T,N]
             loss = -logp.mean()
             return (mix_logits, mu, log_s), state, loss
         else:
-            mix_logits = mix_logits[:, [-1], :, :]                       # [B,1,N,K]
-            mu         = mu[:,       [-1], :, :]
-            log_s      = log_s[:,    [-1], :, :]
+            y = self.lm_head(h_out[:, [-1], :])                          # [B,1,3*K*N]
+            y = y.view(B, 1, self.n_tokens, 3 * K)
+            mix_logits, mu, log_s = torch.split(y, K, dim=-1)           # each [B,1,N,K]
             return (mix_logits, mu, log_s), state, None
 
     @torch.no_grad()

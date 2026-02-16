@@ -28,7 +28,6 @@ class ModuleList(nn.Module):
         new_state = []
 
         for idx, fn in enumerate(self.inner_list):
-            print("idx", idx)
             x, this_state = fn(x, old_state[idx])
             new_state.append(this_state)
 
