@@ -153,8 +153,6 @@ def train(
 
             # prefetch for next step / next iter
             x, y = get_batch("train", config.batch_size)
-            print("TRAIN: x shape: ", x.shape)
-            print("TRAIN: y shape: ", y.shape)
             scaler.scale(loss).backward()
 
         # gradient step
@@ -241,8 +239,6 @@ def estimate_loss(
             x, y = get_batch(split, config.batch_size)
             B, T = x.shape[0], x.shape[1]
             state = model.initial_state(B)
-            print("x shape in estimate_loss: ", x.shape)
-            print("y shape in estimate_loss: ", y.shape)
             with ctx:
                 _, state, loss = model(x, state, y)
 

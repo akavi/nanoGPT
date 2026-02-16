@@ -64,7 +64,6 @@ class MoL(nn.Module):
         """
         device = x.device
         B, T = x.shape
-        print("x shape: ", x.shape)
         assert T <= self.n_block, f"seq len {T} > block size {self.n_block}"
 
         pos = torch.arange(0, T, dtype=torch.long, device=device)    # [T]
@@ -76,8 +75,6 @@ class MoL(nn.Module):
         h_out, state = self.backbone(h_in, state)                    # [B,T,n_embd], state
         h_out = self.ln_f(h_out)
         y = self.lm_head(h_out)                                      # [B,T,3K]
-        print("y shape: ", y.shape)
-        print("targets shape: ", targets.shape if targets is not None else None)
         mix_logits, mu, log_s = torch.split(y, self.n_mix, dim=-1)
 
         if targets is not None:
@@ -110,7 +107,7 @@ class MoL(nn.Module):
             x_cond = x if x.size(1) <= self.n_block else x[:, -self.n_block:]
             (mix_logits, mu, log_s), state, _ = self(x_cond, state, targets=None)
             # shapes [B,1,K]
-            mix_logits = mix_logits[:, -1, :] / 1.0                   # you could divide by a "mixture temp" if desired
+            mix_logits = mix_logits[:, -1, :]                          # [B,K]
             pi = F.softmax(mix_logits, dim=-1)                        # [B,K]
 
             # sample mixture indices
@@ -121,12 +118,10 @@ class MoL(nn.Module):
             mu_k    = (mu[:, -1, :]    * k_onehot).sum(dim=-1)        # [B]
             log_s_k = (log_s[:, -1, :] * k_onehot).sum(dim=-1)        # [B]
 
-            # temperature on scale
-            if temperature != 1.0:
-                # equivalent to multiplying s by temperature
-                log_s_k = torch.log(F.softplus(log_s_k) * temperature + 1e-8)
-
-            x_next = sample_logistic(mu_k, log_s_k)                   # [B]
+            # scale by temperature: convert to actual scale, multiply, sample directly
+            s_k = (F.softplus(log_s_k) + 1e-8) * temperature
+            u = torch.rand_like(mu_k).clamp_(1e-6, 1 - 1e-6)
+            x_next = mu_k + s_k * (torch.log(u) - torch.log1p(-u))   # [B]
             x = torch.cat([x, x_next.unsqueeze(1)], dim=1)            # [B, T+1]
 
         return x

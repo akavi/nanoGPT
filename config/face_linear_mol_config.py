@@ -8,6 +8,7 @@ import os
 from models.model import ModuleList
 from models.mamba import Mamba2, MambaConfig
 from models.mol import MoLConfig, MoL
+from models.categorical import CategoricalConfig, Categorical
 from train import train, TrainConfig
 from utils import (
     OptimizerConfig,
@@ -26,15 +27,15 @@ overridable = override(sys.argv, {
     "out_dir": "out-face-linear-mol",
     "dataset": "image_anime_face",
     "mode": "from_scratch",  
-    "device": "cuda",
+    "device": "mps",
     "seed":1337,
-    "learning_rate":3e-4,
+    "learning_rate":1e-4,
     "min_lr":3e-5,
     "n_layer": 10,
     "n_embd":384,
     "bias": True,
     "block_size": 1024,
-    "n_mix": 5,
+    "n_mix": 256,
 })
 
 # -----------------------------------------------------------------------------#
@@ -107,7 +108,7 @@ TOKENS_PER_ROW = TOKENS_LINEAR + 1
 def detokenize(tokens: torch.Tensor) -> Image.Image:
     """
     Inverse of the linear row-major rasterization (grayscale).
-    tokens: length TOKENS_LINEAR array-like of floats in [-1,1], NO BOS at front.
+    tokens: length TOKENS_LINEAR+1 tensor of floats in [-1,1], BOS at front.
     Returns PIL.Image (mode 'L') of shape HxW.
     """
     t = (tokens[1:].cpu() + 1.0) * 127.5
@@ -118,7 +119,7 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_config_batch(
+    raw_rows = get_config_batch(
         split,
         batch_size,
         DataConfig(
@@ -127,10 +128,10 @@ def get_batch(split, batch_size):
         ),
     )
     block_size = overridable['block_size']
-    x_out = rows[:, :block_size].to(dtype=torch.float) / 127.5 - 1.0
+    bos = torch.zeros(raw_rows.size(0), 1, device=raw_rows.device, dtype=raw_rows.dtype)
+    rows = torch.cat([bos, raw_rows], dim=1)
+    x_out = rows[:, 0:block_size].to(dtype=torch.float) / 127.5 - 1.0
     y_out = rows[:, 1:block_size + 1].to(dtype=torch.float) / 127.5 - 1.0
-    print("x_out shape: ", x_out.shape)
-    print("y_out shape: ", y_out.shape)
 
     return x_out, y_out
 
@@ -181,12 +182,10 @@ if mode == "resume" or mode == "from_scratch":
     )
 else:
     from contextlib import nullcontext
-    from torch.nn import functional as F
 
     device = overridable['device']
     num_samples = 10
     temperature = 0.8
-    block_size = overridable['block_size']
 
     torch.manual_seed(1337)
     model.to(device)
@@ -203,27 +202,11 @@ else:
 
     with torch.no_grad(), ctx:
         for k in range(num_samples):
-            seq = torch.zeros(1, 1, 1, device=device)  # BOS
+            bos = torch.zeros(1, 1, device=device)
+            state = model.initial_state(1)
+            seq = model.generate(bos, TOKENS_LINEAR, state, temperature=temperature)
 
-            for _ in range(TOKENS_LINEAR):
-                y_cond = seq if seq.size(1) <= block_size else seq[:, -block_size:]
-                (ml, m, ls), _, _ = model(y_cond, model.initial_state(1), targets=None)
-                ml, m, ls = ml[:, -1, :, :], m[:, -1, :, :], ls[:, -1, :, :]
-
-                pi = torch.softmax(ml, dim=-1)
-                comp = torch.distributions.Categorical(pi).sample()
-                oh = F.one_hot(comp, num_classes=pi.size(-1)).float()
-
-                mu_k = (m * oh).sum(-1)
-                log_s_k = (ls * oh).sum(-1)
-                s_k = (F.softplus(log_s_k) + 1e-8) * temperature
-
-                u = torch.rand_like(mu_k).clamp_(1e-6, 1 - 1e-6)
-                z = mu_k + s_k * (torch.log(u) - torch.log1p(-u))
-
-                seq = torch.cat([seq, z.unsqueeze(1)], dim=1)
-
-            tokens = seq[0, :, 0]  # [T+1] with BOS at front
+            tokens = seq[0, :]
             img = detokenize(tokens)
             path = os.path.join(overridable['out_dir'], f"{k}.png")
             img.save(path, format="PNG")
