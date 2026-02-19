@@ -34,9 +34,9 @@ overridable = override(sys.argv, {
     "bias": True,
     "block_size": 1024,
     "n_mix": 1,
-    "n_tokens": 1024,
+    "n_tokens": 1,
     "max_iters": 3000,
-    "batch_size": 128,
+    "batch_size": 1,
 })
 
 # -----------------------------------------------------------------------------#
@@ -212,7 +212,7 @@ train_config = TrainConfig(
     batch_size=overridable['batch_size'],
 
     eval_only=False,
-    eval_interval=250,
+    eval_interval=100,
     eval_iters=20,
     warmup_iters=overridable['max_iters'] // 10,
     max_iters=overridable['max_iters'],

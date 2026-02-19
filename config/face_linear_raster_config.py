@@ -189,7 +189,7 @@ else:
         img.save(path, format="PNG")
 
     sample_config = SampleConfig(
-        num_samples=10,
+        num_samples=1,
         max_new_tokens=1024,
         temperature=0.8,
         top_k=200,
