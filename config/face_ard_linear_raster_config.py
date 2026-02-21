@@ -15,7 +15,6 @@ from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_fixed_batch,
     get_sampled_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
@@ -38,11 +37,8 @@ overridable = override(sys.argv, {
     "bias": True,
     "block_size": 1024,
     "n_step": 4,
-    "n_embd": 8,
-    "latent_loss_scale": 0.0,
+    "latent_loss_scale": 1.0,
     "max_iters": 3000,
-    "gamma": 0.0,
-    "snr_eps": 0.1,
     "batch_size": 1,
 })
 
@@ -76,8 +72,6 @@ model = ArDiffusion(ArDiffusionConfig(
     dropout=0.05,
     device=overridable['device'],
     mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
-    gamma=overridable['gamma'],
-    snr_eps=overridable['snr_eps'],
 ), backbone)
 
 optimizer_config = OptimizerConfig(
@@ -131,7 +125,7 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     return Image.fromarray(img, mode="L")
 
 def get_batch(split, batch_size):
-    rows = get_fixed_batch(
+    rows = get_config_batch(
         split,
         batch_size,
         DataConfig(
@@ -197,6 +191,7 @@ else:
     def detokenize_and_save(tokens: np.ndarray, path: str):
         img = detokenize(tokens)
         path = os.path.join(overridable['out_dir'], str(Path(path).with_suffix(".png")))
+        print(f"Saving generated image to {path}")
         img.save(path, format="PNG")
 
     sample_config = SampleConfig(

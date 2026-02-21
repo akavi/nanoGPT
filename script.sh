@@ -7,7 +7,8 @@ rm -rf .venv
 uv venv --python 3.13
 source .venv/bin/activate
 uv sync
-./sweep_diffmol.sh
+uv run config/face_ard_linear_raster_config.py
+
 uv run python3 config/face_diffmol_config.py --learning_rate=3e-5 --min_lr=3e-6 --n_tokens=32 --n_mix=32
 
 git clone --depth 1 --branch master https://github.com/akavi/nanoGPT.git
@@ -23,9 +24,9 @@ uv run python3 config/face_ard_linear_raster_config.py --n_step=4 --latent_loss_
 git fetch && git reset origin/master --hard
 
 
-export LOGIN=root@86.38.238.110
+export LOGIN= root@86.38.238.15
 export PORT=22
-export DIR=out-face-diffmol
+export DIR=out-face-linear-raster
 scp -r -P $PORT "$LOGIN:~/nanoGPT/$DIR/*.png" .
 scp -r -P 22 out-face-mdct-zigzag $LOGIN:~/nanoGPT
 scp -r -P 22 out-image-mdct-even $LOGIN:~/nanoGPT
