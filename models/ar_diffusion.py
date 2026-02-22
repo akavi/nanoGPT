@@ -76,6 +76,13 @@ class ArDiffusion(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def _blend_fracs(self, device):
+        """Per-sublatent blend fractions shaped (1, 1, S, 1) for broadcasting."""
+        s_idx = torch.arange(self.n_step, device=device, dtype=torch.float)
+        clean = (s_idx / self.n_step).view(1, 1, -1, 1)
+        non_clean = ((self.n_step - s_idx) / self.n_step).view(1, 1, -1, 1)
+        return clean, non_clean / self.n_step, non_clean * (self.n_step - 1) / self.n_step
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -98,9 +105,9 @@ class ArDiffusion(nn.Module):
             input = clean_frac * norm_emb(tok_j) + ar_frac * norm_emb(tok_{j-1}) + noise_frac * noise
 
         After tilting, position i, sublatent s corresponds to tok_{i-s},
-        with AR from tok_{i-s-1}.
+        with AR from tok_{i-s-S} (the fully-denoised token from S steps back).
 
-        When S=1: clean_frac=0, ar_frac=1, noise_frac=0 → vanilla AR.
+        When S=1: clean_frac=0, ar_frac=1, noise_frac=0 → vanilla AR (AR from tok_{i-1}).
 
         Returns:
           x_in:         (B, L, S, E) blended tilted input
@@ -138,11 +145,14 @@ class ArDiffusion(nn.Module):
         clean_pre = torch.zeros(B, D, E, device=device)
         clean_pre[:, S - 1 : S - 1 + t, :] = emb_normed
 
-        # AR embeddings in pre-tilt space, shifted by 1 (valid at j = S .. S+n_ar-1)
+        # AR embeddings in pre-tilt space, shifted by 2S-1 so that after tilting,
+        # AR at (i, s) = emb(toks[i - s - S]): each sublatent gets the token that
+        # was fully denoised when that sublatent's token first entered the ladder.
         ar_pre = torch.zeros(B, D, E, device=device)
-        n_ar = min(t, D - S)
+        ar_offset = 2 * S - 1
+        n_ar = min(t, D - ar_offset)
         if n_ar > 0:
-            ar_pre[:, S : S + n_ar, :] = emb_normed[:, :n_ar, :]
+            ar_pre[:, ar_offset : ar_offset + n_ar, :] = emb_normed[:, :n_ar, :]
 
         # Expand to (B, D, S, E) — same embedding at every sublatent
         clean_exp = clean_pre.unsqueeze(2).expand(B, D, S, E)
@@ -151,15 +161,9 @@ class ArDiffusion(nn.Module):
         # Noise
         noise = torch.randn(B, D, S, E, device=device)
 
-        # Per-sublatent blend fractions
-        s_idx = torch.arange(S, device=device, dtype=torch.float)
-        clean_frac = (s_idx / S).view(1, 1, S, 1)
-        non_clean = ((S - s_idx) / S).view(1, 1, S, 1)
-        ar_frac = non_clean / S
-        noise_frac = non_clean * (S - 1) / S
-
         # Blend and tilt
-        blended = clean_frac * clean_exp + ar_frac * ar_exp + noise_frac * noise
+        cf, af, nf = self._blend_fracs(device)
+        blended = cf * clean_exp + af * ar_exp + nf * noise
         x_in = tilt(blended, tilt_dim=2, content_dim=1)          # (B, L, S, E)
         clean_tilted = tilt(clean_exp, tilt_dim=2, content_dim=1) # (B, L, S, E)
 
@@ -212,84 +216,54 @@ class ArDiffusion(nn.Module):
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
         else:  # sample
-            # Blend fractions for constructing generated inputs
-            s_idx = torch.arange(S, device=toks.device, dtype=torch.float)
-            cf = (s_idx / S).view(1, 1, S, 1)
-            nc = ((S - s_idx) / S).view(1, 1, S, 1)
-            af = nc / S
-            nf = nc * (S - 1) / S
+            output_buf, ar_buf = diffusion_state
+            cf, af, nf = self._blend_fracs(toks.device)
 
-            # AR buffer: tracks the AR signal assigned to each active sublatent.
-            # ar_buf[:, s, :] = the AR embedding this sublatent received when it
-            # entered the ladder at s=0.  As sublatents shift up (s -> s+1),
-            # their AR signal shifts with them.
-            ar_buf = torch.zeros(B, S, E, device=toks.device)
-            prev_out = torch.zeros(B, 1, S, E, device=toks.device)
+            start = output_buf.shape[1] - 1
+            fill_length = T + S - 1
 
-            fill_length = toks.shape[1] + self.n_step - 1
-            for idx in range(fill_length):
-                m = train_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1)
+            for idx in range(start, fill_length):
+                prev_out = output_buf[:, -1:, :, :]
 
-                # Clean component: output at s-1 feeds into s (shift up)
-                shifted = torch.zeros(B, 1, S, E, device=toks.device)
-                shifted[:, :, 1:, :] = prev_out[:, :, :-1, :]
+                # Clean component: output at s-1 feeds into s (shift up, zero at s=0)
+                shifted = F.pad(prev_out[:, :, :-1, :], (0, 0, 1, 0))
+                # Shift AR buffer; new s=0 gets the token embedding from the cleanest prediction
+                pred_tok = self.lm_head(prev_out[:, :, -1, :]).argmax(dim=-1)  # (B, 1)
+                ar_buf = torch.cat([self.in_norm(self.wte(pred_tok)), ar_buf[:, :-1, :]], dim=1)
 
-                # Shift AR buffer: each sublatent's AR travels with it
-                new_ar_buf = torch.zeros_like(ar_buf)
-                new_ar_buf[:, 1:, :] = ar_buf[:, :-1, :]
-                # New s=0 entry gets the cleanest output that just slid off
-                new_ar_buf[:, 0, :] = prev_out[:, 0, -1, :]
-                ar_buf = new_ar_buf
-
-                ar_signal = ar_buf.unsqueeze(1)  # (B, 1, S, E)
                 noise = torch.randn(B, 1, S, E, device=toks.device)
-                gen_input = cf * shifted + af * ar_signal + nf * noise
+                gen_input = cf * shifted + af * ar_buf.unsqueeze(1) + nf * noise
 
-                x_in[:, idx:idx+1, :, :] = (
-                    m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * gen_input
-                )
+                m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1)
+                blended = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * gen_input
+
                 y, backbone_state = self._one_step(
-                    x_in[:, :idx+1, :, :],
-                    backbone_state,
-                    pos_idx=idx,
+                    blended, backbone_state, pos_offset=idx,
                 )
-                prev_out = y[:, -1:, :, :]
+                output_buf = torch.cat([output_buf, y[:, -1:, :, :]], dim=1)
 
-            tok_logits = self.lm_head(y[:, :, -1, :])  # (B, T, V) from cleanest sublatent
-            return tok_logits, (diffusion_state, backbone_state), None
+            tok_logits = self.lm_head(output_buf[:, -1:, -1, :])  # (B, 1, V) cleanest sublatent
+            return tok_logits, ((output_buf, ar_buf), backbone_state), None
 
     def lm_head(self, x: Tensor) -> Tensor:
         return self.lm_projection(x)  # (B,L,V)
 
     @torch.no_grad()
     def generate(self, tok, max_new_tokens, state, temperature=1.0, top_k=None):
-        # implementation from 
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
         for idx in range(max_new_tokens):
-            print(f"gen {idx}")
-            # if the sequence context is growing too long we must crop it at n_block
-            tok = tok if tok.size(1) <= self.n_block else tok[:, -self.n_block:]
-            # forward the model to get the logits for the index in the sequence
             logits, state, _ = self(tok, state)
-            # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
-            # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
             x_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
             tok = torch.cat((tok, x_next), dim=1)
-
         return tok
     
     
     def initial_state(self, batch_size):
-        diffusion_state = torch.zeros(batch_size, 1, self.n_step, self.n_embd_per_step, device=self.device)
-        return (diffusion_state, self.backbone.initial_state(batch_size))
+        S, E = self.n_step, self.n_embd_per_step
+        output_buf = torch.zeros(batch_size, 1, S, E, device=self.device)
+        ar_buf = torch.zeros(batch_size, S, E, device=self.device)
+        return ((output_buf, ar_buf), self.backbone.initial_state(batch_size))
 
     def flops_per_fwdbwd(self):
         return self.backbone.flops_per_fwdbwd()
@@ -333,10 +307,10 @@ class ArDiffusion(nn.Module):
         return n_params
 
 
-    def _one_step(self, x: Tensor, backbone_state, pos_idx=0):
+    def _one_step(self, x: Tensor, backbone_state, pos_offset=0):
         B, L, _, _ = x.shape
         x_flat = x.reshape(B, L, self.n_step * self.n_embd_per_step)
-        pos = torch.arange(0, L, device=self.device)
+        pos = torch.arange(pos_offset, pos_offset + L, device=self.device)
         pos_emb = self.wpe(pos)  # (L, n_embd)
         # Normalize pos_emb to zero mean, unit variance (matching in_norm on token embeddings)
         pos_emb = (pos_emb - pos_emb.mean(dim=-1, keepdim=True)) * torch.rsqrt(
@@ -346,10 +320,7 @@ class ArDiffusion(nn.Module):
 
         y_flat, new_backbone_state = self.backbone(x_flat, backbone_state)  # (B,L,n_embd)
 
-        suffix_len = L - pos_idx
-        y_flat = y_flat[:, -suffix_len:, :]
-
-        y_pre = y_flat.view(B, L - pos_idx, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
+        y_pre = y_flat.view(B, L, self.n_step, self.n_embd_per_step)        # (B,L,S,E)
         y = self.out_norm(y_pre)
         return y, new_backbone_state
 

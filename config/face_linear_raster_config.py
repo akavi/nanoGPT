@@ -36,6 +36,7 @@ overridable = override(sys.argv, {
     "n_embd":384,
     "bias": True,
     "block_size": 1024,
+    "max_iters": 3000,
 })
 
 # -----------------------------------------------------------------------------#
@@ -156,7 +157,7 @@ train_config = TrainConfig(
     eval_interval=250,
     eval_iters=20,
     warmup_iters=300,
-    max_iters=3000,
+    max_iters=overridable['max_iters'],
 
     log_interval=1,
     always_save_checkpoint=True,

@@ -15,7 +15,7 @@ from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_sampled_batch as get_config_batch,
+    get_fixed_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
     load_checkpoint,
@@ -60,7 +60,7 @@ backbone = ModuleList([
         n_chunk=32,
         dropout=0.05,
         device=overridable['device'],
-        mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
+        mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "train",
     ), i)
 for i in range(overridable['n_layer'])])
 model = ArDiffusion(ArDiffusionConfig(
@@ -197,7 +197,7 @@ else:
     sample_config = SampleConfig(
         num_samples=10,
         max_new_tokens=1024,
-        temperature=0.8,
+        temperature=0.01,
         top_k=200,
         seed=1337,
         device=overridable['device'],
