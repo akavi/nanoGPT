@@ -34,7 +34,7 @@ overridable = override(sys.argv, {
     "min_lr":3e-5,
     "n_layer": 10,
     "n_embd":384,
-    "bias": True,
+    "bias": False,
     "block_size": 1024,
     "max_iters": 3000,
 })
@@ -53,7 +53,7 @@ backbone = ModuleList([
         n_conv=4,
         n_state=64,
 
-        bias=False,
+        bias=overridable['bias'],
         n_chunk=32,
         dropout=0.05,
         device=overridable['device'],

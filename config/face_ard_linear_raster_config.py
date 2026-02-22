@@ -15,7 +15,7 @@ from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_fixed_batch as get_config_batch,
+    get_sampled_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
     load_checkpoint,
@@ -39,7 +39,7 @@ overridable = override(sys.argv, {
     "n_step": 4,
     "latent_loss_scale": 1.0,
     "max_iters": 3000,
-    "batch_size": 1,
+    "batch_size": 128,
 })
 
 # -----------------------------------------------------------------------------#
@@ -60,7 +60,7 @@ backbone = ModuleList([
         n_chunk=32,
         dropout=0.05,
         device=overridable['device'],
-        mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "train",
+        mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
     ), i)
 for i in range(overridable['n_layer'])])
 model = ArDiffusion(ArDiffusionConfig(
@@ -118,7 +118,7 @@ def detokenize(tokens: torch.Tensor) -> Image.Image:
     tokens: length TOKENS_LINEAR array-like of ints in [0,255], NO BOS at front.
     Returns PIL.Image (mode 'L') of shape HxW.
     """
-    t = np.asarray(tokens[1:].cpu(), dtype=np.uint8)
+    t = np.asarray(tokens.cpu(), dtype=np.uint8)
     if t.ndim != 1 or t.size != TOKENS_LINEAR:
         raise ValueError(f"expected 1D length {TOKENS_LINEAR}, got shape {t.shape}")
     img = t.reshape(H, W)  # row-major single channel

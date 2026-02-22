@@ -172,15 +172,15 @@ class ArDiffusion(nn.Module):
     def forward(self, toks, state, targets=None):
         diffusion_state, backbone_state = state
 
-        x_in, clean_tilted, train_mask, gen_mask = self._prep_backbone_inputs(toks)
-
         (B, T) = toks.size()
-        L = x_in.shape[1]
         S = self.n_step
         E = self.n_embd_per_step
-        V = self.n_vocab
 
         if self.mode == "train":
+            x_in, clean_tilted, train_mask, gen_mask = self._prep_backbone_inputs(toks)
+            L = x_in.shape[1]
+            V = self.n_vocab
+
             y, new_backbone_state = self._one_step(x_in, backbone_state)
             tok_logits = self.lm_head(y)  # (B, L, S, V)
             new_diff_state = y
@@ -207,7 +207,7 @@ class ArDiffusion(nn.Module):
             # MSE loss: all sublatents vs clean embeddings (x-prediction)
             latent_loss = _latent_mse(
                 pred=y,
-                target=clean_tilted,
+                target=clean_tilted.detach(),
                 real_mask=train_mask,
             )
 
@@ -227,20 +227,23 @@ class ArDiffusion(nn.Module):
 
                 # Clean component: output at s-1 feeds into s (shift up, zero at s=0)
                 shifted = F.pad(prev_out[:, :, :-1, :], (0, 0, 1, 0))
-                # Shift AR buffer; new s=0 gets the token embedding from the cleanest prediction
-                pred_tok = self.lm_head(prev_out[:, :, -1, :]).argmax(dim=-1)  # (B, 1)
-                ar_buf = torch.cat([self.in_norm(self.wte(pred_tok)), ar_buf[:, :-1, :]], dim=1)
 
+                # Build input from model's own recurrence. ar_buf carries the
+                # predicted token embedding from the previous position (zeros
+                # initially), so at position 0 this is cf*0 + af*0 + nf*noise,
+                # matching training's x_in at position 0 (no previous token).
                 noise = torch.randn(B, 1, S, E, device=toks.device)
-                gen_input = cf * shifted + af * ar_buf.unsqueeze(1) + nf * noise
-
-                m = gen_mask[:, idx:idx+1, :, :].to(dtype=x_in.dtype)  # (1,1,S,1)
-                blended = m * x_in[:, idx:idx+1, :, :] + (1.0 - m) * gen_input
+                blended = cf * shifted + af * ar_buf.unsqueeze(1) + nf * noise
 
                 y, backbone_state = self._one_step(
                     blended, backbone_state, pos_offset=idx,
                 )
                 output_buf = torch.cat([output_buf, y[:, -1:, :, :]], dim=1)
+
+                # Update ar_buf AFTER processing: this position's prediction
+                # becomes the AR input for the next position
+                pred_tok = self.lm_head(y[:, -1:, -1, :]).argmax(dim=-1)  # (B, 1)
+                ar_buf = torch.cat([self.in_norm(self.wte(pred_tok)), ar_buf[:, :-1, :]], dim=1)
 
             tok_logits = self.lm_head(output_buf[:, -1:, -1, :])  # (B, 1, V) cleanest sublatent
             return tok_logits, ((output_buf, ar_buf), backbone_state), None
@@ -250,13 +253,25 @@ class ArDiffusion(nn.Module):
 
     @torch.no_grad()
     def generate(self, tok, max_new_tokens, state, temperature=1.0, top_k=None):
+        """
+        Generate tokens autoregressively.
+
+        ARD at position i predicts toks[i] (current-token prediction), so the
+        seed token passed via `tok` is only used to bootstrap the first forward
+        call — it is not part of the output. The returned tensor contains only
+        the generated tokens: [pred_0, pred_1, ...].
+
+        Internally, tok still grows (as a position counter for fill_length),
+        but the sample path builds its own AR inputs from the model's
+        recurrence (ar_buf / shifted), not from tok's content.
+        """
         for idx in range(max_new_tokens):
             logits, state, _ = self(tok, state)
             logits = logits[:, -1, :] / temperature
             probs = F.softmax(logits, dim=-1)
             x_next = torch.multinomial(probs, num_samples=1)
             tok = torch.cat((tok, x_next), dim=1)
-        return tok
+        return tok[:, 1:]  # strip seed — predictions start at tok[1]
     
     
     def initial_state(self, batch_size):
