@@ -7,7 +7,7 @@ rm -rf .venv
 uv venv --python 3.13
 source .venv/bin/activate
 uv sync
-uv run config/face_ard_linear_raster_config.py --n_step=4 --latent_loss_scale=0.0
+uv run python tests/test_ard_s1.py  --n_iters=1000
 
 uv run python3 config/face_diffmol_config.py --learning_rate=3e-5 --min_lr=3e-6 --n_tokens=32 --n_mix=32
 
@@ -19,12 +19,12 @@ rm -rf .venv
 uv venv --python 3.13
 source .venv/bin/activate
 uv sync
-uv run python3 config/face_ard_linear_raster_config.py --n_step=4 --latent_loss_scale=1.0 --n_embd=384
+uv run python3 config/face_ard_linear_raster_config.py --n_step=1
 
 git fetch && git reset origin/master --hard
 
 
-export LOGIN=root@31.22.104.12
+export LOGIN=ubuntu@216.81.245.142
 export PORT=22
 export DIR=out-face-linear-raster
 scp -r -P $PORT "$LOGIN:~/nanoGPT/$DIR/*.png" .
