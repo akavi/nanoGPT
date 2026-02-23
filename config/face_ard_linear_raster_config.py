@@ -197,7 +197,7 @@ else:
     sample_config = SampleConfig(
         num_samples=10,
         max_new_tokens=1024,
-        temperature=0.01,
+        temperature=0.8,
         top_k=200,
         seed=1337,
         device=overridable['device'],

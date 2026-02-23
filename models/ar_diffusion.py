@@ -68,7 +68,6 @@ class ArDiffusion(nn.Module):
         self.out_norm = SubLatentLayerNorm(self.n_step, self.n_embd_per_step)
 
         self.lm_projection = nn.Linear(self.n_embd_per_step, config.n_vocab, bias=False)
-        self.wte.weight = self.lm_projection.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -94,7 +93,7 @@ class ArDiffusion(nn.Module):
     def _prep_backbone_inputs(
         self,
         toks: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """
         Construct blended inputs with clean + AR + noise, then tilt.
 
@@ -123,18 +122,10 @@ class ArDiffusion(nn.Module):
         E = self.n_embd_per_step
         D = t + 2 * (S - 1)  # padded pre-tilt length
 
-        # ---- Masks (unchanged) ----
         side_neg = torch.zeros(1, S - 1, S, 1, device=device)
-        side_pos = torch.ones(1, S - 1, S, 1, device=device)
         main_pos = torch.ones(1, t, S, 1, device=device)
-
         train_mask = tilt(
             torch.cat([side_neg, main_pos, side_neg], dim=1),
-            tilt_dim=2, content_dim=1,
-        )  # (1, L, S, 1)
-
-        gen_mask = tilt(
-            torch.cat([side_pos, main_pos, side_neg], dim=1),
             tilt_dim=2, content_dim=1,
         )  # (1, L, S, 1)
 
@@ -167,17 +158,17 @@ class ArDiffusion(nn.Module):
         x_in = tilt(blended, tilt_dim=2, content_dim=1)          # (B, L, S, E)
         clean_tilted = tilt(clean_exp, tilt_dim=2, content_dim=1) # (B, L, S, E)
 
-        return x_in, clean_tilted, train_mask, gen_mask
+        return x_in, clean_tilted, train_mask
 
     def forward(self, toks, state, targets=None):
-        diffusion_state, backbone_state = state
+        output_buf, backbone_state = state
 
         (B, T) = toks.size()
         S = self.n_step
         E = self.n_embd_per_step
 
         if self.mode == "train":
-            x_in, clean_tilted, train_mask, gen_mask = self._prep_backbone_inputs(toks)
+            x_in, clean_tilted, train_mask = self._prep_backbone_inputs(toks)
             L = x_in.shape[1]
             V = self.n_vocab
 
@@ -187,16 +178,15 @@ class ArDiffusion(nn.Module):
 
             # ---- Tilted targets (token indices) ----
             side_target = torch.zeros(B, S - 1, S, dtype=toks.dtype, device=toks.device)
-            tgt = toks.unsqueeze(-1).expand(B, T, S)
+            exp_toks = toks.unsqueeze(-1).expand(B, T, S)
             targets = tilt(
-                torch.cat([side_target, tgt, side_target], dim=1),
+                torch.cat([side_target, exp_toks, side_target], dim=1),
                 tilt_dim=2, content_dim=1,
             )  # (B, L, S)
 
-            mask = train_mask[:, :, :, 0]  # (1, L, S)
 
             # CE loss on cleanest sublatent only (same position, no AR shift)
-            ce_mask = mask[:, :, -1]  # (1, L)
+            ce_mask = train_mask[:, :, -1, 0]  # (1, L, S)
             ce_loss_per = F.cross_entropy(
                 tok_logits[:, :, -1, :].reshape(B * L, V),
                 targets[:, :, -1].reshape(B * L),
@@ -215,38 +205,28 @@ class ArDiffusion(nn.Module):
 
             return tok_logits, (new_diff_state, new_backbone_state), loss
 
-        else:  # sample
-            output_buf, ar_buf = diffusion_state
+        else:  # sample — one position per call, AR from tok history
             cf, af, nf = self._blend_fracs(toks.device)
+            idx = output_buf.shape[1] - 1  # position to process
 
-            start = output_buf.shape[1] - 1
-            fill_length = T + S - 1
+            prev_out = output_buf[:, -1:, :, :]
+            shifted = F.pad(prev_out[:, :, :-1, :], (0, 0, 1, 0))
 
-            for idx in range(start, fill_length):
-                prev_out = output_buf[:, -1:, :, :]
+            # AR signal: sublatent s wants emb(toks[idx - s - S]).
+            # Pad with S zero-embeddings so out-of-range indices land on zeros.
+            tok_emb = self.in_norm(self.wte(toks))  # (B, T, E)
+            padded = F.pad(tok_emb, (0, 0, S, 0))  # (B, S + T, E)
+            ar_indices = idx - torch.arange(S, device=toks.device)  # offset by S already from pad
+            ar_emb = padded[:, ar_indices].unsqueeze(1)  # (B, 1, S, E)
 
-                # Clean component: output at s-1 feeds into s (shift up, zero at s=0)
-                shifted = F.pad(prev_out[:, :, :-1, :], (0, 0, 1, 0))
+            noise = torch.randn(B, 1, S, E, device=toks.device)
+            blended = cf * shifted + af * ar_emb + nf * noise
 
-                # Build input from model's own recurrence. ar_buf carries the
-                # predicted token embedding from the previous position (zeros
-                # initially), so at position 0 this is cf*0 + af*0 + nf*noise,
-                # matching training's x_in at position 0 (no previous token).
-                noise = torch.randn(B, 1, S, E, device=toks.device)
-                blended = cf * shifted + af * ar_buf.unsqueeze(1) + nf * noise
+            y, backbone_state = self._one_step(blended, backbone_state, pos_offset=idx)
+            output_buf = torch.cat([output_buf, y[:, -1:, :, :]], dim=1)
 
-                y, backbone_state = self._one_step(
-                    blended, backbone_state, pos_offset=idx,
-                )
-                output_buf = torch.cat([output_buf, y[:, -1:, :, :]], dim=1)
-
-                # Update ar_buf AFTER processing: this position's prediction
-                # becomes the AR input for the next position
-                pred_tok = self.lm_head(y[:, -1:, -1, :]).argmax(dim=-1)  # (B, 1)
-                ar_buf = torch.cat([self.in_norm(self.wte(pred_tok)), ar_buf[:, :-1, :]], dim=1)
-
-            tok_logits = self.lm_head(output_buf[:, -1:, -1, :])  # (B, 1, V) cleanest sublatent
-            return tok_logits, ((output_buf, ar_buf), backbone_state), None
+            tok_logits = self.lm_head(y[:, -1:, -1, :])
+            return tok_logits, (output_buf, backbone_state), None
 
     def lm_head(self, x: Tensor) -> Tensor:
         return self.lm_projection(x)  # (B,L,V)
@@ -256,29 +236,32 @@ class ArDiffusion(nn.Module):
         """
         Generate tokens autoregressively.
 
-        ARD at position i predicts toks[i] (current-token prediction), so the
-        seed token passed via `tok` is only used to bootstrap the first forward
-        call — it is not part of the output. The returned tensor contains only
-        the generated tokens: [pred_0, pred_1, ...].
+        ARD does current-token prediction, so there's no seed/BOS. tok starts
+        empty and accumulates the actually-selected tokens. The forward sample
+        path reads AR embeddings directly from tok.
 
-        Internally, tok still grows (as a position counter for fill_length),
-        but the sample path builds its own AR inputs from the model's
-        recurrence (ar_buf / shifted), not from tok's content.
+        For S > 1, the first S-1 calls warm up the sublatent ladder before
+        the cleanest sublatent produces a valid prediction.
         """
-        for idx in range(max_new_tokens):
+        B = tok.shape[0]
+        tok = torch.empty((B, 0), dtype=torch.long, device=self.device)
+
+        # Warm up ladder: S-1 calls to fill the sublatent pipeline
+        for _ in range(self.n_step - 1):
+            _, state, _ = self(tok, state)
+
+        for _ in range(max_new_tokens):
             logits, state, _ = self(tok, state)
             logits = logits[:, -1, :] / temperature
             probs = F.softmax(logits, dim=-1)
             x_next = torch.multinomial(probs, num_samples=1)
             tok = torch.cat((tok, x_next), dim=1)
-        return tok[:, 1:]  # strip seed — predictions start at tok[1]
+        return tok
     
     
     def initial_state(self, batch_size):
-        S, E = self.n_step, self.n_embd_per_step
-        output_buf = torch.zeros(batch_size, 1, S, E, device=self.device)
-        ar_buf = torch.zeros(batch_size, S, E, device=self.device)
-        return ((output_buf, ar_buf), self.backbone.initial_state(batch_size))
+        output_buf = torch.zeros(batch_size, 1, self.n_step, self.n_embd_per_step, device=self.device)
+        return (output_buf, self.backbone.initial_state(batch_size))
 
     def flops_per_fwdbwd(self):
         return self.backbone.flops_per_fwdbwd()
