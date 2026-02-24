@@ -14,7 +14,10 @@ class ArDiffusionConfig:
     dropout: float
     mode: Literal["train"] | Literal["sample"]
     latent_loss_scale: float
+    snr_bias: float
     device: str
+    ce_all_sublatents: bool = False
+    noise_jitter: float = 0.0
 
 class ArDiffusion(nn.Module):
     """
@@ -56,6 +59,9 @@ class ArDiffusion(nn.Module):
         self.n_vocab = config.n_vocab
         self.n_step = config.n_step
         self.latent_loss_scale = config.latent_loss_scale
+        self.snr_bias = config.snr_bias
+        self.ce_all_sublatents = config.ce_all_sublatents
+        self.noise_jitter = config.noise_jitter
         self.n_embd = config.n_embd
         self.device = config.device
 
@@ -149,8 +155,11 @@ class ArDiffusion(nn.Module):
         clean_exp = clean_pre.unsqueeze(2).expand(B, D, S, E)
         ar_exp = ar_pre.unsqueeze(2).expand(B, D, S, E)
 
-        # Noise
+        # Noise (with optional per-sample jitter for training robustness)
         noise = torch.randn(B, D, S, E, device=device)
+        if self.noise_jitter > 0.0 and self.training:
+            jitter_scale = 1.0 + self.noise_jitter * (2 * torch.rand(B, 1, S, 1, device=device) - 1)
+            noise = noise * jitter_scale
 
         # Blend and tilt
         cf, af, nf = self._blend_fracs(device)
@@ -185,20 +194,38 @@ class ArDiffusion(nn.Module):
             )  # (B, L, S)
 
 
-            # CE loss on cleanest sublatent only (same position, no AR shift)
-            ce_mask = train_mask[:, :, -1, 0]  # (1, L, S)
-            ce_loss_per = F.cross_entropy(
-                tok_logits[:, :, -1, :].reshape(B * L, V),
-                targets[:, :, -1].reshape(B * L),
-                reduction="none",
-            ).reshape(B, L)
-            ce_loss = (ce_loss_per * ce_mask).sum() / (B * ce_mask.sum()).clamp(min=1e-8)
+            # SNR weights per sublatent: snr(s) = (s/S) / ((S-s)(S-1)/S^2) = s*S / ((S-s)*(S-1))
+            # Weight = snr / (snr + snr_bias), shaped (1, 1, S, 1)
+            s_idx = torch.arange(S, device=toks.device, dtype=torch.float)
+            snr = (s_idx * S) / ((S - s_idx) * (S - 1)).clamp(min=1e-8)
+            snr_weight = (snr / (snr + self.snr_bias)).view(1, 1, S, 1)
+
+            if self.ce_all_sublatents:
+                # CE on all sublatents, weighted by SNR schedule
+                ce_mask_all = train_mask[:, :, :, 0]  # (1, L, S)
+                snr_weight_ce = snr_weight[:, :, :, 0]  # (1, 1, S)
+                ce_loss_per = F.cross_entropy(
+                    tok_logits.reshape(B * L * S, V),
+                    targets.reshape(B * L * S),
+                    reduction="none",
+                ).reshape(B, L, S)
+                weighted = ce_loss_per * ce_mask_all * snr_weight_ce
+                ce_loss = weighted.sum() / (B * (ce_mask_all * snr_weight_ce).sum()).clamp(min=1e-8)
+            else:
+                # CE on cleanest sublatent only
+                ce_mask = train_mask[:, :, -1, 0]  # (1, L)
+                ce_loss_per = F.cross_entropy(
+                    tok_logits[:, :, -1, :].reshape(B * L, V),
+                    targets[:, :, -1].reshape(B * L),
+                    reduction="none",
+                ).reshape(B, L)
+                ce_loss = (ce_loss_per * ce_mask).sum() / (B * ce_mask.sum()).clamp(min=1e-8)
 
             # MSE loss: all sublatents vs clean embeddings (x-prediction)
             latent_loss = _latent_mse(
                 pred=y,
                 target=clean_tilted.detach(),
-                real_mask=train_mask,
+                real_mask=train_mask * snr_weight,
             )
 
             loss = ce_loss + self.latent_loss_scale * latent_loss

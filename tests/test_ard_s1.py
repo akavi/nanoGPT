@@ -219,7 +219,7 @@ def test_blend_fractions(device, n_embd=64, n_layer=2, batch_size=16, target_los
     backbone = make_backbone(n_embd, n_layer=1, device=device)
     model = ArDiffusion(ArDiffusionConfig(
         n_block=BLOCK_SIZE, n_vocab=N_VOCAB, n_embd=n_embd, n_step=1,
-        latent_loss_scale=1.0, dropout=0.0, device=device, mode="train",
+        latent_loss_scale=1.0, snr_bias=5.0, dropout=0.0, device=device, mode="train",
     ), backbone)
     model.to(device)
 
@@ -278,7 +278,7 @@ def test_latent_loss_scale(device, n_iters=100, n_embd=192, n_layer=6, batch_siz
         backbone = make_backbone(n_embd, n_layer, device)
         model = ArDiffusion(ArDiffusionConfig(
             n_block=BLOCK_SIZE, n_vocab=N_VOCAB, n_embd=n_embd, n_step=1,
-            latent_loss_scale=scale, dropout=0.0, device=device, mode="train",
+            latent_loss_scale=scale, snr_bias=5.0, dropout=0.0, device=device, mode="train",
         ), backbone)
 
         losses, _, actual_iters = train_model(
@@ -358,7 +358,7 @@ def test_weight_tying(device, n_iters=100, n_embd=192, n_layer=6, batch_size=64,
         backbone = make_backbone(n_embd, n_layer, device)
         model = ArDiffusion(ArDiffusionConfig(
             n_block=BLOCK_SIZE, n_vocab=N_VOCAB, n_embd=n_embd, n_step=1,
-            latent_loss_scale=var["latent_loss_scale"], dropout=0.0,
+            latent_loss_scale=var["latent_loss_scale"], snr_bias=5.0, dropout=0.0,
             device=device, mode="train",
         ), backbone)
 
@@ -425,7 +425,7 @@ def test_entropy_collapse(device, n_iters=100, n_embd=192, n_layer=6, batch_size
     backbone = make_backbone(n_embd, n_layer, device)
     model = ArDiffusion(ArDiffusionConfig(
         n_block=BLOCK_SIZE, n_vocab=N_VOCAB, n_embd=n_embd, n_step=1,
-        latent_loss_scale=1.0, dropout=0.0, device=device, mode="train",
+        latent_loss_scale=1.0, snr_bias=5.0, dropout=0.0, device=device, mode="train",
     ), backbone)
 
     _, _, actual_iters = train_model(
