@@ -26,13 +26,13 @@ QUEUE_FILE = "~/.pi_queue"
 QUEUE_RUNNER = f"""\
 while true; do
   if [ -s {QUEUE_FILE} ]; then
-    cmd=$(head -1 {QUEUE_FILE})
-    tail -n +2 {QUEUE_FILE} > {QUEUE_FILE}.tmp && mv {QUEUE_FILE}.tmp {QUEUE_FILE}
-    echo ">>> $cmd"
-    eval "$cmd"
+    cmd=$(head -1 {QUEUE_FILE});
+    tail -n +2 {QUEUE_FILE} > {QUEUE_FILE}.tmp && mv {QUEUE_FILE}.tmp {QUEUE_FILE};
+    echo ">>> $cmd";
+    eval "$cmd";
   else
-    sleep 2
-  fi
+    sleep 2;
+  fi;
 done
 """
 
@@ -143,6 +143,10 @@ def queue_command(state, cmd):
     """Append a command to the remote queue file."""
     escaped = cmd.replace("'", "'\\''")
     remote_exec(state, f"echo '{escaped}' >> {QUEUE_FILE}")
+    # Record locally
+    history = state.setdefault("cmd_history", [])
+    history.append({"cmd": cmd, "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+    save_state(state)
 
 
 def read_queue(state):
@@ -172,10 +176,11 @@ def ensure_runner(state):
     if r.returncode != 0:
         remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION}", check=False)
 
-    # Check if the runner is already going — look for the sleep/eval pattern
-    r = remote_exec(state, f"tmux capture-pane -t {TMUX_SESSION} -p -l 1", check=False)
-    # If tmux is idle (shell prompt) and there's no runner, start one
+    # If tmux is idle, kill and recreate to clear any stale input (e.g. stuck
+    # continuation prompt), then start the runner fresh.
     if not tmux_is_busy(state):
+        remote_exec(state, f"tmux kill-session -t {TMUX_SESSION}", check=False)
+        remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION}", check=False)
         remote_exec(state, f"touch {QUEUE_FILE}", check=False)
         runner_escaped = QUEUE_RUNNER.replace("'", "'\\''").replace("\n", " ")
         tmux_send(state, runner_escaped)
@@ -218,6 +223,7 @@ def cmd_up(args):
     cloud_id = pick["cloudId"]
     provider = pick["provider"]
     socket = pick.get("socket", "SXM5")
+    data_center_id = pick.get("dataCenterId") or pick.get("dataCenter")
     print(f"Found: {provider} / {pick.get('region', '?')} @ ${pick['prices']['onDemand']}/hr")
 
     # Get SSH key ID
@@ -241,6 +247,7 @@ def cmd_up(args):
             "socket": socket,
             "gpuCount": args.gpu_count,
             "name": pod_name,
+            **({"dataCenterId": data_center_id} if data_center_id else {}),
         },
         "provider": {"type": provider},
     }
@@ -248,6 +255,8 @@ def cmd_up(args):
         body["pod"]["sshKeyId"] = ssh_key_id
 
     r = requests.post(f"{API_BASE}/pods/", headers=api_headers(), json=body)
+    if not r.ok:
+        print(f"API error {r.status_code}: {r.text}")
     r.raise_for_status()
     pod = r.json()
     pod_id = pod["id"]
@@ -604,6 +613,17 @@ def cmd_list(args):
                 print("Invalid selection.")
 
 
+def cmd_history(args):
+    state = require_pod()
+    history = state.get("cmd_history", [])
+    if not history:
+        print("No command history.")
+        return
+    for i, entry in enumerate(history, 1):
+        ts = entry.get("ts", "?")
+        print(f"  {i}. [{ts}] {entry['cmd']}")
+
+
 def cmd_ssh(args):
     state = require_pod()
     cmd = ssh_opts(state) + ["-t", f"tmux attach -t {TMUX_SESSION} || tmux new -s {TMUX_SESSION}"]
@@ -646,6 +666,7 @@ def main():
     p_fetch.add_argument("--local-dir", default=".", help="Local destination directory")
 
     sub.add_parser("status", help="Check pod and training status")
+    sub.add_parser("history", help="Show command history for the current pod")
     sub.add_parser("ssh", help="SSH into the pod tmux session")
     sub.add_parser("sync", help="Fetch active pods from the API")
     sub.add_parser("list", help="List active pods")
@@ -664,6 +685,7 @@ def main():
         "sample": cmd_sample,
         "fetch": cmd_fetch,
         "status": cmd_status,
+        "history": cmd_history,
         "ssh": cmd_ssh,
         "sync": cmd_sync,
         "list": cmd_list,
