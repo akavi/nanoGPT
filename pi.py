@@ -327,7 +327,7 @@ def tmux_is_busy(state):
     if r.returncode != 0:
         return False
     cmd = r.stdout.strip()
-    return cmd not in ("bash", "zsh", "sh", "fish", "")
+    return cmd not in ("bash", "zsh", "sh", "fish", "sleep", "")
 
 
 def tmux_capture(state, lines=5):
