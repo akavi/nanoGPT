@@ -2,6 +2,7 @@
 """Prime Intellect GPU pod management CLI for nanoGPT."""
 
 import argparse
+import datetime
 import json
 import os
 import subprocess
@@ -53,8 +54,20 @@ def save_state(state):
 
 
 def clear_state():
+    """Clear pod-specific state but preserve run tracking data."""
     if os.path.exists(STATE_FILE):
-        os.remove(STATE_FILE)
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+        # Preserve run management fields
+        preserved = {}
+        for key in ("next_run_id", "last_run_id", "runs", "api_key"):
+            if key in state:
+                preserved[key] = state[key]
+        if preserved:
+            with open(STATE_FILE, "w") as f:
+                json.dump(preserved, f, indent=2)
+        else:
+            os.remove(STATE_FILE)
 
 
 def get_api_key():
@@ -78,6 +91,146 @@ def require_pod():
         print("Error: No active pod. Run `pi up` first.")
         sys.exit(1)
     return state
+
+
+# ── Run management ────────────────────────────────────────────────────────────
+
+def allocate_run_id(state):
+    """Allocate the next sequential run ID and update state."""
+    run_id = state.get("next_run_id", 1)
+    state["next_run_id"] = run_id + 1
+    state["last_run_id"] = run_id
+    runs = state.setdefault("runs", {})
+    runs[str(run_id)] = {"status": "queued"}
+    save_state(state)
+    return run_id
+
+
+def get_run(state, run_id=None):
+    """Get run metadata by ID, defaulting to last_run_id."""
+    if run_id is None:
+        run_id = state.get("last_run_id")
+    if run_id is None:
+        print("Error: No run ID specified and no previous run.")
+        sys.exit(1)
+    runs = state.get("runs", {})
+    run = runs.get(str(run_id))
+    if not run:
+        print(f"Error: Run {run_id} not found in local state.")
+        sys.exit(1)
+    return run_id, run
+
+
+def get_git_sha():
+    """Get current git SHA."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def write_run_metadata(state, run_id, config, overrides):
+    """Write run.json to the remote outputs directory."""
+    metadata = {
+        "run_id": run_id,
+        "config": config,
+        "overrides": overrides,
+        "git_sha": get_git_sha(),
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    meta_json = json.dumps(metadata)
+    escaped = meta_json.replace("'", "'\\''")
+    remote_exec(state, f"mkdir -p ~/nanoGPT/outputs/{run_id}")
+    remote_exec(state, f"echo '{escaped}' > ~/nanoGPT/outputs/{run_id}/run.json")
+
+
+def sync_run(state, run_id):
+    """Rsync outputs/$run_id/ from remote to local."""
+    user = state.get("ssh_user", "root")
+    ip = state["ip"]
+    port = state.get("port", 22)
+    remote_path = f"{user}@{ip}:~/nanoGPT/outputs/{run_id}/"
+    local_path = f"outputs/{run_id}/"
+    os.makedirs(local_path, exist_ok=True)
+    cmd = [
+        "rsync", "-avz", "--progress",
+        "-e", f"ssh -i {SSH_KEY} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+        remote_path, local_path,
+    ]
+    print(f"Syncing outputs/{run_id}/ from remote...")
+    result = subprocess.run(cmd, check=False)
+    if result.returncode == 0:
+        print(f"Synced to {local_path}")
+    else:
+        print(f"Warning: rsync failed with code {result.returncode}")
+
+
+def _wait_and_shutdown_inner(run_ids):
+    """Poll until queue is idle, sync run outputs, then shut down (unless zombified).
+    Runs in a forked background process — logs to ~/.pi/wait.log."""
+    log = open(os.path.join(STATE_DIR, "wait.log"), "a")
+    def _log(msg):
+        log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        log.flush()
+
+    state = load_state()
+    _log(f"Waiting for runs {run_ids} to finish...")
+
+    for _ in range(720):  # up to 2 hours at 10s intervals
+        if queue_is_idle(state):
+            break
+        time.sleep(10)
+        state = load_state()  # refresh in case pod changed
+    _log("Queue idle.")
+
+    # Sync all requested runs
+    for run_id in run_ids:
+        state = load_state()
+        _log(f"Syncing run {run_id}...")
+        sync_run(state, run_id)
+        runs = state.get("runs", {})
+        if str(run_id) in runs:
+            runs[str(run_id)]["status"] = "synced"
+            save_state(state)
+
+    # Check zombify flag
+    state = load_state()
+    if not state.get("pod_id"):
+        _log("No pod in state — skipping shutdown.")
+        log.close()
+        return
+    r = remote_exec(state, "test -f ~/.pi_zombify", check=False)
+    if r.returncode == 0:
+        _log("Zombify flag detected — skipping shutdown.")
+        log.close()
+        return
+
+    # Shut down
+    _log("Shutting down pod...")
+    pod_id = state["pod_id"]
+    r = requests.delete(f"{API_BASE}/pods/{pod_id}", headers=api_headers())
+    r.raise_for_status()
+    clear_state()
+    _log("Pod terminated.")
+    log.close()
+
+
+def wait_and_shutdown(state, run_ids):
+    """Fork a background process to poll, sync, and shut down."""
+    pid = os.fork()
+    if pid == 0:
+        # Child — detach from terminal
+        os.setsid()
+        try:
+            _wait_and_shutdown_inner(run_ids)
+        except Exception as e:
+            with open(os.path.join(STATE_DIR, "wait.log"), "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] Error: {e}\n")
+        os._exit(0)
+    else:
+        print(f"Background watcher started (pid {pid}). Logs: ~/.pi/wait.log")
 
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
@@ -312,17 +465,19 @@ def cmd_up(args):
         print("Error: Pod did not become ready in time.")
         sys.exit(1)
 
-    state = {
+    # Preserve existing run tracking and API key
+    old_state = load_state()
+    state = {}
+    for key in ("next_run_id", "last_run_id", "runs", "api_key"):
+        if key in old_state:
+            state[key] = old_state[key]
+    state.update({
         "pod_id": pod_id,
         "ip": ip,
         "port": port,
         "ssh_user": ssh_user,
         "name": pod_name,
-    }
-    # Preserve API key if stored in state
-    old_state = load_state()
-    if "api_key" in old_state:
-        state["api_key"] = old_state["api_key"]
+    })
     save_state(state)
 
     print(f"Pod ready: {ssh_user}@{ip}:{port}")
@@ -405,38 +560,84 @@ def cmd_run(args):
 def cmd_train(args):
     state = require_pod()
     config = args.config_path
-    overrides = " ".join(args.overrides) if args.overrides else ""
+    overrides = list(args.overrides) if args.overrides else []
 
-    train_cmd = f"cd ~/nanoGPT && uv run {config} {overrides}".strip()
+    # Allocate run ID and write metadata
+    run_id = allocate_run_id(state)
+    state["runs"][str(run_id)]["config"] = config
+    state["runs"][str(run_id)]["overrides"] = overrides
+    save_state(state)
+
+    write_run_metadata(state, run_id, config, overrides)
+
+    override_str = " ".join(overrides)
+    train_cmd = f"cd ~/nanoGPT && uv run {config} --out_dir=outputs/{run_id} {override_str}".strip()
     enqueue_or_flush(state, train_cmd, force=args.f)
 
-    # Try to infer out_dir from config name
-    basename = os.path.basename(config).replace("_config.py", "").replace("_", "-")
-    out_dir = f"out-{basename}"
-    state["last_out_dir"] = out_dir
-    save_state(state)
+    print(f"Run {run_id}: {config} → outputs/{run_id}/")
+
+    if not args.no_wait:
+        wait_and_shutdown(state, [run_id])
 
 
 def cmd_sample(args):
     state = require_pod()
-    config = args.config_path
-    overrides = " ".join(args.overrides) if args.overrides else ""
+    overrides = list(args.overrides) if args.overrides else []
 
-    sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample {overrides}".strip()
+    # Look up run
+    run_id, run = get_run(state, args.run)
+    config = run.get("config")
+    if not config:
+        print(f"Error: Run {run_id} has no config recorded.")
+        sys.exit(1)
+
+    override_str = " ".join(overrides)
+    sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample --out_dir=outputs/{run_id} {override_str}".strip()
     enqueue_or_flush(state, sample_cmd, force=args.f)
 
-    # Try to infer out_dir from config name
-    basename = os.path.basename(config).replace("_config.py", "").replace("_", "-")
-    out_dir = f"out-{basename}"
-    state["last_out_dir"] = out_dir
-    save_state(state)
+    print(f"Sampling run {run_id}: {config} → outputs/{run_id}/")
+
+    if not args.no_wait:
+        wait_and_shutdown(state, [run_id])
+
+
+def cmd_resume(args):
+    state = require_pod()
+    overrides = list(args.overrides) if args.overrides else []
+
+    # Look up run
+    run_id, run = get_run(state, args.run)
+    config = run.get("config")
+    if not config:
+        print(f"Error: Run {run_id} has no config recorded.")
+        sys.exit(1)
+
+    override_str = " ".join(overrides)
+    resume_cmd = f"cd ~/nanoGPT && uv run {config} --mode=resume --out_dir=outputs/{run_id} {override_str}".strip()
+    enqueue_or_flush(state, resume_cmd, force=args.f)
+
+    print(f"Resuming run {run_id}: {config} → outputs/{run_id}/")
+
+    if not args.no_wait:
+        wait_and_shutdown(state, [run_id])
+
+
+def cmd_zombify(args):
+    state = require_pod()
+    remote_exec(state, "touch ~/.pi_zombify")
+    print("Zombify flag set — pod will not auto-shutdown after runs.")
 
 
 def cmd_fetch(args):
     state = require_pod()
+    # Support --run to fetch by run ID
+    if args.run:
+        run_id, _ = get_run(state, args.run)
+        sync_run(state, run_id)
+        return
     out_dir = args.out_dir or state.get("last_out_dir")
     if not out_dir:
-        print("Error: No --out-dir specified and no previous train command to infer from.")
+        print("Error: No --out-dir or --run specified and no previous train command to infer from.")
         sys.exit(1)
 
     local_dir = args.local_dir or "."
@@ -651,18 +852,27 @@ def main():
 
     p_train = sub.add_parser("train", help="Train a model")
     p_train.add_argument("-f", action="store_true", help="Flush queue and run immediately")
+    p_train.add_argument("--no-wait", action="store_true", help="Queue and exit without waiting")
     p_train.add_argument("config_path", help="Config file path (e.g. config/face_ard_linear_raster_config.py)")
     p_train.add_argument("overrides", nargs=argparse.REMAINDER, help="Training overrides (e.g. --n_step=1)")
 
     p_sample = sub.add_parser("sample", help="Sample from a trained model")
     p_sample.add_argument("-f", action="store_true", help="Flush queue and run immediately")
-    p_sample.add_argument("config_path", help="Config file path (e.g. config/face_ard_linear_raster_config.py)")
+    p_sample.add_argument("--no-wait", action="store_true", help="Queue and exit without waiting")
+    p_sample.add_argument("--run", type=int, default=None, help="Run ID to sample from (default: last run)")
     p_sample.add_argument("overrides", nargs=argparse.REMAINDER, help="Sampling overrides (e.g. --n_step=1)")
+
+    p_resume = sub.add_parser("resume", help="Resume training from a previous run")
+    p_resume.add_argument("-f", action="store_true", help="Flush queue and run immediately")
+    p_resume.add_argument("--no-wait", action="store_true", help="Queue and exit without waiting")
+    p_resume.add_argument("--run", type=int, default=None, help="Run ID to resume (default: last run)")
+    p_resume.add_argument("overrides", nargs=argparse.REMAINDER, help="Resume overrides (e.g. --n_step=1)")
 
     p_fetch = sub.add_parser("fetch", help="Fetch results from the pod")
     p_fetch.add_argument("--images", action="store_true", help="Fetch PNG images")
     p_fetch.add_argument("--checkpoint", action="store_true", help="Fetch checkpoint")
     p_fetch.add_argument("--out-dir", help="Remote output directory name")
+    p_fetch.add_argument("--run", type=int, default=None, help="Run ID to fetch")
     p_fetch.add_argument("--local-dir", default=".", help="Local destination directory")
 
     sub.add_parser("status", help="Check pod and training status")
@@ -670,6 +880,7 @@ def main():
     sub.add_parser("ssh", help="SSH into the pod tmux session")
     sub.add_parser("sync", help="Fetch active pods from the API")
     sub.add_parser("list", help="List active pods")
+    sub.add_parser("zombify", help="Prevent auto-shutdown after runs")
 
     args = parser.parse_args()
 
@@ -683,12 +894,14 @@ def main():
         "run": cmd_run,
         "train": cmd_train,
         "sample": cmd_sample,
+        "resume": cmd_resume,
         "fetch": cmd_fetch,
         "status": cmd_status,
         "history": cmd_history,
         "ssh": cmd_ssh,
         "sync": cmd_sync,
         "list": cmd_list,
+        "zombify": cmd_zombify,
     }
     cmds[args.cmd](args)
 

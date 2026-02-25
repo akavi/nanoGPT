@@ -19,12 +19,12 @@ rm -rf .venv
 uv venv --python 3.13
 source .venv/bin/activate
 uv sync
-uv run python3 config/face_ard_linear_raster_config.py --n_step=1
+uv run python3 config/face_ard_linear_raster_config.py --n_step=4
 
 git fetch && git reset origin/master --hard
 
 
-export LOGIN=ubuntu@216.81.245.142
+export LOGIN=root@86.38.238.625 
 export PORT=22
 export DIR=out-face-linear-raster
 scp -r -P $PORT "$LOGIN:~/nanoGPT/$DIR/*.png" .
