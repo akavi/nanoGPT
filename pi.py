@@ -5,6 +5,7 @@ import argparse
 import datetime
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -63,6 +64,12 @@ def clear_state():
         for key in ("next_run_id", "last_run_id", "runs", "api_key"):
             if key in state:
                 preserved[key] = state[key]
+        # Kill any active watcher since the pod is going away
+        if "watcher_pid" in state:
+            try:
+                os.kill(state["watcher_pid"], signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
         if preserved:
             with open(STATE_FILE, "w") as f:
                 json.dump(preserved, f, indent=2)
@@ -217,20 +224,59 @@ def _wait_and_shutdown_inner(run_ids):
     log.close()
 
 
+def kill_existing_watcher(state):
+    """Kill any existing watcher process tracked in state."""
+    pid = state.get("watcher_pid")
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # already gone
+        except PermissionError:
+            pass
+
+
 def wait_and_shutdown(state, run_ids):
-    """Fork a background process to poll, sync, and shut down."""
+    """Fork a background process to poll, sync, and shut down.
+
+    Accumulates run_ids across invocations — each call kills the previous
+    watcher and starts a new one covering all accumulated runs."""
+    # Accumulate run IDs in state
+    watcher_run_ids = state.get("watcher_run_ids", [])
+    for rid in run_ids:
+        if rid not in watcher_run_ids:
+            watcher_run_ids.append(rid)
+    state["watcher_run_ids"] = watcher_run_ids
+
+    # Kill previous watcher before forking a new one
+    kill_existing_watcher(state)
+
+    save_state(state)
+
     pid = os.fork()
     if pid == 0:
         # Child — detach from terminal
         os.setsid()
         try:
-            _wait_and_shutdown_inner(run_ids)
+            _wait_and_shutdown_inner(watcher_run_ids)
         except Exception as e:
             with open(os.path.join(STATE_DIR, "wait.log"), "a") as f:
                 f.write(f"[{time.strftime('%H:%M:%S')}] Error: {e}\n")
+        finally:
+            # Clean up watcher state
+            try:
+                s = load_state()
+                s.pop("watcher_pid", None)
+                s.pop("watcher_run_ids", None)
+                save_state(s)
+            except Exception:
+                pass
         os._exit(0)
     else:
-        print(f"Background watcher started (pid {pid}). Logs: ~/.pi/wait.log")
+        # Store watcher PID so next invocation can kill it
+        state["watcher_pid"] = pid
+        save_state(state)
+        print(f"Background watcher started (pid {pid}, runs {watcher_run_ids}). Logs: ~/.pi/wait.log")
 
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
@@ -576,8 +622,7 @@ def cmd_train(args):
 
     print(f"Run {run_id}: {config} → outputs/{run_id}/")
 
-    if not args.no_wait:
-        wait_and_shutdown(state, [run_id])
+    wait_and_shutdown(state, [run_id])
 
 
 def cmd_sample(args):
@@ -597,8 +642,7 @@ def cmd_sample(args):
 
     print(f"Sampling run {run_id}: {config} → outputs/{run_id}/")
 
-    if not args.no_wait:
-        wait_and_shutdown(state, [run_id])
+    wait_and_shutdown(state, [run_id])
 
 
 def cmd_resume(args):
@@ -618,8 +662,7 @@ def cmd_resume(args):
 
     print(f"Resuming run {run_id}: {config} → outputs/{run_id}/")
 
-    if not args.no_wait:
-        wait_and_shutdown(state, [run_id])
+    wait_and_shutdown(state, [run_id])
 
 
 def cmd_zombify(args):
@@ -852,19 +895,16 @@ def main():
 
     p_train = sub.add_parser("train", help="Train a model")
     p_train.add_argument("-f", action="store_true", help="Flush queue and run immediately")
-    p_train.add_argument("--no-wait", action="store_true", help="Queue and exit without waiting")
     p_train.add_argument("config_path", help="Config file path (e.g. config/face_ard_linear_raster_config.py)")
     p_train.add_argument("overrides", nargs=argparse.REMAINDER, help="Training overrides (e.g. --n_step=1)")
 
     p_sample = sub.add_parser("sample", help="Sample from a trained model")
     p_sample.add_argument("-f", action="store_true", help="Flush queue and run immediately")
-    p_sample.add_argument("--no-wait", action="store_true", help="Queue and exit without waiting")
     p_sample.add_argument("--run", type=int, default=None, help="Run ID to sample from (default: last run)")
     p_sample.add_argument("overrides", nargs=argparse.REMAINDER, help="Sampling overrides (e.g. --n_step=1)")
 
     p_resume = sub.add_parser("resume", help="Resume training from a previous run")
     p_resume.add_argument("-f", action="store_true", help="Flush queue and run immediately")
-    p_resume.add_argument("--no-wait", action="store_true", help="Queue and exit without waiting")
     p_resume.add_argument("--run", type=int, default=None, help="Run ID to resume (default: last run)")
     p_resume.add_argument("overrides", nargs=argparse.REMAINDER, help="Resume overrides (e.g. --n_step=1)")
 
