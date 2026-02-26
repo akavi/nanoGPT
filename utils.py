@@ -1,4 +1,5 @@
 import os
+import json
 import pickle
 from dataclasses import dataclass
 from typing import Optional, Any
@@ -145,6 +146,17 @@ def save_checkpoint(
     }
     print(f"saving checkpoint to {out_dir}")
     torch.save(ckpt, os.path.join(out_dir, "ckpt.pt"))
+
+    # Update run.json with iter_num and best_val_loss
+    run_json_path = os.path.join(out_dir, "run.json")
+    run_data = {}
+    if os.path.exists(run_json_path):
+        with open(run_json_path, "r") as f:
+            run_data = json.load(f)
+    run_data["iter_num"] = iter_num
+    run_data["best_val_loss"] = best_val_loss
+    with open(run_json_path, "w") as f:
+        json.dump(run_data, f, indent=2)
 
 def init_data(dataset: str, prepare_fn):
     data_dir = Path(os.path.join("data", dataset))

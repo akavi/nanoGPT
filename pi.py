@@ -64,6 +64,12 @@ def clear_state():
         for key in ("next_run_id", "last_run_id", "runs", "api_key"):
             if key in state:
                 preserved[key] = state[key]
+        # Kill any active provisioner since the pod is going away
+        if "provisioner_pid" in state:
+            try:
+                os.kill(state["provisioner_pid"], signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
         # Kill any active watcher since the pod is going away
         if "watcher_pid" in state:
             try:
@@ -96,6 +102,32 @@ def require_pod():
     state = load_state()
     if not state.get("pod_id"):
         print("Error: No active pod. Run `pi up` first.")
+        sys.exit(1)
+    return state
+
+
+def require_pod_ready():
+    """Require an active pod that has finished provisioning."""
+    state = load_state()
+    if not state.get("pod_id"):
+        print("Error: No active pod. Run `pi up` first.")
+        sys.exit(1)
+    if state.get("provision_error"):
+        print(f"Error: Pod provisioning failed: {state['provision_error']}")
+        sys.exit(1)
+    if state.get("provisioning"):
+        print("Waiting for pod to be ready...", end="", flush=True)
+        for _ in range(180):  # up to 15 minutes
+            time.sleep(5)
+            state = load_state()
+            if state.get("provision_error"):
+                print(f"\nError: Pod provisioning failed: {state['provision_error']}")
+                sys.exit(1)
+            if not state.get("provisioning"):
+                print(" ready.")
+                return state
+            print(".", end="", flush=True)
+        print("\nError: Pod provisioning timed out.")
         sys.exit(1)
     return state
 
@@ -402,6 +434,175 @@ def enqueue_or_flush(state, cmd, force=False):
         print(f"Queued: {cmd}")
 
 
+# ── Provisioning ──────────────────────────────────────────────────────────────
+
+def _run_when_ready(fn):
+    """Fork a background process that waits for provisioning, then calls fn(state).
+    If the pod is already ready, calls fn directly without forking."""
+    state = load_state()
+    if not state.get("provisioning"):
+        fn(state)
+        return None
+
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        log = open(os.path.join(STATE_DIR, "wait.log"), "a")
+        def _log(msg):
+            log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            log.flush()
+        try:
+            _log("Waiting for pod to be ready...")
+            for _ in range(180):
+                state = load_state()
+                if state.get("provision_error"):
+                    _log(f"Provisioning failed: {state['provision_error']}")
+                    break
+                if not state.get("provisioning"):
+                    _log("Pod ready — executing deferred job.")
+                    fn(state)
+                    break
+                time.sleep(5)
+            else:
+                _log("Timed out waiting for pod.")
+        except Exception as e:
+            _log(f"Deferred job error: {e}")
+        log.close()
+        os._exit(0)
+    return pid
+
+
+def _provision_pod_inner(pod_id, repo, branch):
+    """Background: poll until pod ACTIVE, set up SSH + environment.
+    Updates state as it progresses. Logs to ~/.pi/provision.log."""
+    log = open(os.path.join(STATE_DIR, "provision.log"), "w")
+    def _log(msg):
+        log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        log.flush()
+
+    _log(f"Provisioning pod {pod_id}...")
+
+    ip = None
+    port = 22
+    ssh_user = "root"
+
+    for _ in range(120):  # up to 10 minutes
+        time.sleep(5)
+        try:
+            r = requests.get(
+                f"{API_BASE}/pods/status",
+                headers=api_headers(),
+                params={"pod_ids": pod_id},
+            )
+            r.raise_for_status()
+            statuses = r.json().get("data", [])
+        except Exception as e:
+            _log(f"API error: {e}")
+            continue
+
+        if not statuses:
+            continue
+        s = statuses[0]
+        status = s.get("status", "")
+        _log(f"Status: {status}, install: {s.get('installationStatus', '?')}")
+
+        if status == "ACTIVE":
+            ip = s.get("ip")
+            ssh_conn = s.get("sshConnection", "")
+            if isinstance(ssh_conn, str) and ssh_conn:
+                parts = ssh_conn.split()
+                for i, p in enumerate(parts):
+                    if "@" in p and not p.startswith("-"):
+                        user_ip = p.split("@")
+                        ssh_user = user_ip[0]
+                        ip = user_ip[1]
+                    if p == "-p" and i + 1 < len(parts):
+                        port = int(parts[i + 1])
+            if isinstance(ip, list):
+                ip = ip[0]
+            inst = s.get("installationStatus")
+            if inst in ("FINISHED", None):
+                break
+            if inst == "ERROR":
+                _log(f"Installation error: {s.get('installationFailure')}")
+                state = load_state()
+                state.pop("provisioning", None)
+                state["provision_error"] = str(s.get("installationFailure"))
+                save_state(state)
+                log.close()
+                return
+        elif status in ("ERROR", "TERMINATED"):
+            _log(f"Pod entered {status} state.")
+            state = load_state()
+            state.pop("provisioning", None)
+            state["provision_error"] = f"Pod {status}"
+            save_state(state)
+            log.close()
+            return
+
+    if not ip:
+        _log("Pod did not become ready in time.")
+        state = load_state()
+        state.pop("provisioning", None)
+        state["provision_error"] = "Timed out waiting for pod"
+        save_state(state)
+        log.close()
+        return
+
+    # Update state with connection info
+    state = load_state()
+    state["ip"] = ip
+    state["port"] = port
+    state["ssh_user"] = ssh_user
+    save_state(state)
+    _log(f"Pod active: {ssh_user}@{ip}:{port}")
+
+    # Wait for SSH
+    _log("Waiting for SSH...")
+    ssh_ok = False
+    for _ in range(30):
+        r = remote_exec(state, "echo ok", check=False)
+        if r.returncode == 0:
+            ssh_ok = True
+            break
+        time.sleep(3)
+
+    if not ssh_ok:
+        _log("SSH never became ready.")
+        state = load_state()
+        state.pop("provisioning", None)
+        state["provision_error"] = "SSH timeout"
+        save_state(state)
+        log.close()
+        return
+
+    # Setup environment
+    _log("Setting up environment...")
+    remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION} || true")
+    remote_exec(state, f"touch {QUEUE_FILE}", check=False)
+
+    setup_cmds = " && ".join([
+        f"git clone --depth 1 --branch {branch} {repo}",
+        "cd nanoGPT",
+        "curl -LsSf https://astral.sh/uv/install.sh | sh",
+        'export PATH="$HOME/.local/bin:$PATH"',
+        "uv python install 3.13",
+        "uv venv --python 3.13",
+        "uv sync",
+    ])
+    queue_command(state, setup_cmds)
+
+    runner_escaped = QUEUE_RUNNER.replace("'", "'\\''").replace("\n", " ")
+    tmux_send(state, runner_escaped)
+
+    # Mark provisioning complete
+    state = load_state()
+    state.pop("provisioning", None)
+    save_state(state)
+    _log("Provisioning complete. Queue runner started.")
+    log.close()
+
+
 # ── Subcommands ───────────────────────────────────────────────────────────────
 
 def cmd_up(args):
@@ -418,6 +619,7 @@ def cmd_up(args):
         print(f"No {args.gpu_type} x{args.gpu_count} available right now.")
         sys.exit(1)
 
+    items.sort(key=lambda x: x["prices"]["onDemand"])
     pick = items[0]
     cloud_id = pick["cloudId"]
     provider = pick["provider"]
@@ -459,59 +661,8 @@ def cmd_up(args):
     r.raise_for_status()
     pod = r.json()
     pod_id = pod["id"]
-    print(f"Pod created: {pod_id}")
 
-    # Poll until running
-    print("Waiting for pod to be ready", end="", flush=True)
-    ip = None
-    port = 22
-    ssh_user = "root"
-    for _ in range(120):  # up to 10 minutes
-        time.sleep(5)
-        print(".", end="", flush=True)
-        r = requests.get(
-            f"{API_BASE}/pods/status",
-            headers=api_headers(),
-            params={"pod_ids": pod_id},
-        )
-        r.raise_for_status()
-        statuses = r.json().get("data", [])
-        if not statuses:
-            continue
-        s = statuses[0]
-        status = s.get("status", "")
-        if status == "ACTIVE":
-            ip = s.get("ip")
-            ssh_conn = s.get("sshConnection", "")
-            # Parse SSH connection string like "ssh root@1.2.3.4 -p 22"
-            if isinstance(ssh_conn, str) and ssh_conn:
-                parts = ssh_conn.split()
-                for i, p in enumerate(parts):
-                    if "@" in p and not p.startswith("-"):
-                        user_ip = p.split("@")
-                        ssh_user = user_ip[0]
-                        ip = user_ip[1]
-                    if p == "-p" and i + 1 < len(parts):
-                        port = int(parts[i + 1])
-            if isinstance(ip, list):
-                ip = ip[0]
-            # Check installation status
-            inst = s.get("installationStatus")
-            if inst in ("FINISHED", None):
-                break
-            if inst == "ERROR":
-                print(f"\nInstallation error: {s.get('installationFailure')}")
-                break
-        elif status in ("ERROR", "TERMINATED"):
-            print(f"\nPod entered {status} state.")
-            sys.exit(1)
-    print()
-
-    if not ip:
-        print("Error: Pod did not become ready in time.")
-        sys.exit(1)
-
-    # Preserve existing run tracking and API key
+    # Save state immediately so other commands can see the pod
     old_state = load_state()
     state = {}
     for key in ("next_run_id", "last_run_id", "runs", "api_key"):
@@ -519,52 +670,34 @@ def cmd_up(args):
             state[key] = old_state[key]
     state.update({
         "pod_id": pod_id,
-        "ip": ip,
-        "port": port,
-        "ssh_user": ssh_user,
         "name": pod_name,
+        "provisioning": True,
     })
     save_state(state)
 
-    print(f"Pod ready: {ssh_user}@{ip}:{port}")
-
-    # Wait a moment for SSH to be ready
-    print("Waiting for SSH...", end="", flush=True)
-    for _ in range(30):
-        r = remote_exec(state, "echo ok", check=False)
-        if r.returncode == 0:
-            break
-        time.sleep(3)
-        print(".", end="", flush=True)
-    print()
-
-    # Setup: tmux + repo + uv, then start queue runner
+    # Fork background provisioner
     repo = args.repo
     branch = args.branch
-    print("Setting up environment...")
-    remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION} || true")
-    remote_exec(state, f"touch {QUEUE_FILE}", check=False)
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        try:
+            _provision_pod_inner(pod_id, repo, branch)
+        except Exception as e:
+            with open(os.path.join(STATE_DIR, "provision.log"), "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] Fatal error: {e}\n")
+            s = load_state()
+            s.pop("provisioning", None)
+            s["provision_error"] = str(e)
+            save_state(s)
+        os._exit(0)
 
-    # Queue the setup commands so they run through the runner
-    setup_cmds = " && ".join([
-        f"git clone --depth 1 --branch {branch} {repo}",
-        "cd nanoGPT",
-        "curl -LsSf https://astral.sh/uv/install.sh | sh",
-        'export PATH="$HOME/.local/bin:$PATH"',
-        "uv python install 3.13",
-        "uv venv --python 3.13",
-        "uv sync",
-    ])
-    queue_command(state, setup_cmds)
+    state["provisioner_pid"] = pid
+    save_state(state)
 
-    # Start the queue runner in tmux
-    runner_escaped = QUEUE_RUNNER.replace("'", "'\\''").replace("\n", " ")
-    tmux_send(state, runner_escaped)
-
-    print(f"Queue runner started in tmux session '{TMUX_SESSION}'.")
-    print(f"Setup commands queued.")
-    print(f"\nSSH: ssh -i {SSH_KEY} -p {port} {ssh_user}@{ip}")
-    print(f"Attach: python pi.py ssh")
+    print(f"Pod created: {pod_id}")
+    print(f"Provisioning in background (pid {pid}). Logs: ~/.pi/provision.log")
+    print(f"You can queue jobs now — they'll start when the pod is ready.")
 
 
 def cmd_down(args):
@@ -572,8 +705,16 @@ def cmd_down(args):
     pod_id = state["pod_id"]
     name = state.get("name", pod_id)
 
-    if not args.f:
-        # Wait for queued commands to finish
+    # Kill provisioner if still running
+    prov_pid = state.get("provisioner_pid")
+    if prov_pid:
+        try:
+            os.kill(prov_pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    if not args.f and not state.get("provisioning"):
+        # Wait for queued commands to finish (only if pod is ready)
         pending = read_queue(state)
         if pending or tmux_is_busy(state):
             print(f"Waiting for {len(pending)} queued command(s) to finish...")
@@ -594,7 +735,7 @@ def cmd_down(args):
 
 
 def cmd_run(args):
-    state = require_pod()
+    state = require_pod_ready()
     cmd = " ".join(args.command)
     if not cmd:
         print("Error: No command specified.")
@@ -607,27 +748,33 @@ def cmd_train(args):
     state = require_pod()
     config = args.config_path
     overrides = list(args.overrides) if args.overrides else []
+    force = args.f
 
-    # Allocate run ID and write metadata
+    # Allocate run ID locally (instant)
     run_id = allocate_run_id(state)
     state["runs"][str(run_id)]["config"] = config
     state["runs"][str(run_id)]["overrides"] = overrides
     save_state(state)
 
-    write_run_metadata(state, run_id, config, overrides)
+    print(f"Run {run_id}: {config} → outputs/{run_id}/")
 
     override_str = " ".join(overrides)
     train_cmd = f"cd ~/nanoGPT && uv run {config} --out_dir=outputs/{run_id} {override_str}".strip()
-    enqueue_or_flush(state, train_cmd, force=args.f)
 
-    print(f"Run {run_id}: {config} → outputs/{run_id}/")
+    def _do(state):
+        write_run_metadata(state, run_id, config, overrides)
+        enqueue_or_flush(state, train_cmd, force=force)
+        wait_and_shutdown(state, [run_id])
 
-    wait_and_shutdown(state, [run_id])
+    pid = _run_when_ready(_do)
+    if pid is not None:
+        print(f"Job deferred until pod is ready (pid {pid}). Logs: ~/.pi/wait.log")
 
 
 def cmd_sample(args):
     state = require_pod()
     overrides = list(args.overrides) if args.overrides else []
+    force = args.f
 
     # Look up run
     run_id, run = get_run(state, args.run)
@@ -636,18 +783,24 @@ def cmd_sample(args):
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    override_str = " ".join(overrides)
-    sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample --out_dir=outputs/{run_id} {override_str}".strip()
-    enqueue_or_flush(state, sample_cmd, force=args.f)
-
     print(f"Sampling run {run_id}: {config} → outputs/{run_id}/")
 
-    wait_and_shutdown(state, [run_id])
+    override_str = " ".join(overrides)
+    sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample --out_dir=outputs/{run_id} {override_str}".strip()
+
+    def _do(state):
+        enqueue_or_flush(state, sample_cmd, force=force)
+        wait_and_shutdown(state, [run_id])
+
+    pid = _run_when_ready(_do)
+    if pid is not None:
+        print(f"Job deferred until pod is ready (pid {pid}). Logs: ~/.pi/wait.log")
 
 
 def cmd_resume(args):
     state = require_pod()
     overrides = list(args.overrides) if args.overrides else []
+    force = args.f
 
     # Look up run
     run_id, run = get_run(state, args.run)
@@ -656,23 +809,28 @@ def cmd_resume(args):
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    override_str = " ".join(overrides)
-    resume_cmd = f"cd ~/nanoGPT && uv run {config} --mode=resume --out_dir=outputs/{run_id} {override_str}".strip()
-    enqueue_or_flush(state, resume_cmd, force=args.f)
-
     print(f"Resuming run {run_id}: {config} → outputs/{run_id}/")
 
-    wait_and_shutdown(state, [run_id])
+    override_str = " ".join(overrides)
+    resume_cmd = f"cd ~/nanoGPT && uv run {config} --mode=resume --out_dir=outputs/{run_id} {override_str}".strip()
+
+    def _do(state):
+        enqueue_or_flush(state, resume_cmd, force=force)
+        wait_and_shutdown(state, [run_id])
+
+    pid = _run_when_ready(_do)
+    if pid is not None:
+        print(f"Job deferred until pod is ready (pid {pid}). Logs: ~/.pi/wait.log")
 
 
 def cmd_zombify(args):
-    state = require_pod()
+    state = require_pod_ready()
     remote_exec(state, "touch ~/.pi_zombify")
     print("Zombify flag set — pod will not auto-shutdown after runs.")
 
 
 def cmd_fetch(args):
-    state = require_pod()
+    state = require_pod_ready()
     # Support --run to fetch by run ID
     if args.run:
         run_id, _ = get_run(state, args.run)
@@ -745,7 +903,8 @@ def cmd_status(args):
         s = statuses[0]
         print(f"Pod:    {state.get('name', pod_id)}")
         print(f"Status: {s.get('status', '?')}")
-        print(f"IP:     {state['ip']}:{state.get('port', 22)}")
+        if state.get("ip"):
+            print(f"IP:     {state['ip']}:{state.get('port', 22)}")
         inst = s.get("installationStatus")
         if inst:
             prog = s.get("installationProgress", "")
@@ -754,7 +913,14 @@ def cmd_status(args):
         print(f"Pod {pod_id}: no status available")
         return
 
-    # Check tmux
+    if state.get("provisioning"):
+        print(f"Local:  provisioning (logs: ~/.pi/provision.log)")
+        return
+    if state.get("provision_error"):
+        print(f"Local:  provision failed — {state['provision_error']}")
+        return
+
+    # Check tmux (only if pod is ready)
     if tmux_is_busy(state):
         r = remote_exec(state, f"tmux list-panes -t {TMUX_SESSION} -F '#{{pane_current_command}}'", check=False)
         print(f"Tmux:   running ({r.stdout.strip()})")
@@ -868,8 +1034,36 @@ def cmd_history(args):
         print(f"  {i}. [{ts}] {entry['cmd']}")
 
 
+def cmd_upload(args):
+    state = require_pod_ready()
+    run_id, _ = get_run(state, args.run)
+    local_path = args.path or f"outputs/{run_id}/ckpt.pt"
+    if not os.path.exists(local_path):
+        print(f"Error: Local file not found: {local_path}")
+        sys.exit(1)
+
+    user = state.get("ssh_user", "root")
+    ip = state["ip"]
+    port = state.get("port", 22)
+    remote_dir = f"~/nanoGPT/outputs/{run_id}"
+    remote_exec(state, f"mkdir -p {remote_dir}")
+
+    print(f"Uploading {local_path} → {remote_dir}/ckpt.pt ...")
+    cmd = [
+        "rsync", "-avz", "--progress",
+        "-e", f"ssh -i {SSH_KEY} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+        local_path, f"{user}@{ip}:{remote_dir}/ckpt.pt",
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode == 0:
+        print(f"Uploaded to outputs/{run_id}/ckpt.pt on remote.")
+    else:
+        print(f"Upload failed with code {result.returncode}")
+        sys.exit(1)
+
+
 def cmd_ssh(args):
-    state = require_pod()
+    state = require_pod_ready()
     cmd = ssh_opts(state) + ["-t", f"tmux attach -t {TMUX_SESSION} || tmux new -s {TMUX_SESSION}"]
     os.execvp("ssh", cmd)
 
@@ -920,6 +1114,10 @@ def main():
     sub.add_parser("ssh", help="SSH into the pod tmux session")
     sub.add_parser("sync", help="Fetch active pods from the API")
     sub.add_parser("list", help="List active pods")
+    p_upload = sub.add_parser("upload", help="Upload a checkpoint to the remote pod")
+    p_upload.add_argument("--run", type=int, default=None, help="Run ID (default: last run)")
+    p_upload.add_argument("--path", help="Local checkpoint path (default: outputs/<run>/ckpt.pt)")
+
     sub.add_parser("zombify", help="Prevent auto-shutdown after runs")
 
     args = parser.parse_args()
@@ -941,6 +1139,7 @@ def main():
         "ssh": cmd_ssh,
         "sync": cmd_sync,
         "list": cmd_list,
+        "upload": cmd_upload,
         "zombify": cmd_zombify,
     }
     cmds[args.cmd](args)

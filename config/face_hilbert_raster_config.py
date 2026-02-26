@@ -194,7 +194,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=1,
+    batch_size=128,
 
     eval_only=False,
     eval_interval=250,
@@ -233,7 +233,7 @@ else:
         img.save(path, format="PNG")
 
     sample_config = SampleConfig(
-        num_samples=1,
+        num_samples=10,
         max_new_tokens=1024,
         temperature=0.8,
         top_k=200,
