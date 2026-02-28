@@ -61,7 +61,6 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.layer_idx = layer_idx
-        self.mode = config.mode
         self.attn_sums = {}
         self.attn_counts = {}
         self.use_decay = config.use_decay
@@ -79,62 +78,53 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.decay_raw = nn.Parameter(torch.zeros(self.n_head)) if self.use_decay else None
 
-    def forward(self, x):
+    def forward(self, x, state):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        hs = C // self.n_head
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (Bil nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
 
+        # fold: concatenate with cached k,v (identity = zero-length tensors)
+        cached_k, cached_v = state
+        k = torch.cat([cached_k, k], dim=2)
+        v = torch.cat([cached_v, v], dim=2)
+        T_full = k.size(2)
+        offset = T_full - T
+
+        # causal mask: new queries attend to all cached keys + causal within new tokens
         neg_inf = torch.finfo(torch.float32).min
         attn_mask = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)
+        if offset > 0:
+            attn_mask = torch.cat([
+                torch.zeros(T, offset, device=x.device, dtype=torch.float32),
+                attn_mask,
+            ], dim=1)
+
         if self.use_decay:
             decay = F.softplus(self.decay_raw).to(q.dtype)                 # (nh,)
-            # dist[i,j] = max(i-j, 0)  
-            idx  = torch.arange(T, device=x.device)
-            dist = (idx[:, None] - idx[None, :]).clamp_min(0).to(torch.float32)  # (T,T)
-            log1p_dist = torch.log1p(dist)                         # (T,T)
-            logw = -torch.log1p(decay.view(self.n_head, 1, 1) * log1p_dist)   
+            q_idx = torch.arange(offset, offset + T, device=x.device)
+            k_idx = torch.arange(T_full, device=x.device)
+            dist = (q_idx[:, None] - k_idx[None, :]).clamp_min(0).to(torch.float32)
+            log1p_dist = torch.log1p(dist)                         # (T, T_full)
+            logw = -torch.log1p(decay.view(self.n_head, 1, 1) * log1p_dist)
+            attn_mask = attn_mask + logw
 
-            attn_mask += logw
-
-        if self.mode == 'train':
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout if self.training else 0, 
-                is_causal=False
-            )
-        else: 
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att + attn_mask
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-
-            att_sum = att.detach().to(torch.float32).sum(dim=0)  # (nh, T, T), sum over batch
-            if T not in self.attn_sums:
-                self.attn_sums[T] = torch.zeros(
-                    self.n_head, T, T, dtype=torch.float32, device=att_sum.device
-                )
-                self.attn_counts[T] = torch.zeros(
-                    self.n_head, dtype=torch.float32, device=att_sum.device
-                )
-            self.attn_sums[T] += att_sum
-            # each head gets +B examples
-            self.attn_counts[T] += float(B)
-
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0,
+            is_causal=False,
+        )
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, (k, v)
 
 class MLP(nn.Module):
 
@@ -158,10 +148,8 @@ class CsaConfig:
     n_embd: int
     n_step: int
     block_size: int
-    bias: bool  
     bias: bool
     dropout: float
-    mode: str = "train"
     use_decay: bool = False
 
 class CsaBlock(nn.Module):
@@ -177,12 +165,16 @@ class CsaBlock(nn.Module):
         self.mlp = MLP(config.n_embd, bias=config.bias, dropout=config.dropout)
 
     def forward(self, x, state):
-        x = x + self.attn(self.ln_1(x))
+        attn_out, state = self.attn(self.ln_1(x), state)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
         return x, state
 
     def initial_state(self, batch_size):
-        return None
+        device = next(self.parameters()).device
+        hs = self.n_embd // self.n_head
+        empty = torch.zeros(batch_size, self.n_head, 0, hs, device=device)
+        return (empty, empty)
 
     def get_num_params(self, non_embedding=True):
         return sum(p.numel() for p in self.parameters())
@@ -223,12 +215,16 @@ class SubLatentCsaBlock(nn.Module):
         return x4.reshape(B, T, S * E)
 
     def forward(self, x, state):
-        x = x + self.attn(self._per_latent_ln(x, self.ln_1))
+        attn_out, state = self.attn(self._per_latent_ln(x, self.ln_1), state)
+        x = x + attn_out
         x = x + self.mlp(self._per_latent_ln(x, self.ln_2))
         return x, state
 
     def initial_state(self, batch_size):
-        return None
+        device = next(self.parameters()).device
+        hs = self.n_embd // self.n_head
+        empty = torch.zeros(batch_size, self.n_head, 0, hs, device=device)
+        return (empty, empty)
 
     def get_num_params(self, non_embedding=True):
         return sum(p.numel() for p in self.parameters())
@@ -336,13 +332,17 @@ class GPT(nn.Module):
 
     def forward(self, idx, state, targets=None):
         device = idx.device
-        b, t = idx.size()
+        _, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # only process tokens not already in the KV-cache
+        offset = state[0][0].size(2)  # cached seq len
+        idx_new = idx[:, offset:]
+        t_new = idx_new.size(1)
+        pos = torch.arange(offset, offset + t_new, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx_new)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
         for i, block in enumerate(self.transformer.backbone):
             x, state[i] = block(x, state[i])
@@ -371,10 +371,7 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, state, _ = self(idx_cond, state)
+            logits, state, _ = self(idx, state)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

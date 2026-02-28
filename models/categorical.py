@@ -52,11 +52,16 @@ class Categorical(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # only process tokens not already in the KV-cache
+        first = state[0] if isinstance(state, list) else None
+        offset = first[0].size(2) if isinstance(first, tuple) else 0
+        idx_new = idx[:, offset:]
+        t_new = idx_new.size(1)
+        pos = torch.arange(offset, offset + t_new, dtype=torch.long, device=device)
 
-        # forward the GPT model itself
-        tok_emb = self.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.wpe(pos) # position embeddings of shape (t, n_embd)
+        # forward the model
+        tok_emb = self.wte(idx_new)
+        pos_emb = self.wpe(pos)
         x = self.drop(tok_emb + pos_emb)
         x, state = self.backbone(x, state)
         x = self.ln_f(x)
@@ -83,10 +88,7 @@ class Categorical(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at n_block
-            idx_cond = idx if idx.size(1) <= self.n_block else idx[:, -self.n_block:]
-            # forward the model to get the logits for the index in the sequence
-            logits, state, _ = self(idx_cond, state)
+            logits, state, _ = self(idx, state)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

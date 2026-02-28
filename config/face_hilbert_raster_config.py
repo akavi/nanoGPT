@@ -54,7 +54,6 @@ backbone = ModuleList([
         block_size=overridable['block_size'],
         bias=overridable['bias'],
         dropout=0.05,
-        mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
     ), i)
 for i in range(overridable['n_layer'])])
 model = Categorical(CategoricalConfig(
