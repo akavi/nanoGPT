@@ -719,6 +719,10 @@ def cmd_up(args):
     pid = os.fork()
     if pid == 0:
         os.setsid()
+        # Redirect stdout/stderr to wait.log so daemon output doesn't leak into the CLI
+        daemon_log = open(os.path.join(STATE_DIR, "wait.log"), "a")
+        os.dup2(daemon_log.fileno(), 1)
+        os.dup2(daemon_log.fileno(), 2)
         try:
             _daemon(pod_id, repo, branch)
         except Exception as e:

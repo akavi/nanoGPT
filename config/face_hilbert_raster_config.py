@@ -167,7 +167,7 @@ def get_batch(split, batch_size):
         ),
     )
     # rows are in linear (row-major) order from the dataset — reorder to Hilbert
-    idx = INV_HILBERT_ORDER_T.to(rows.device)
+    idx = HILBERT_ORDER_T.to(rows.device)
     rows = rows[:, idx]
 
     block_size = overridable['block_size']
