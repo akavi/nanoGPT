@@ -2,7 +2,9 @@
 """Prime Intellect GPU pod management CLI for nanoGPT."""
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import signal
@@ -41,46 +43,59 @@ done
 
 # ── State management ──────────────────────────────────────────────────────────
 
+LOCK_FILE = os.path.join(STATE_DIR, "state.lock")
+
+
+@contextlib.contextmanager
+def locked_state():
+    """Context manager that holds an exclusive lock for the duration.
+    Yields the state dict; on exit, writes it back to disk.
+
+    Usage:
+        with locked_state() as state:
+            state["foo"] = "bar"
+            # automatically saved on exit
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock_fd = open(LOCK_FILE, "w")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        else:
+            state = {}
+        yield state
+        # Atomic write: temp file + rename so load_state() never sees a truncated file
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
 def load_state():
+    """Read state without locking. Use locked_state() for read-modify-write."""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
     return {}
 
 
-def save_state(state):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
 def clear_state():
     """Clear pod-specific state but preserve run tracking data."""
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        # Preserve run management fields
-        preserved = {}
-        for key in ("next_run_id", "last_run_id", "runs", "api_key"):
-            if key in state:
-                preserved[key] = state[key]
-        # Kill any active provisioner since the pod is going away
-        if "provisioner_pid" in state:
+    with locked_state() as state:
+        daemon_pid = state.get("daemon_pid")
+        if daemon_pid:
             try:
-                os.kill(state["provisioner_pid"], signal.SIGTERM)
+                os.kill(daemon_pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
-        # Kill any active watcher since the pod is going away
-        if "watcher_pid" in state:
-            try:
-                os.kill(state["watcher_pid"], signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-        if preserved:
-            with open(STATE_FILE, "w") as f:
-                json.dump(preserved, f, indent=2)
-        else:
-            os.remove(STATE_FILE)
+        preserved = {k: state[k] for k in ("next_run_id", "last_run_id", "runs", "next_cmd_id", "commands", "api_key") if k in state}
+        state.clear()
+        state.update(preserved)
 
 
 def get_api_key():
@@ -135,14 +150,32 @@ def require_pod_ready():
 # ── Run management ────────────────────────────────────────────────────────────
 
 def allocate_run_id(state):
-    """Allocate the next sequential run ID and update state."""
+    """Allocate the next sequential run ID. Caller must hold locked_state()."""
     run_id = state.get("next_run_id", 1)
     state["next_run_id"] = run_id + 1
     state["last_run_id"] = run_id
     runs = state.setdefault("runs", {})
-    runs[str(run_id)] = {"status": "queued"}
-    save_state(state)
+    runs[str(run_id)] = {}
     return run_id
+
+
+def allocate_cmd_id(state, cmd_type, cmd, run_id=None, force=False):
+    """Allocate a command ID and create a pending command entry. Caller must hold locked_state()."""
+    cmd_id = state.get("next_cmd_id", 1)
+    state["next_cmd_id"] = cmd_id + 1
+    commands = state.setdefault("commands", {})
+    entry = {
+        "type": cmd_type,
+        "cmd": cmd,
+        "status": "pending",
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    if run_id is not None:
+        entry["run_id"] = run_id
+    if force:
+        entry["force"] = True
+    commands[str(cmd_id)] = entry
+    return cmd_id
 
 
 def get_run(state, run_id=None):
@@ -206,109 +239,130 @@ def sync_run(state, run_id):
         print(f"Warning: rsync failed with code {result.returncode}")
 
 
-def _wait_and_shutdown_inner(run_ids):
-    """Poll until queue is idle, sync run outputs, then shut down (unless zombified).
-    Runs in a forked background process — logs to ~/.pi/wait.log."""
+def _daemon(pod_id, repo, branch):
+    """Single background daemon: provision → execute jobs → sync → idle/shutdown.
+    Forked from cmd_up. Logs to provision.log (provisioning) and wait.log (everything else)."""
     log = open(os.path.join(STATE_DIR, "wait.log"), "a")
     def _log(msg):
         log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         log.flush()
 
-    state = load_state()
-    _log(f"Waiting for runs {run_ids} to finish...")
+    shutdown_requested = False
+    def _handle_sigterm(signum, frame):
+        nonlocal shutdown_requested
+        _log("Received SIGTERM.")
+        shutdown_requested = True
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
-    for _ in range(720):  # up to 2 hours at 10s intervals
-        if queue_is_idle(state):
-            break
-        time.sleep(10)
-        state = load_state()  # refresh in case pod changed
-    _log("Queue idle.")
+    try:
+        # Phase 1: Provision
+        _provision_pod_inner(pod_id, repo, branch)
 
-    # Sync all requested runs
-    for run_id in run_ids:
         state = load_state()
-        _log(f"Syncing run {run_id}...")
-        sync_run(state, run_id)
-        runs = state.get("runs", {})
-        if str(run_id) in runs:
-            runs[str(run_id)]["status"] = "synced"
-            save_state(state)
+        if state.get("provision_error"):
+            _log(f"Provisioning failed: {state['provision_error']}")
+            return
 
-    # Check zombify flag
-    state = load_state()
-    if not state.get("pod_id"):
-        _log("No pod in state — skipping shutdown.")
+        # Wait for setup command to finish on remote
+        _log("Waiting for setup command to finish...")
+        for _ in range(360):  # up to 30 minutes
+            if shutdown_requested:
+                break
+            if queue_is_idle(load_state()):
+                break
+            time.sleep(5)
+
+        # Mark setup command completed
+        with locked_state() as s:
+            for cid in sorted(s.get("commands", {}).keys(), key=int):
+                if s["commands"][cid]["type"] == "setup" and s["commands"][cid]["status"] == "running":
+                    s["commands"][cid]["status"] = "completed"
+                    break
+
+        # Phase 2: Main loop — per-command processing with sync
+        _log("Setup complete. Entering main loop.")
+        idle_since = None
+        IDLE_TIMEOUT = 30
+
+        while not shutdown_requested:
+            # Find next pending command
+            cmd_id = None
+            cmd_entry = None
+            with locked_state() as s:
+                commands = s.get("commands", {})
+                for cid in sorted(commands.keys(), key=int):
+                    if commands[cid]["status"] == "pending":
+                        cmd_id = cid
+                        commands[cid]["status"] = "running"
+                        cmd_entry = dict(commands[cid])
+                        break
+
+            if cmd_entry:
+                idle_since = None
+                state = load_state()
+                _log(f"Executing command {cmd_id}: {cmd_entry.get('type', '?')} (run {cmd_entry.get('run_id', '-')})")
+                _execute_command(state, cmd_entry)
+
+                # Wait for remote queue to drain
+                _log(f"Waiting for command {cmd_id} to finish on remote...")
+                for _ in range(720):  # up to 2 hours
+                    if shutdown_requested:
+                        break
+                    state = load_state()
+                    if queue_is_idle(state):
+                        break
+                    time.sleep(10)
+
+                if shutdown_requested:
+                    break
+
+                # Sync if command has a run_id
+                run_id = cmd_entry.get("run_id")
+                if run_id:
+                    state = load_state()
+                    _log(f"Syncing run {run_id}...")
+                    sync_run(state, run_id)
+
+                # Mark completed
+                with locked_state() as s:
+                    if cmd_id in s.get("commands", {}):
+                        s["commands"][cmd_id]["status"] = "completed"
+                _log(f"Command {cmd_id} completed.")
+                continue
+
+            # No pending commands — idle logic
+            if idle_since is None:
+                idle_since = time.time()
+                _log("Queue idle, waiting for new commands...")
+
+            state = load_state()
+            if not state.get("pod_id"):
+                _log("No pod in state — exiting.")
+                break
+
+            # Check zombify flag
+            r = remote_exec(state, "test -f ~/.pi_zombify", check=False)
+            if r.returncode == 0:
+                time.sleep(10)
+                idle_since = None  # stay alive indefinitely
+                continue
+
+            if time.time() - idle_since >= IDLE_TIMEOUT:
+                _log("Idle timeout — shutting down pod...")
+                r = requests.delete(f"{API_BASE}/pods/{state['pod_id']}", headers=api_headers())
+                r.raise_for_status()
+                clear_state()
+                _log("Pod terminated.")
+                break
+
+            time.sleep(5)
+
+    except Exception as e:
+        _log(f"Daemon error: {e}")
+    finally:
+        with locked_state() as s:
+            s.pop("daemon_pid", None)
         log.close()
-        return
-    r = remote_exec(state, "test -f ~/.pi_zombify", check=False)
-    if r.returncode == 0:
-        _log("Zombify flag detected — skipping shutdown.")
-        log.close()
-        return
-
-    # Shut down
-    _log("Shutting down pod...")
-    pod_id = state["pod_id"]
-    r = requests.delete(f"{API_BASE}/pods/{pod_id}", headers=api_headers())
-    r.raise_for_status()
-    clear_state()
-    _log("Pod terminated.")
-    log.close()
-
-
-def kill_existing_watcher(state):
-    """Kill any existing watcher process tracked in state."""
-    pid = state.get("watcher_pid")
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass  # already gone
-        except PermissionError:
-            pass
-
-
-def wait_and_shutdown(state, run_ids):
-    """Fork a background process to poll, sync, and shut down.
-
-    Accumulates run_ids across invocations — each call kills the previous
-    watcher and starts a new one covering all accumulated runs."""
-    # Accumulate run IDs in state
-    watcher_run_ids = state.get("watcher_run_ids", [])
-    for rid in run_ids:
-        if rid not in watcher_run_ids:
-            watcher_run_ids.append(rid)
-    state["watcher_run_ids"] = watcher_run_ids
-
-    # Kill previous watcher before forking a new one
-    kill_existing_watcher(state)
-
-    save_state(state)
-
-    pid = os.fork()
-    if pid == 0:
-        # Child — detach from terminal
-        os.setsid()
-        try:
-            _wait_and_shutdown_inner(watcher_run_ids)
-        except Exception as e:
-            with open(os.path.join(STATE_DIR, "wait.log"), "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] Error: {e}\n")
-        finally:
-            # Clean up watcher state
-            try:
-                s = load_state()
-                s.pop("watcher_pid", None)
-                s.pop("watcher_run_ids", None)
-                save_state(s)
-            except Exception:
-                pass
-        os._exit(0)
-    else:
-        # Store watcher PID so next invocation can kill it
-        state["watcher_pid"] = pid
-        save_state(state)
-        print(f"Background watcher started (pid {pid}, runs {watcher_run_ids}). Logs: ~/.pi/wait.log")
 
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
@@ -374,10 +428,6 @@ def queue_command(state, cmd):
     """Append a command to the remote queue file."""
     escaped = cmd.replace("'", "'\\''")
     remote_exec(state, f"echo '{escaped}' >> {QUEUE_FILE}")
-    # Record locally
-    history = state.setdefault("cmd_history", [])
-    history.append({"cmd": cmd, "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
-    save_state(state)
 
 
 def read_queue(state):
@@ -436,40 +486,40 @@ def enqueue_or_flush(state, cmd, force=False):
 
 # ── Provisioning ──────────────────────────────────────────────────────────────
 
-def _run_when_ready(fn):
-    """Fork a background process that waits for provisioning, then calls fn(state).
-    If the pod is already ready, calls fn directly without forking."""
-    state = load_state()
-    if not state.get("provisioning"):
-        fn(state)
-        return None
+def _execute_command(state, cmd_entry):
+    """Execute a single command — write run metadata if needed, enqueue on remote."""
+    run_id = cmd_entry.get("run_id")
+    if run_id and cmd_entry["type"] in ("train", "resume"):
+        runs = state.get("runs", {})
+        run = runs.get(str(run_id), {})
+        write_run_metadata(state, run_id, run.get("config", ""), run.get("overrides", []))
+    enqueue_or_flush(state, cmd_entry["cmd"], force=cmd_entry.get("force", False))
 
-    pid = os.fork()
-    if pid == 0:
-        os.setsid()
-        log = open(os.path.join(STATE_DIR, "wait.log"), "a")
-        def _log(msg):
-            log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-            log.flush()
+
+def _enqueue_command(cmd_type, cmd, run_id=None, force=False):
+    """Create a pending command in state for the daemon, or execute directly if no daemon."""
+    state = load_state()
+    daemon_pid = state.get("daemon_pid")
+    daemon_alive = False
+    if daemon_pid:
         try:
-            _log("Waiting for pod to be ready...")
-            for _ in range(180):
-                state = load_state()
-                if state.get("provision_error"):
-                    _log(f"Provisioning failed: {state['provision_error']}")
-                    break
-                if not state.get("provisioning"):
-                    _log("Pod ready — executing deferred job.")
-                    fn(state)
-                    break
-                time.sleep(5)
-            else:
-                _log("Timed out waiting for pod.")
-        except Exception as e:
-            _log(f"Deferred job error: {e}")
-        log.close()
-        os._exit(0)
-    return pid
+            os.kill(daemon_pid, 0)
+            daemon_alive = True
+        except ProcessLookupError:
+            pass
+
+    with locked_state() as s:
+        cmd_id = allocate_cmd_id(s, cmd_type, cmd, run_id=run_id, force=force)
+
+    if daemon_alive:
+        print(f"Command {cmd_id} queued for daemon.")
+    else:
+        # No daemon — execute directly (pod must be ready)
+        state = require_pod_ready()
+        with locked_state() as s:
+            s["commands"][str(cmd_id)]["status"] = "running"
+        _execute_command(state, {"type": cmd_type, "cmd": cmd, "run_id": run_id, "force": force})
+        print(f"Command {cmd_id} queued on remote (no daemon — won't auto-sync/shutdown).")
 
 
 def _provision_pod_inner(pod_id, repo, branch):
@@ -479,6 +529,12 @@ def _provision_pod_inner(pod_id, repo, branch):
     def _log(msg):
         log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         log.flush()
+
+    def _fail(error):
+        with locked_state() as state:
+            state.pop("provisioning", None)
+            state["provision_error"] = error
+        log.close()
 
     _log(f"Provisioning pod {pod_id}...")
 
@@ -525,40 +581,28 @@ def _provision_pod_inner(pod_id, repo, branch):
                 break
             if inst == "ERROR":
                 _log(f"Installation error: {s.get('installationFailure')}")
-                state = load_state()
-                state.pop("provisioning", None)
-                state["provision_error"] = str(s.get("installationFailure"))
-                save_state(state)
-                log.close()
+                _fail(str(s.get("installationFailure")))
                 return
         elif status in ("ERROR", "TERMINATED"):
             _log(f"Pod entered {status} state.")
-            state = load_state()
-            state.pop("provisioning", None)
-            state["provision_error"] = f"Pod {status}"
-            save_state(state)
-            log.close()
+            _fail(f"Pod {status}")
             return
 
     if not ip:
         _log("Pod did not become ready in time.")
-        state = load_state()
-        state.pop("provisioning", None)
-        state["provision_error"] = "Timed out waiting for pod"
-        save_state(state)
-        log.close()
+        _fail("Timed out waiting for pod")
         return
 
     # Update state with connection info
-    state = load_state()
-    state["ip"] = ip
-    state["port"] = port
-    state["ssh_user"] = ssh_user
-    save_state(state)
+    with locked_state() as state:
+        state["ip"] = ip
+        state["port"] = port
+        state["ssh_user"] = ssh_user
     _log(f"Pod active: {ssh_user}@{ip}:{port}")
 
-    # Wait for SSH
+    # Wait for SSH (use state snapshot for SSH info)
     _log("Waiting for SSH...")
+    state = load_state()
     ssh_ok = False
     for _ in range(30):
         r = remote_exec(state, "echo ok", check=False)
@@ -569,11 +613,7 @@ def _provision_pod_inner(pod_id, repo, branch):
 
     if not ssh_ok:
         _log("SSH never became ready.")
-        state = load_state()
-        state.pop("provisioning", None)
-        state["provision_error"] = "SSH timeout"
-        save_state(state)
-        log.close()
+        _fail("SSH timeout")
         return
 
     # Setup environment
@@ -590,15 +630,17 @@ def _provision_pod_inner(pod_id, repo, branch):
         "uv venv --python 3.13",
         "uv sync",
     ])
+    with locked_state() as s:
+        cmd_id = allocate_cmd_id(s, "setup", setup_cmds)
+        s["commands"][str(cmd_id)]["status"] = "running"
     queue_command(state, setup_cmds)
 
     runner_escaped = QUEUE_RUNNER.replace("'", "'\\''").replace("\n", " ")
     tmux_send(state, runner_escaped)
 
     # Mark provisioning complete
-    state = load_state()
-    state.pop("provisioning", None)
-    save_state(state)
+    with locked_state() as state:
+        state.pop("provisioning", None)
     _log("Provisioning complete. Queue runner started.")
     log.close()
 
@@ -662,41 +704,37 @@ def cmd_up(args):
     pod = r.json()
     pod_id = pod["id"]
 
-    # Save state immediately so other commands can see the pod
-    old_state = load_state()
-    state = {}
-    for key in ("next_run_id", "last_run_id", "runs", "api_key"):
-        if key in old_state:
-            state[key] = old_state[key]
-    state.update({
-        "pod_id": pod_id,
-        "name": pod_name,
-        "provisioning": True,
-    })
-    save_state(state)
+    # Clear old pod state (kills stale daemon, preserves run tracking)
+    clear_state()
+    with locked_state() as state:
+        state.update({
+            "pod_id": pod_id,
+            "name": pod_name,
+            "provisioning": True,
+        })
 
-    # Fork background provisioner
+    # Fork background daemon (handles provisioning + job execution + sync + shutdown)
     repo = args.repo
     branch = args.branch
     pid = os.fork()
     if pid == 0:
         os.setsid()
         try:
-            _provision_pod_inner(pod_id, repo, branch)
+            _daemon(pod_id, repo, branch)
         except Exception as e:
-            with open(os.path.join(STATE_DIR, "provision.log"), "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] Fatal error: {e}\n")
-            s = load_state()
-            s.pop("provisioning", None)
-            s["provision_error"] = str(e)
-            save_state(s)
+            with open(os.path.join(STATE_DIR, "wait.log"), "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] Daemon fatal error: {e}\n")
+            with locked_state() as s:
+                s.pop("provisioning", None)
+                s.pop("daemon_pid", None)
+                s["provision_error"] = str(e)
         os._exit(0)
 
-    state["provisioner_pid"] = pid
-    save_state(state)
+    with locked_state() as state:
+        state["daemon_pid"] = pid
 
     print(f"Pod created: {pod_id}")
-    print(f"Provisioning in background (pid {pid}). Logs: ~/.pi/provision.log")
+    print(f"Daemon started (pid {pid}). Logs: ~/.pi/provision.log, ~/.pi/wait.log")
     print(f"You can queue jobs now — they'll start when the pod is ready.")
 
 
@@ -705,11 +743,12 @@ def cmd_down(args):
     pod_id = state["pod_id"]
     name = state.get("name", pod_id)
 
-    # Kill provisioner if still running
-    prov_pid = state.get("provisioner_pid")
-    if prov_pid:
+    # Kill daemon if running
+    daemon_pid = state.get("daemon_pid")
+    if daemon_pid:
         try:
-            os.kill(prov_pid, signal.SIGTERM)
+            os.kill(daemon_pid, signal.SIGTERM)
+            time.sleep(1)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -734,93 +773,81 @@ def cmd_down(args):
     print("Pod terminated.")
 
 
+def cmd_reset(args):
+    """Kill daemon and clear pod state (keeps run history)."""
+    state = load_state()
+    daemon_pid = state.get("daemon_pid")
+    if daemon_pid:
+        try:
+            os.kill(daemon_pid, signal.SIGTERM)
+            print(f"Killed daemon (pid {daemon_pid})")
+        except ProcessLookupError:
+            print(f"Daemon already dead (pid {daemon_pid})")
+        except PermissionError:
+            print(f"Cannot kill daemon (pid {daemon_pid})")
+    clear_state()
+    print("State reset. Run history preserved.")
+
+
 def cmd_run(args):
-    state = require_pod_ready()
+    require_pod()
     cmd = " ".join(args.command)
     if not cmd:
         print("Error: No command specified.")
         sys.exit(1)
 
-    enqueue_or_flush(state, cmd, force=args.f)
+    _enqueue_command("run", cmd, force=args.f)
 
 
 def cmd_train(args):
-    state = require_pod()
+    require_pod()
     config = args.config_path
     overrides = list(args.overrides) if args.overrides else []
-    force = args.f
-
-    # Allocate run ID locally (instant)
-    run_id = allocate_run_id(state)
-    state["runs"][str(run_id)]["config"] = config
-    state["runs"][str(run_id)]["overrides"] = overrides
-    save_state(state)
-
-    print(f"Run {run_id}: {config} → outputs/{run_id}/")
 
     override_str = " ".join(overrides)
+    with locked_state() as s:
+        run_id = allocate_run_id(s)
+        s["runs"][str(run_id)]["config"] = config
+        s["runs"][str(run_id)]["overrides"] = overrides
+
     train_cmd = f"cd ~/nanoGPT && uv run {config} --out_dir=outputs/{run_id} {override_str}".strip()
 
-    def _do(state):
-        write_run_metadata(state, run_id, config, overrides)
-        enqueue_or_flush(state, train_cmd, force=force)
-        wait_and_shutdown(state, [run_id])
-
-    pid = _run_when_ready(_do)
-    if pid is not None:
-        print(f"Job deferred until pod is ready (pid {pid}). Logs: ~/.pi/wait.log")
+    print(f"Run {run_id}: {config} → outputs/{run_id}/")
+    _enqueue_command("train", train_cmd, run_id=run_id, force=args.f)
 
 
 def cmd_sample(args):
     state = require_pod()
     overrides = list(args.overrides) if args.overrides else []
-    force = args.f
 
-    # Look up run
     run_id, run = get_run(state, args.run)
     config = run.get("config")
     if not config:
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    print(f"Sampling run {run_id}: {config} → outputs/{run_id}/")
-
     override_str = " ".join(overrides)
     sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample --out_dir=outputs/{run_id} {override_str}".strip()
 
-    def _do(state):
-        enqueue_or_flush(state, sample_cmd, force=force)
-        wait_and_shutdown(state, [run_id])
-
-    pid = _run_when_ready(_do)
-    if pid is not None:
-        print(f"Job deferred until pod is ready (pid {pid}). Logs: ~/.pi/wait.log")
+    print(f"Sampling run {run_id}: {config} → outputs/{run_id}/")
+    _enqueue_command("sample", sample_cmd, run_id=run_id, force=args.f)
 
 
 def cmd_resume(args):
     state = require_pod()
     overrides = list(args.overrides) if args.overrides else []
-    force = args.f
 
-    # Look up run
     run_id, run = get_run(state, args.run)
     config = run.get("config")
     if not config:
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    print(f"Resuming run {run_id}: {config} → outputs/{run_id}/")
-
     override_str = " ".join(overrides)
     resume_cmd = f"cd ~/nanoGPT && uv run {config} --mode=resume --out_dir=outputs/{run_id} {override_str}".strip()
 
-    def _do(state):
-        enqueue_or_flush(state, resume_cmd, force=force)
-        wait_and_shutdown(state, [run_id])
-
-    pid = _run_when_ready(_do)
-    if pid is not None:
-        print(f"Job deferred until pod is ready (pid {pid}). Logs: ~/.pi/wait.log")
+    print(f"Resuming run {run_id}: {config} → outputs/{run_id}/")
+    _enqueue_command("resume", resume_cmd, run_id=run_id, force=args.f)
 
 
 def cmd_zombify(args):
@@ -913,12 +940,33 @@ def cmd_status(args):
         print(f"Pod {pod_id}: no status available")
         return
 
+    # Daemon status
+    daemon_pid = state.get("daemon_pid")
+    if daemon_pid:
+        try:
+            os.kill(daemon_pid, 0)
+            print(f"Daemon: running (pid {daemon_pid})")
+        except ProcessLookupError:
+            print(f"Daemon: dead (stale pid {daemon_pid})")
+    else:
+        print(f"Daemon: not running")
+
     if state.get("provisioning"):
         print(f"Local:  provisioning (logs: ~/.pi/provision.log)")
         return
     if state.get("provision_error"):
         print(f"Local:  provision failed — {state['provision_error']}")
         return
+
+    # Commands
+    commands = state.get("commands", {})
+    active = {cid: c for cid, c in commands.items() if c["status"] in ("pending", "running")}
+    if active:
+        print(f"\nCommands ({len(active)} active):")
+        for cid in sorted(active.keys(), key=int):
+            c = active[cid]
+            run_str = f" run {c['run_id']}" if c.get("run_id") else ""
+            print(f"  {cid}. [{c['status']}] {c['type']}{run_str}: {c['cmd'][:80]}")
 
     # Check tmux (only if pod is ready)
     if tmux_is_busy(state):
@@ -934,9 +982,10 @@ def cmd_status(args):
         for i, cmd in enumerate(pending, 1):
             print(f"  {i}. {cmd}")
 
-    output = tmux_capture(state, lines=8)
-    if output:
-        print(f"\nRecent output:\n{output}")
+    if not pending:
+        output = tmux_capture(state, lines=8)
+        if output:
+            print(f"\nRecent output:\n{output}")
 
 
 def cmd_sync(args):
@@ -951,24 +1000,20 @@ def cmd_sync(args):
     pods = data.get("data", [])
     active = [p for p in pods if p.get("status") == "ACTIVE"]
 
-    state = load_state()
-    state["pods"] = active
-
-    # Auto-select if exactly one active pod and no pod currently selected
-    if len(active) == 1 and not state.get("pod_id"):
-        select_pod(state, active[0])
-        print(f"Auto-selected pod '{state['name']}'.")
-    elif len(active) > 1 and not state.get("pod_id"):
-        print("Multiple active pods — run `pi list` to select one.")
-
-    save_state(state)
+    with locked_state() as state:
+        state["pods"] = active
+        if len(active) == 1 and not state.get("pod_id"):
+            select_pod(state, active[0])
+            print(f"Auto-selected pod '{state['name']}'.")
+        elif len(active) > 1 and not state.get("pod_id"):
+            print("Multiple active pods — run `pi list` to select one.")
 
     print(f"Fetched {len(active)} active pod(s) (of {len(pods)} total).")
     return active
 
 
 def select_pod(state, pod):
-    """Set a pod as the currently selected pod in state."""
+    """Set a pod as the currently selected pod in state. Caller must hold locked_state()."""
     state["pod_id"] = pod["id"]
     state["name"] = pod.get("name", pod["id"])
     ssh_conn = pod.get("sshConnection", "")
@@ -985,7 +1030,6 @@ def select_pod(state, pod):
         state["ip"] = pod["ip"]
         state.setdefault("ssh_user", "root")
         state.setdefault("port", 22)
-    save_state(state)
 
 
 def cmd_list(args):
@@ -1015,7 +1059,8 @@ def cmd_list(args):
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(active):
-                    select_pod(state, active[idx])
+                    with locked_state() as state:
+                        select_pod(state, active[idx])
                     print(f"Selected: {active[idx].get('name', active[idx]['id'])}")
                 else:
                     print("Invalid selection.")
@@ -1024,14 +1069,16 @@ def cmd_list(args):
 
 
 def cmd_history(args):
-    state = require_pod()
-    history = state.get("cmd_history", [])
-    if not history:
+    state = load_state()
+    commands = state.get("commands", {})
+    if not commands:
         print("No command history.")
         return
-    for i, entry in enumerate(history, 1):
-        ts = entry.get("ts", "?")
-        print(f"  {i}. [{ts}] {entry['cmd']}")
+    for cid in sorted(commands.keys(), key=int):
+        c = commands[cid]
+        ts = c.get("created_at", "?")
+        run_str = f" run {c['run_id']}" if c.get("run_id") else ""
+        print(f"  {cid}. [{c['status']}] {ts} {c['type']}{run_str}: {c['cmd'][:100]}")
 
 
 def cmd_upload(args):
@@ -1119,6 +1166,7 @@ def main():
     p_upload.add_argument("--path", help="Local checkpoint path (default: outputs/<run>/ckpt.pt)")
 
     sub.add_parser("zombify", help="Prevent auto-shutdown after runs")
+    sub.add_parser("reset", help="Kill daemon and clear pod state (keeps run history)")
 
     args = parser.parse_args()
 
@@ -1141,6 +1189,7 @@ def main():
         "list": cmd_list,
         "upload": cmd_upload,
         "zombify": cmd_zombify,
+        "reset": cmd_reset,
     }
     cmds[args.cmd](args)
 

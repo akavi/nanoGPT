@@ -69,3 +69,5 @@ CLI for Prime Intellect GPU pods. State in `~/.pi/state.json`. Commands queued t
 ## Dependencies
 
 Python 3.12+, managed with `uv`. Key deps: torch, numpy, transformers, tiktoken, einops, wandb.
+
+**Always use `uv run` to invoke Python** — both for scripts (`uv run pi.py ...`) and one-off commands (`uv run python -c "..."`). Never use bare `python`.
