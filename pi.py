@@ -85,7 +85,8 @@ def load_state():
 
 
 def clear_state():
-    """Clear pod-specific state but preserve run tracking data."""
+    """Clear pod-specific state but preserve run tracking data.
+    Resets any 'running' commands to 'pending' (the pod they were running on is gone)."""
     with locked_state() as state:
         daemon_pid = state.get("daemon_pid")
         if daemon_pid:
@@ -93,6 +94,10 @@ def clear_state():
                 os.kill(daemon_pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
+        # Reset running commands — the pod is gone
+        for cmd in state.get("commands", {}).values():
+            if cmd["status"] == "running":
+                cmd["status"] = "pending"
         preserved = {k: state[k] for k in ("next_run_id", "last_run_id", "runs", "next_cmd_id", "commands", "api_key") if k in state}
         state.clear()
         state.update(preserved)
@@ -239,6 +244,25 @@ def sync_run(state, run_id):
         print(f"Warning: rsync failed with code {result.returncode}")
 
 
+def upload_run(state, run_id):
+    """Rsync outputs/$run_id/ from local to remote (inverse of sync_run)."""
+    user = state.get("ssh_user", "root")
+    ip = state["ip"]
+    port = state.get("port", 22)
+    local_path = f"outputs/{run_id}/"
+    remote_path = f"{user}@{ip}:~/nanoGPT/outputs/{run_id}/"
+    if not os.path.exists(local_path):
+        return False
+    remote_exec(state, f"mkdir -p ~/nanoGPT/outputs/{run_id}")
+    cmd = [
+        "rsync", "-avz",
+        "-e", f"ssh -i {SSH_KEY} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+        local_path, remote_path,
+    ]
+    result = subprocess.run(cmd, check=False)
+    return result.returncode == 0
+
+
 def _daemon(pod_id, repo, branch):
     """Single background daemon: provision → execute jobs → sync → idle/shutdown.
     Forked from cmd_up. Logs to provision.log (provisioning) and wait.log (everything else)."""
@@ -301,6 +325,22 @@ def _daemon(pod_id, repo, branch):
                 idle_since = None
                 state = load_state()
                 _log(f"Executing command {cmd_id}: {cmd_entry.get('type', '?')} (run {cmd_entry.get('run_id', '-')})")
+
+                # Auto-upload local artifacts for sample/resume if not on remote
+                run_id = cmd_entry.get("run_id")
+                if run_id and cmd_entry.get("type") in ("sample", "resume"):
+                    r = remote_exec(state, f"test -f ~/nanoGPT/outputs/{run_id}/ckpt.pt", check=False)
+                    if r.returncode != 0:
+                        local_ckpt = f"outputs/{run_id}/ckpt.pt"
+                        if os.path.exists(local_ckpt):
+                            _log(f"Uploading local outputs/{run_id}/ to remote...")
+                            if upload_run(state, run_id):
+                                _log(f"Upload complete.")
+                            else:
+                                _log(f"Warning: upload_run failed for run {run_id}")
+                        else:
+                            _log(f"Warning: no checkpoint on remote or locally for run {run_id}")
+
                 _execute_command(state, cmd_entry)
 
                 # Wait for remote queue to drain
@@ -705,7 +745,40 @@ def cmd_up(args):
     pod_id = pod["id"]
 
     # Clear old pod state (kills stale daemon, preserves run tracking)
+    # This also resets any 'running' commands back to 'pending'
     clear_state()
+
+    # Check for pending commands from a previous pod
+    prev_state = load_state()
+    pending_cmds = {
+        cid: c for cid, c in prev_state.get("commands", {}).items()
+        if c["status"] == "pending" and c["type"] != "setup"
+    }
+    if pending_cmds:
+        print(f"\n{len(pending_cmds)} pending command(s) from previous pod:")
+        for cid in sorted(pending_cmds.keys(), key=int):
+            c = pending_cmds[cid]
+            run_str = f" run {c['run_id']}" if c.get("run_id") else ""
+            print(f"  {cid}. {c['type']}{run_str}: {c['cmd'][:80]}")
+        choice = input("\nRe-queue? [a]ll / [s]elect / [n]one (default: all): ").strip().lower()
+        if choice in ("n", "none"):
+            with locked_state() as s:
+                for cid in pending_cmds:
+                    s["commands"][cid]["status"] = "abandoned"
+            print("All pending commands abandoned.")
+        elif choice in ("s", "select"):
+            keep = input(f"Enter command IDs to keep (comma-separated): ").strip()
+            keep_ids = {x.strip() for x in keep.split(",") if x.strip()}
+            with locked_state() as s:
+                for cid in pending_cmds:
+                    if cid not in keep_ids:
+                        s["commands"][cid]["status"] = "abandoned"
+            kept = len(keep_ids & set(pending_cmds.keys()))
+            print(f"Kept {kept}, abandoned {len(pending_cmds) - kept}.")
+        else:
+            print("All pending commands will be re-queued.")
+        print()
+
     with locked_state() as state:
         state.update({
             "pod_id": pod_id,
