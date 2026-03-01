@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import time
@@ -23,27 +24,8 @@ DEFAULT_BRANCH = "master"
 DEFAULT_GPU_TYPE = "H100_80GB"
 DEFAULT_GPU_COUNT = 1
 TMUX_SESSION = "pi"
-QUEUE_FILE = "~/.pi_queue"
-
-# The queue runner loop that runs inside tmux on the remote.
-# It processes commands from QUEUE_FILE one at a time.
 CMD_LOG = "~/.pi_cmd.log"
 BUSY_FLAG = "~/.pi_busy"
-QUEUE_RUNNER = f"""\
-while true; do
-  if [ -s {QUEUE_FILE} ]; then
-    cmd=$(head -1 {QUEUE_FILE});
-    tail -n +2 {QUEUE_FILE} > {QUEUE_FILE}.tmp && mv {QUEUE_FILE}.tmp {QUEUE_FILE};
-    echo ">>> $cmd";
-    touch {BUSY_FLAG};
-    eval "$cmd" 2>&1 | tee -a {CMD_LOG};
-    echo ${{PIPESTATUS[0]}} > ~/.pi_last_exit;
-    rm -f {BUSY_FLAG};
-  else
-    sleep 2;
-  fi;
-done
-"""
 
 
 # ── State management ──────────────────────────────────────────────────────────
@@ -319,16 +301,16 @@ def _daemon(pod_id, skip_provision=False):
         IDLE_TIMEOUT = 30
 
         while not shutdown_requested:
+            # Phase 1: Check for completed commands (save state before starting new ones)
             with locked_state() as s:
-                # 1. Check pod still exists
+                s["daemon_heartbeat"] = time.time()
+
                 if not s.get("pod_id"):
                     _log("No pod in state — exiting.")
                     break
 
-                # 2. Sync down logs
                 sync_cmd_log(s)
 
-                # 3. If there's a "running" command, check if it finished on the remote
                 commands = s.get("commands", {})
                 running_id = None
                 running_entry = None
@@ -338,8 +320,7 @@ def _daemon(pod_id, skip_provision=False):
                         running_entry = commands[cid]
                         break
 
-                if running_entry and queue_is_idle(s):
-                    # Remote finished — check exit status
+                if running_entry and not tmux_is_busy(s):
                     exit_code = check_remote_exit(s)
                     failed = exit_code and exit_code != "0"
                     if failed:
@@ -348,7 +329,6 @@ def _daemon(pod_id, skip_provision=False):
                         if output:
                             _log(f"Recent output:\n{output}")
 
-                    # Sync artifacts if command has a run_id
                     run_id = running_entry.get("run_id")
                     if run_id:
                         _log(f"Syncing run {run_id}...")
@@ -356,11 +336,17 @@ def _daemon(pod_id, skip_provision=False):
 
                     running_entry["status"] = "failed" if failed else "completed"
                     _log(f"Command {running_id} {'failed' if failed else 'completed'}.")
-                    running_id = None
-                    running_entry = None
+                # State saved here — completion is persisted even if next phase fails
 
-                # 4. If nothing running, start next pending command
-                if not running_entry:
+            # Phase 2: Start next pending command (separate state block)
+            with locked_state() as s:
+                if not s.get("pod_id"):
+                    break
+
+                commands = s.get("commands", {})
+                has_running = any(c["status"] == "running" for c in commands.values())
+
+                if not has_running:
                     for cid in sorted(commands.keys(), key=int):
                         if commands[cid]["status"] == "pending":
                             cmd_entry = commands[cid]
@@ -398,7 +384,6 @@ def _daemon(pod_id, skip_provision=False):
                         elif time.time() - idle_since >= IDLE_TIMEOUT:
                             _log("Idle timeout — shutting down pod...")
                             pod_id_to_delete = s["pod_id"]
-                            # Inline clear_state logic (can't call clear_state under existing lock)
                             for cmd in s.get("commands", {}).values():
                                 if cmd["status"] == "running":
                                     cmd["status"] = "pending"
@@ -465,7 +450,7 @@ def tmux_send(state, cmd):
 
 
 def tmux_is_busy(state):
-    """Check if the queue runner is actively executing a command."""
+    """Check if a command is actively running in tmux."""
     r = remote_exec(state, f"test -f {BUSY_FLAG}", check=False)
     return r.returncode == 0
 
@@ -476,90 +461,28 @@ def tmux_capture(state, lines=5):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-# ── Queue helpers ─────────────────────────────────────────────────────────────
-
-def queue_command(state, cmd):
-    """Append a command to the remote queue file."""
-    escaped = cmd.replace("'", "'\\''")
-    remote_exec(state, f"echo '{escaped}' >> {QUEUE_FILE}")
-
-
-def read_queue(state):
-    """Read pending commands from the remote queue file."""
-    r = remote_exec(state, f"cat {QUEUE_FILE} 2>/dev/null", check=False)
-    if r.returncode != 0 or not r.stdout.strip():
-        return []
-    return [line for line in r.stdout.strip().splitlines() if line.strip()]
-
-
-def clear_queue(state):
-    """Clear the remote queue and interrupt the current command."""
-    remote_exec(state, f"truncate -s 0 {QUEUE_FILE}", check=False)
-    remote_exec(state, f"tmux send-keys -t {TMUX_SESSION} C-c", check=False)
-
-
-def queue_is_idle(state):
-    """Check if the queue is empty and nothing is actively running."""
-    pending = read_queue(state)
-    return len(pending) == 0 and not tmux_is_busy(state)
-
-
-def ensure_runner(state):
-    """Ensure the queue runner loop is running in tmux. Start it if not."""
-    # Check if tmux session exists
-    r = remote_exec(state, f"tmux has-session -t {TMUX_SESSION} 2>/dev/null", check=False)
-    if r.returncode != 0:
-        # No session — create one and start the runner
-        remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION}", check=False)
-        remote_exec(state, f"touch {QUEUE_FILE}", check=False)
-        runner_escaped = QUEUE_RUNNER.replace("'", "'\\''").replace("\n", " ")
-        tmux_send(state, runner_escaped)
-        return
-
-    # Session exists. If idle, the runner loop is likely in its `sleep 2` phase
-    # and will pick up new commands from the queue file. Only restart if the
-    # runner seems stuck (e.g. an interactive prompt ate stdin).
-    if not tmux_is_busy(state):
-        # Check if the runner loop is alive by looking for its sleep/eval pattern.
-        # If the queue file is accessible and the pane shows a normal shell, the
-        # runner is probably fine. Only restart if the queue file is missing.
-        r = remote_exec(state, f"test -f {QUEUE_FILE}", check=False)
-        if r.returncode != 0:
-            # Queue file missing — runner probably not running, restart it
-            remote_exec(state, f"tmux kill-session -t {TMUX_SESSION}", check=False)
-            remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION}", check=False)
-            remote_exec(state, f"touch {QUEUE_FILE}", check=False)
-            runner_escaped = QUEUE_RUNNER.replace("'", "'\\''").replace("\n", " ")
-            tmux_send(state, runner_escaped)
-
-
-def enqueue_or_flush(state, cmd, force=False):
-    """Queue a command, or flush+interrupt if force is set."""
-    ensure_runner(state)
-    if force:
-        clear_queue(state)
-        # Brief pause for Ctrl-C to take effect
-        time.sleep(0.5)
-    queue_command(state, cmd)
-    n = len(read_queue(state))
-    if force:
-        print(f"Flushed queue. Queued: {cmd}")
-    elif n > 1:
-        print(f"Queued ({n} pending): {cmd}")
-    else:
-        print(f"Queued: {cmd}")
-
-
 # ── Provisioning ──────────────────────────────────────────────────────────────
 
 def _execute_command(state, cmd_entry):
-    """Execute a single command — write run metadata if needed, enqueue on remote."""
+    """Execute a single command — write run metadata if needed, send directly to tmux."""
     run_id = cmd_entry.get("run_id")
     if run_id and cmd_entry["type"] in ("train", "resume"):
         runs = state.get("runs", {})
         run = runs.get(str(run_id), {})
         write_run_metadata(state, run_id, run.get("config", ""), run.get("overrides", []))
-    enqueue_or_flush(state, cmd_entry["cmd"], force=cmd_entry.get("force", False))
+
+    cmd = cmd_entry["cmd"]
+    force = cmd_entry.get("force", False)
+    if force:
+        remote_exec(state, f"tmux send-keys -t {TMUX_SESSION} C-c", check=False)
+        time.sleep(0.5)
+
+    # Ensure tmux session exists
+    remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION} || true")
+
+    # Send command to tmux, tee to log, write exit code
+    wrapped = f'touch {BUSY_FLAG}; eval {shlex.quote(cmd)} 2>&1 | tee -a {CMD_LOG}; echo ${{PIPESTATUS[0]}} > ~/.pi_last_exit; rm -f {BUSY_FLAG}'
+    tmux_send(state, wrapped)
 
 
 def _daemon_is_alive():
@@ -715,10 +638,9 @@ def _provision_pod_inner(pod_id):
         _fail("SSH timeout")
         return
 
-    # Set up tmux session for queue runner
+    # Set up tmux session
     _log("Setting up tmux...")
     remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION} || true")
-    remote_exec(state, f"touch {QUEUE_FILE}", check=False)
 
     # Mark provisioning complete — daemon main loop will pick up pending commands
     with locked_state() as state:
@@ -830,6 +752,7 @@ def cmd_up(args):
         f"git clone --depth 1 --branch {args.branch} {args.repo}",
         "cd nanoGPT",
         uv_install,
+        'grep -q ".local/bin" ~/.bashrc || echo \'export PATH="$HOME/.local/bin:$PATH"\' >> ~/.bashrc',
         'export PATH="$HOME/.local/bin:$PATH"',
         "uv python install 3.13",
         "uv venv --python 3.13",
@@ -843,7 +766,15 @@ def cmd_up(args):
             "provider": provider,
             "provisioning": True,
         })
+        # Renumber pending commands so setup runs first
+        commands = state.get("commands", {})
+        pending = {cid: c for cid, c in commands.items() if c["status"] == "pending"}
+        for cid in pending:
+            del commands[cid]
         allocate_cmd_id(state, "setup", setup_cmd)
+        for c in pending.values():
+            allocate_cmd_id(state, c["type"], c["cmd"],
+                           run_id=c.get("run_id"), force=c.get("force", False))
 
     # Fork background daemon (handles provisioning + job execution + sync + shutdown)
     pid = _fork_daemon(pod_id)
@@ -868,16 +799,16 @@ def cmd_down(args):
             pass
 
     if not args.f and not state.get("provisioning"):
-        # Wait for queued commands to finish (only if pod is ready)
-        pending = read_queue(state)
-        if pending or tmux_is_busy(state):
-            print(f"Waiting for {len(pending)} queued command(s) to finish...")
+        # Wait for active commands to finish (only if pod is ready)
+        commands = state.get("commands", {})
+        has_active = any(c["status"] in ("pending", "running") for c in commands.values())
+        if has_active or tmux_is_busy(state):
+            print("Waiting for active commands to finish...")
             for _ in range(600):  # up to 50 minutes
-                if queue_is_idle(state):
+                if not tmux_is_busy(state):
                     break
                 time.sleep(5)
-                pending = read_queue(state)
-                print(f"\r  {len(pending)} pending, {'running' if tmux_is_busy(state) else 'idle'}   ",
+                print(f"\r  {'running' if tmux_is_busy(state) else 'idle'}   ",
                       end="", flush=True)
             print()
 
@@ -914,10 +845,18 @@ def cmd_restart(args):
     if daemon_pid:
         try:
             os.kill(daemon_pid, signal.SIGTERM)
-            print(f"Killed old daemon (pid {daemon_pid})")
-            time.sleep(1)
+            print(f"Killing old daemon (pid {daemon_pid})...")
+            # Wait for it to actually die (it may be mid-SSH call)
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    os.kill(daemon_pid, 0)
+                except ProcessLookupError:
+                    break
+            else:
+                os.kill(daemon_pid, signal.SIGKILL)
         except ProcessLookupError:
-            print(f"Old daemon already dead (pid {daemon_pid})")
+            pass
         except PermissionError:
             print(f"Cannot kill old daemon (pid {daemon_pid})")
 
@@ -1078,10 +1017,12 @@ def cmd_status(args):
 
     # Daemon status
     daemon_pid = state.get("daemon_pid")
+    heartbeat = state.get("daemon_heartbeat")
     if daemon_pid:
         try:
             os.kill(daemon_pid, 0)
-            print(f"Daemon: running (pid {daemon_pid})")
+            ago = f", last poll {int(time.time() - heartbeat)}s ago" if heartbeat else ""
+            print(f"Daemon: running (pid {daemon_pid}{ago})")
         except ProcessLookupError:
             print(f"Daemon: dead (stale pid {daemon_pid})")
     else:
@@ -1106,22 +1047,13 @@ def cmd_status(args):
 
     # Check tmux (only if pod is ready)
     if tmux_is_busy(state):
-        r = remote_exec(state, f"tmux list-panes -t {TMUX_SESSION} -F '#{{pane_current_command}}'", check=False)
-        print(f"Tmux:   running ({r.stdout.strip()})")
+        print(f"Tmux:   running")
     else:
         print(f"Tmux:   idle")
 
-    # Show queued commands
-    pending = read_queue(state)
-    if pending:
-        print(f"\nQueue ({len(pending)} pending):")
-        for i, cmd in enumerate(pending, 1):
-            print(f"  {i}. {cmd}")
-
-    if not pending:
-        output = tmux_capture(state, lines=8)
-        if output:
-            print(f"\nRecent output:\n{output}")
+    output = tmux_capture(state, lines=8)
+    if output:
+        print(f"\nRecent output:\n{output}")
 
 
 def cmd_log(args):

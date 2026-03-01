@@ -1,12 +1,11 @@
 import sys
 from pathlib import Path
-from typing import Any
 import numpy as np
 from PIL import Image
 import torch
 import os
 
-from models.model import ModuleList, CsaBlock, CsaConfig
+from models.utils import make_csa_backbone
 from models.categorical import CategoricalConfig, Categorical
 from train import train, TrainConfig
 from sample import sample, SampleConfig
@@ -46,16 +45,13 @@ overridable = override(sys.argv, {
 
 torch.manual_seed(overridable['seed'])
 meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
-backbone = ModuleList([
-    CsaBlock(CsaConfig(
-        n_head=8,
-        n_embd=overridable['n_embd'],
-        n_step=1,
-        block_size=overridable['block_size'],
-        bias=overridable['bias'],
-        dropout=0.05,
-    ), i)
-for i in range(overridable['n_layer'])])
+backbone = make_csa_backbone(
+    n_layer=overridable['n_layer'],
+    n_embd=overridable['n_embd'],
+    block_size=overridable['block_size'],
+    bias=overridable['bias'],
+    dropout=0.05,
+)
 model = Categorical(CategoricalConfig(
     n_block=overridable['block_size'],
     n_vocab=meta['vocab_size'],

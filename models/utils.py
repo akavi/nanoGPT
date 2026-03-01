@@ -1,5 +1,23 @@
 import torch
 
+from models.model import ModuleList, CsaBlock, CsaConfig
+
+
+def make_csa_backbone(*, n_layer, n_head=8, n_embd, block_size, bias, dropout):
+    """Build a ModuleList of CsaBlocks."""
+    return ModuleList([
+        CsaBlock(CsaConfig(
+            n_head=n_head,
+            n_embd=n_embd,
+            n_step=1,
+            block_size=block_size,
+            bias=bias,
+            dropout=dropout,
+        ), i)
+        for i in range(n_layer)
+    ])
+
+
 def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
     # start with all of the candidate parameters
     param_dict = {pn: p for pn, p in self.named_parameters()}

@@ -1,20 +1,17 @@
 import sys
 from pathlib import Path
-from typing import Any
 import numpy as np
 from PIL import Image
 import torch
 import os
 
-from models.model import ModuleList
+from models.utils import make_csa_backbone
 from models.categorical import CategoricalConfig, Categorical
-from models.mamba import Mamba2, MambaConfig
 from train import train, TrainConfig
 from sample import sample, SampleConfig
 from utils import (
     OptimizerConfig,
     DataConfig,
-    get_fixed_batch,
     get_sampled_batch as get_config_batch,
     save_checkpoint as save_config_checkpoint,
     init_sampled_data,
@@ -45,21 +42,13 @@ overridable = override(sys.argv, {
 
 torch.manual_seed(overridable['seed'])
 meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
-backbone = ModuleList([
-    Mamba2(MambaConfig(
-        n_head=8,
-        n_embd=overridable['n_embd'],
-        n_inner=768,
-        n_conv=4,
-        n_state=64,
-
-        bias=overridable['bias'],
-        n_chunk=32,
-        dropout=0.05,
-        device=overridable['device'],
-        mode="train" if overridable["mode"] in ["from_scratch", "resume"] else "sample",
-    ), i)
-for i in range(overridable['n_layer'])])
+backbone = make_csa_backbone(
+    n_layer=overridable['n_layer'],
+    n_embd=overridable['n_embd'],
+    block_size=overridable['block_size'],
+    bias=overridable['bias'],
+    dropout=0.05,
+)
 model = Categorical(CategoricalConfig(
     n_block=overridable['block_size'],
     n_vocab=meta['vocab_size'],
