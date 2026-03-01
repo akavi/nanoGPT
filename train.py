@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from contextlib import nullcontext, AbstractContextManager
@@ -106,6 +108,11 @@ def train(
 
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
+    # log file
+    os.makedirs(config.out_dir, exist_ok=True)
+    log_path = os.path.join(config.out_dir, "log.json")
+    log_entries: list[dict] = []
+
     # training loop
     x, y = get_batch("train", config.batch_size)  # initial prefetch
     t0 = time.time()
@@ -191,6 +198,11 @@ def train(
             if metrics_accum:
                 metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in metrics_accum.items())
                 print(f"  metrics: {metrics_str}")
+
+            entry = {"iter": iter_num, "loss": lossf, "time_ms": dt * 1000, "mfu": running_mfu, **metrics_accum}
+            log_entries.append(entry)
+            with open(log_path, "w") as f:
+                json.dump(log_entries, f, indent=2)
 
         iter_num += 1
         local_iter_num += 1
