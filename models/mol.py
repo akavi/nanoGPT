@@ -82,12 +82,12 @@ class MoL(nn.Module):
             mix_logits, mu, log_s = torch.split(y, K, dim=-1)           # each [B,T,N,K]
             logp = mixture_loglik(targets, mix_logits, mu, log_s)        # [B,T,N]
             loss = -logp.mean()
-            return (mix_logits, mu, log_s), state, loss
+            return (mix_logits, mu, log_s), state, loss, {}
         else:
             y = self.lm_head(h_out[:, [-1], :])                          # [B,1,3*K*N]
             y = y.view(B, 1, self.n_tokens, 3 * K)
             mix_logits, mu, log_s = torch.split(y, K, dim=-1)           # each [B,1,N,K]
-            return (mix_logits, mu, log_s), state, None
+            return (mix_logits, mu, log_s), state, None, {}
 
     @torch.no_grad()
     def generate(self,
@@ -103,7 +103,7 @@ class MoL(nn.Module):
         x = x_prefix
         for _ in range(max_new_tokens):
             x_cond = x if x.size(1) <= self.n_block else x[:, -self.n_block:]
-            (mix_logits, mu, log_s), state, _ = self(x_cond, state, targets=None)
+            (mix_logits, mu, log_s), state, _, _ = self(x_cond, state, targets=None)
             # shapes [B,1,N,K]
             ml = mix_logits[:, -1, :, :]                               # [B,N,K]
             pi = F.softmax(ml, dim=-1)                                 # [B,N,K]

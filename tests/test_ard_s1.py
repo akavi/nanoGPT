@@ -182,11 +182,11 @@ def generate_tokens(model, device, n_tokens=BLOCK_SIZE, temperature=0.8, top_k=2
     # Warm up ladder for ARD
     if hasattr(model, 'n_step'):
         for _ in range(model.n_step - 1):
-            _, state, _ = model(tok, state)
+            _, state, _, _ = model(tok, state)
 
     with torch.no_grad():
         for _ in range(n_tokens):
-            logits, state, _ = model(tok, state)
+            logits, state, _, _ = model(tok, state)
             logits_last = logits[:, -1, :] / temperature
             probs = F.softmax(logits_last, dim=-1)
 

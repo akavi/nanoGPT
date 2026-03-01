@@ -291,7 +291,7 @@ elif mode == "sample":
 
                 for j in range(N_TOKENS):
                     y_cond = seq if seq.size(1) <= block_size else seq[:, -block_size:]
-                    (ml, m, ls), state, _ = model(y_cond, state, targets=None)
+                    (ml, m, ls), state, _, _ = model(y_cond, state, targets=None)
                     pred_clean = sample_mol(ml[:, -1], m[:, -1], ls[:, -1], temperature)
 
                     if j == N_TOKENS - 1:

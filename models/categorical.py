@@ -67,7 +67,7 @@ class Categorical(nn.Module):
         x = self.ln_f(x)
 
         if targets is not None:
-            logits = self.lm_head(x)                        
+            logits = self.lm_head(x)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
@@ -78,7 +78,7 @@ class Categorical(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, state, loss
+        return logits, state, loss, {}
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
@@ -88,7 +88,7 @@ class Categorical(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            logits, state, _ = self(idx, state)
+            logits, state, _, _ = self(idx, state)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

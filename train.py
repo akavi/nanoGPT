@@ -38,8 +38,8 @@ class TrainModel(Protocol):
         x: Tensor,
         state: Any,
         y: Tensor,
-    ) -> tuple[Tensor, Any, Tensor]: ...
-    # (logits, new_state, loss)
+    ) -> tuple[Tensor, Any, Tensor, dict[str, float]]: ...
+    # (logits, new_state, loss, metrics)
 
 GetBatchFn = Callable[[Split, int], tuple[Tensor, Tensor]]
 SaveCheckpointFn = Callable[
@@ -144,12 +144,17 @@ def train(
         if iter_num == 0 and config.eval_only:
             break
 
+        metrics_accum: dict[str, float] = {}
         for _micro_step in range(config.gradient_accumulation_steps):
             B = x.shape[0]
             state = model.initial_state(B)
             with ctx:
-                _, state, loss = model(x, state, y)
+                _, state, loss, metrics = model(x, state, y)
                 loss = loss / config.gradient_accumulation_steps # scale the loss to account for gradient accumulation
+
+            # accumulate metrics (average across micro steps)
+            for k, v in metrics.items():
+                metrics_accum[k] = metrics_accum.get(k, 0.0) + v / config.gradient_accumulation_steps
 
             # prefetch for next step / next iter
             x, y = get_batch("train", config.batch_size)
@@ -183,6 +188,9 @@ def train(
                 f"iter {iter_num}: loss {lossf:.4f}, "
                 f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
             )
+            if metrics_accum:
+                metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in metrics_accum.items())
+                print(f"  metrics: {metrics_str}")
 
         iter_num += 1
         local_iter_num += 1
@@ -240,7 +248,7 @@ def estimate_loss(
             B, T = x.shape[0], x.shape[1]
             state = model.initial_state(B)
             with ctx:
-                _, state, loss = model(x, state, y)
+                _, state, loss, _ = model(x, state, y)
 
             total_loss_weighted += loss.item() * (B * T)
             total_tokens += B * T

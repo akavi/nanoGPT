@@ -357,7 +357,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, state, loss
+        return logits, state, loss, {}
 
 
     def initial_state(self, batch_size):
@@ -371,7 +371,7 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            logits, state, _ = self(idx, state)
+            logits, state, _, _ = self(idx, state)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

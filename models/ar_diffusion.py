@@ -230,7 +230,7 @@ class ArDiffusion(nn.Module):
 
             loss = ce_loss + self.latent_loss_scale * latent_loss
 
-            return tok_logits, (new_diff_state, new_backbone_state), loss
+            return tok_logits, (new_diff_state, new_backbone_state), loss, {}
 
         else:  # sample — one position per call, AR from tok history
             cf, af, nf = self._blend_fracs(toks.device)
@@ -253,7 +253,7 @@ class ArDiffusion(nn.Module):
             output_buf = torch.cat([output_buf, y[:, -1:, :, :]], dim=1)
 
             tok_logits = self.lm_head(y[:, -1:, -1, :])
-            return tok_logits, (output_buf, backbone_state), None
+            return tok_logits, (output_buf, backbone_state), None, {}
 
     def lm_head(self, x: Tensor) -> Tensor:
         return self.lm_projection(x)  # (B,L,V)
@@ -275,10 +275,10 @@ class ArDiffusion(nn.Module):
 
         # Warm up ladder: S-1 calls to fill the sublatent pipeline
         for _ in range(self.n_step - 1):
-            _, state, _ = self(tok, state)
+            _, state, _, _ = self(tok, state)
 
         for _ in range(max_new_tokens):
-            logits, state, _ = self(tok, state)
+            logits, state, _, _ = self(tok, state)
             logits = logits[:, -1, :] / temperature
             probs = F.softmax(logits, dim=-1)
             x_next = torch.multinomial(probs, num_samples=1)

@@ -259,9 +259,12 @@ class DeTokenizer(nn.Module):
         device = hidden_states.device
 
         if M == 0:
-            # No tokens selected — just return residual
-            new_state = state if state is not None else residual.new_zeros(B, D)
-            return residual, new_state
+            # No boundary tokens this step — use previous EMA state to match
+            # training behavior where non-boundary positions still receive the
+            # EMA-broadcast main-stage contribution via chunk_idx mapping.
+            contribution = state.unsqueeze(1).expand(B, L, D)
+            output = (residual.float() + contribution.float()).to(residual.dtype)
+            return output, state
 
         # Build chunk probs: gather boundary probs at token positions
         chunk_probs = prob.new_zeros(B, M)
@@ -449,7 +452,7 @@ class HNet(nn.Module):
         G = prob.mean()
         return (N / (N - 1)) * ((N - 1) * F * G + (1 - F) * (1 - G))
 
-    def forward(self, x: Tensor, state: dict) -> tuple[Tensor, dict, Tensor]:
+    def forward(self, x: Tensor, state: dict) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
         B, L, D = x.shape
 
         # 1. Pre-stage (encoder)
@@ -468,6 +471,10 @@ class HNet(nn.Module):
         # 5. Tokenize — compact to boundary positions
         chunked, counts = self.tokenizer(x, token_mask)
 
+        # Track compression ratio: input_len / num_boundary_tokens
+        n_tokens_selected = token_mask.float().sum(dim=1).mean().item()
+        ratio = L / max(n_tokens_selected, 1.0)
+
         # 6. Pad to deeper dimension if needed
         B_c, M, D_c = chunked.shape
         if self.pad_parameter is not None:
@@ -475,11 +482,15 @@ class HNet(nn.Module):
             chunked = torch.cat([chunked, pad], dim=-1)
 
         # 7. Main stage (on compressed sequence) — skip if empty
+        metrics: dict[str, float] = {'ratio': ratio}
         M = chunked.shape[1]
         if M > 0:
             if isinstance(self.main_stage, HNet):
-                chunked, main_state, inner_aux = self.main_stage(chunked, state['main'])
+                chunked, main_state, inner_aux, inner_metrics = self.main_stage(chunked, state['main'])
                 aux_loss = aux_loss + inner_aux
+                # prefix inner metrics to distinguish levels
+                for k, v in inner_metrics.items():
+                    metrics[f'inner_{k}'] = v
             else:
                 chunked, main_state = self.main_stage(chunked, state['main'])
         else:
@@ -503,7 +514,7 @@ class HNet(nn.Module):
             'router': router_state,
             'detokenizer': detok_state,
         }
-        return x, new_state, aux_loss
+        return x, new_state, aux_loss, metrics
 
     def initial_state(self, batch_size, device='cpu'):
         return {
@@ -614,9 +625,9 @@ class HNetLM(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def forward(self, idx: Tensor, state, targets: Tensor | None = None):
-        """TrainModel protocol: (logits, state, loss)."""
+        """TrainModel protocol: (logits, state, loss, metrics)."""
         x = self.embeddings(idx)  # (B, L, D)
-        x, state, ratio_loss = self.backbone(x, state)
+        x, state, ratio_loss, metrics = self.backbone(x, state)
 
         if targets is not None:
             logits = self.lm_head(x)
@@ -625,12 +636,13 @@ class HNetLM(nn.Module):
                 targets.view(-1),
                 ignore_index=-1,
             )
+            metrics['ratio_loss'] = ratio_loss.item()
             loss = loss + self.config.ratio_loss_weight * ratio_loss
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
-        return logits, state, loss
+        return logits, state, loss, metrics
 
     def initial_state(self, batch_size):
         device = next(self.parameters()).device
@@ -639,7 +651,7 @@ class HNetLM(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
         # Process the prompt
-        logits, state, _ = self(idx, state)
+        logits, state, _, _ = self(idx, state)
         for _ in range(max_new_tokens):
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
@@ -649,7 +661,7 @@ class HNetLM(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
             # Feed only the new token, relying on state
-            logits, state, _ = self(idx_next, state)
+            logits, state, _, _ = self(idx_next, state)
         return idx
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
