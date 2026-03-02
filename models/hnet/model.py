@@ -561,6 +561,7 @@ class HNetLM(nn.Module):
         self.config = config
 
         self.embeddings = nn.Embedding(config.vocab_size, config.d_model)
+        self.wpe = nn.Embedding(config.block_size, config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.embeddings.weight
@@ -604,7 +605,11 @@ class HNetLM(nn.Module):
 
     def forward(self, idx: Tensor, state, targets: Tensor | None = None):
         """TrainModel protocol: (logits, state, loss, metrics)."""
-        x = self.embeddings(idx)  # (B, L, D)
+        # Compute position offset from pre_stage KV cache
+        offset = state['pre'][0][0].size(2)  # cached seq len
+        L = idx.size(1)
+        pos = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
+        x = self.embeddings(idx) + self.wpe(pos)  # (B, L, D)
         x, state, ratio_loss, metrics = self.backbone(x, state)
 
         if targets is not None:
@@ -614,6 +619,7 @@ class HNetLM(nn.Module):
                 targets.view(-1),
                 ignore_index=-1,
             )
+            metrics['ce_loss'] = loss.item()
             metrics['ratio_loss'] = ratio_loss.item()
             loss = loss + self.config.ratio_loss_weight * ratio_loss
         else:
