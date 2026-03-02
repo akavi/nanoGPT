@@ -635,8 +635,8 @@ class HNetLM(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
         # Process the prompt
-        logits, state, _, _ = self(idx, state)
         for _ in range(max_new_tokens):
+            logits, state, _, _ = self(idx, state)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -644,8 +644,6 @@ class HNetLM(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
-            # Feed only the new token, relying on state
-            logits, state, _, _ = self(idx_next, state)
         return idx
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
