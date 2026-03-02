@@ -103,7 +103,7 @@ def train(
     else:
         dtype = "float16"
 
-    device_type = "cuda" if "cuda" in config.device else "cpu"
+    device_type = "cuda" if "cuda" in config.device else ("mps" if "mps" in config.device else "cpu")
     ctx = make_ctx(device_type, dtype)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
@@ -234,7 +234,7 @@ def make_ctx(
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }[dtype]
-    if device_type == "cpu":
+    if device_type == "cpu" or (device_type == "mps" and ptdtype != torch.float32):
         return nullcontext()
     return torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 

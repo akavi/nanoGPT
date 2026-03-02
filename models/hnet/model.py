@@ -21,9 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from einops import rearrange, repeat
-
-from models.mamba import RMSNorm, ssd
+from models.mamba import RMSNorm
 from models.model import CsaConfig
 
 
@@ -47,51 +45,45 @@ def ste(x):
 
 
 # ---------------------------------------------------------------------------
-# EMA via SSD
+# EMA via parallel scan in [0, 1]
 # ---------------------------------------------------------------------------
 
 def ema_scan(
-    x: Tensor,         # (B, L, D)
-    dt: Tensor,         # (B, L) — log(1/(1-p))
-    n_heads: int,
-    d_head: int,
-    chunk_size: int,
-    initial_states: Tensor | None = None,  # (B, n_heads, d_head) or None
+    x: Tensor,              # (B, L, D) — input values
+    decay: Tensor,           # (B, L) — decay factors in [0, 1]
+    initial_state: Tensor,   # (B, D)
 ) -> Tensor:
-    """EMA as a scalar SSM: h[t] = exp(-dt)*h[t-1] + x[t].
+    """Parallel-scan EMA: h[t] = decay[t] * h[t-1] + (1 - decay[t]) * x[t].
 
-    This is ssd() with A=-1, B=C=1 (d_state=1).
-    Input x should already be scaled by 1/dt before calling.
+    Uses the associative scan identity:
+        (a2, b2) ∘ (a1, b1) = (a2 * a1, a2 * b1 + b2)
+    where a[t] = decay[t], b[t] = (1 - decay[t]) * x[t].
+
+    All arithmetic stays in [0, 1] for the decay terms, so no overflow.
     """
     B, L, D = x.shape
-    device = x.device
 
-    # Reshape for ssd: (B, L, n_heads, d_head)
-    x_4d = rearrange(x, 'b l (h p) -> b l h p', h=n_heads, p=d_head)
-    # dt: (B, L) -> (B, L, n_heads)
-    dt_3d = repeat(dt, 'b l -> b l h', h=n_heads)
-    # A = -1 for all heads
-    A = -torch.ones(n_heads, device=device, dtype=torch.float32)
-    # A * dt: (B, L, n_heads)
-    A_dt = A.unsqueeze(0).unsqueeze(0) * dt_3d
-    # B = C = 1, d_state=1
-    ones = torch.ones(B, L, 1, 1, device=device, dtype=x.dtype)
+    # a[t] = decay[t], b[t] = (1 - decay[t]) * x[t]
+    a = decay.unsqueeze(-1).expand(B, L, D)       # (B, L, D)
+    b = (1 - decay).unsqueeze(-1).expand(B, L, D) * x  # (B, L, D)
 
-    if initial_states is not None:
-        # (B, n_heads, d_head) -> (B, 1, n_heads, d_head, 1)
-        init = initial_states.unsqueeze(1).unsqueeze(-1)
-    else:
-        init = torch.zeros(B, 1, n_heads, d_head, 1, device=device, dtype=x.dtype)
+    # Fold initial state into the first position:
+    # h[0] = decay[0] * init + (1 - decay[0]) * x[0]
+    #       = a[0] * init + b[0]
+    b = torch.cat([b[:, :1] + a[:, :1] * initial_state.unsqueeze(1), b[:, 1:]], dim=1)
 
-    y, _final = ssd(
-        x_4d * dt_3d.unsqueeze(-1),  # scale input by dt
-        A_dt,
-        ones, ones,
-        chunk_size,
-        initial_states=init,
-        device=device,
-    )
-    return rearrange(y, 'b l h p -> b l (h p)')
+    # Hillis-Steele parallel prefix scan (out-of-place for autograd)
+    # Each step combines element i with element i-stride.
+    # O(L log L) work, O(log L) depth — simple and correct.
+    stride = 1
+    while stride < L:
+        b = torch.cat([b[:, :stride],
+                        a[:, stride:] * b[:, :-stride] + b[:, stride:]], dim=1)
+        a = torch.cat([a[:, :stride],
+                        a[:, stride:] * a[:, :-stride]], dim=1)
+        stride *= 2
+
+    return b  # b now holds h[t] at each position
 
 
 # ---------------------------------------------------------------------------
@@ -231,14 +223,9 @@ class DeTokenizer(nn.Module):
     to original sequence length via cumulative chunk indexing.
     """
 
-    def __init__(self, d_model: int, d_head: int = 32, chunk_size: int = 256, epsilon: float = 1e-4):
+    def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
-        self.d_head = d_head
-        assert d_model % d_head == 0
-        self.n_heads = d_model // d_head
-        self.chunk_size = chunk_size
-        self.epsilon = epsilon
 
     def forward(
         self,
@@ -273,21 +260,11 @@ class DeTokenizer(nn.Module):
             selected_probs = prob[b, token_mask[b]]  # (n_tokens,)
             chunk_probs[b, :selected_probs.shape[0]] = selected_probs
 
-        # Clamp for numerical stability
-        clipped_p = chunk_probs.clamp(min=self.epsilon, max=1 - self.epsilon)
-        dt = torch.log(1 / (1 - clipped_p))  # (B, M)
+        # decay = 1 - p: high boundary prob → low decay (forget the past)
+        decay = (1 - chunk_probs).clamp(0, 1)  # (B, M)
 
-        # Scale input by 1/dt for EMA
-        x_scaled = hidden_states / dt.unsqueeze(-1).clamp(min=1e-8)
-
-        # Initial states for EMA
-        if state is not None:
-            init = rearrange(state, 'b (h p) -> b h p', h=self.n_heads, p=self.d_head)
-        else:
-            init = None
-
-        # Run EMA
-        ema_out = ema_scan(x_scaled, dt, self.n_heads, self.d_head, self.chunk_size, init)
+        # Run EMA: h[t] = decay[t] * h[t-1] + (1 - decay[t]) * x[t]
+        ema_out = ema_scan(hidden_states, decay, state)
         # Zero out invalid positions
         ema_out = ema_out * valid_mask.unsqueeze(-1).to(ema_out.dtype)
 
@@ -459,7 +436,8 @@ class HNet(nn.Module):
         x, pre_state = self.pre_stage(x, state['pre'])
 
         # 2. Residual projection (in fp32 for stability)
-        with torch.autocast(device_type='cuda', enabled=False):
+        device_type = 'cuda' if x.is_cuda else ('mps' if x.is_mps else 'cpu')
+        with torch.autocast(device_type=device_type, enabled=False):
             residual = self.residual_proj(x.float())
 
         # 3. Router — compute boundary probabilities
@@ -607,7 +585,7 @@ class HNetLM(nn.Module):
             main_stage=main_stage,
             post_stage=post_stage,
             router=CosineSimRouter(cfg.d_model),
-            detokenizer=DeTokenizer(cfg.d_model, cfg.d_head_detok, cfg.detok_chunk_size),
+            detokenizer=DeTokenizer(cfg.d_model),
             residual_proj=_make_residual_proj(cfg.d_model),
             pad_parameter=nn.Parameter(torch.zeros(pad_dim)) if pad_dim > 0 else None,
             target_ratio=cfg.target_ratio,

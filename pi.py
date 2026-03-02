@@ -931,6 +931,12 @@ def cmd_zombify(args):
     print("Zombify flag set — pod will not auto-shutdown after runs.")
 
 
+def cmd_mortalize(args):
+    state = require_pod_ready()
+    remote_exec(state, "rm -f ~/.pi_zombify")
+    print("Zombify flag removed — pod will auto-shutdown when idle.")
+
+
 def cmd_fetch(args):
     state = require_pod_ready()
     # Support --run to fetch by run ID
@@ -1164,6 +1170,63 @@ def cmd_history(args):
         print(f"  {cid}. [{c['status']}] {ts} {c['type']}{run_str}: {c['cmd'][:100]}")
 
 
+def _rm_command(s, cmd_id):
+    """Cancel or kill a single command by ID. Caller must hold locked_state()."""
+    cmd_id = str(cmd_id)
+    commands = s.get("commands", {})
+    if cmd_id not in commands:
+        print(f"Error: Command {cmd_id} not found.")
+        sys.exit(1)
+    entry = commands[cmd_id]
+    status = entry["status"]
+    if status in ("completed", "failed", "cancelled"):
+        print(f"Command {cmd_id} already {status}.")
+        return
+    if status == "running":
+        if s.get("pod_id") and s.get("ip"):
+            remote_exec(s, f"tmux send-keys -t {TMUX_SESSION} C-c", check=False)
+            time.sleep(0.5)
+            remote_exec(s, f"rm -f {BUSY_FLAG}", check=False)
+        print(f"Killed running command {cmd_id}.")
+    else:
+        print(f"Cancelled pending command {cmd_id}.")
+    entry["status"] = "cancelled"
+
+
+def cmd_rm(args):
+    """Remove a command — cancel if pending, kill if running."""
+    if args.cmd_id is not None:
+        with locked_state() as s:
+            _rm_command(s, args.cmd_id)
+        return
+
+    # Interactive mode: show active commands and let user pick
+    state = load_state()
+    commands = state.get("commands", {})
+    active = [(cid, c) for cid, c in sorted(commands.items(), key=lambda x: int(x[0]))
+              if c["status"] in ("pending", "running")]
+    if not active:
+        print("No active commands.")
+        return
+
+    for cid, c in active:
+        run_str = f" run {c['run_id']}" if c.get("run_id") else ""
+        print(f"  {cid}. [{c['status']}] {c['type']}{run_str}: {c['cmd'][:100]}")
+
+    print()
+    choice = input("Command ID(s) to remove (comma-separated, or 'all'): ").strip()
+    if not choice:
+        return
+    if choice == "all":
+        ids = [cid for cid, _ in active]
+    else:
+        ids = [x.strip() for x in choice.split(",")]
+
+    with locked_state() as s:
+        for cid in ids:
+            _rm_command(s, cid)
+
+
 def cmd_upload(args):
     state = require_pod_ready()
     run_id, _ = get_run(state, args.run)
@@ -1251,7 +1314,10 @@ def main():
     p_log = sub.add_parser("log", help="Show remote command output log")
     p_log.add_argument("-n", type=int, default=50, help="Number of lines to show (default: 50)")
 
+    p_rm = sub.add_parser("rm", help="Remove a pending or running command")
+    p_rm.add_argument("cmd_id", nargs="?", type=int, default=None, help="Command ID to remove (interactive if omitted)")
     sub.add_parser("zombify", help="Prevent auto-shutdown after runs")
+    sub.add_parser("mortalize", help="Re-enable auto-shutdown after runs")
     sub.add_parser("restart", help="Restart the daemon for the current pod")
     sub.add_parser("reset", help="Kill daemon and clear pod state (keeps run history)")
 
@@ -1274,9 +1340,11 @@ def main():
         "ssh": cmd_ssh,
         "sync": cmd_sync,
         "list": cmd_list,
+        "rm": cmd_rm,
         "upload": cmd_upload,
         "log": cmd_log,
         "zombify": cmd_zombify,
+        "mortalize": cmd_mortalize,
         "restart": cmd_restart,
         "reset": cmd_reset,
     }

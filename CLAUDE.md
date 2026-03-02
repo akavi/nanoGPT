@@ -59,6 +59,7 @@ CLI for Prime Intellect GPU pods. State in `~/.pi/state.json`. Commands queued t
 
 ## Key Conventions
 
+- Trust the invariants. Don't add `Optional`/`None` paths defensively — we own the code and can enforce invariants at the source. If `initial_state()` returns a tensor, the parameter type is `Tensor`, not `Tensor | None`.
 - `state` is explicitly threaded through model forward passes (not hidden in the model) to support both transformer KV-cache and SSM inference state
 - Weight tying between token embeddings and output head is standard
 - `model.mode` switches between "train" and "sample" (affects attention computation)
