@@ -925,6 +925,51 @@ def cmd_resume(args):
     _enqueue_command("resume", resume_cmd, run_id=run_id, force=args.f)
 
 
+def cmd_sweep(args):
+    """Enqueue train + sample for the cartesian product of comma-separated overrides."""
+    import itertools
+
+    require_pod()
+    config = args.config_path
+    overrides = list(args.overrides) if args.overrides else []
+
+    # Partition overrides into sweep (has commas) vs fixed
+    fixed = []
+    sweep_keys = []
+    sweep_values = []
+    for ov in overrides:
+        if "=" in ov and "," in ov.split("=", 1)[1]:
+            key, vals = ov.split("=", 1)
+            sweep_keys.append(key)
+            sweep_values.append(vals.split(","))
+        else:
+            fixed.append(ov)
+
+    if not sweep_keys:
+        print("No comma-separated overrides found — nothing to sweep.")
+        sys.exit(1)
+
+    combos = list(itertools.product(*sweep_values))
+    print(f"Sweep: {len(combos)} runs from {' × '.join(f'{k}={{{",".join(v)}}}' for k, v in zip(sweep_keys, sweep_values))}")
+
+    for combo in combos:
+        combo_overrides = fixed + [f"{k}={v}" for k, v in zip(sweep_keys, combo)]
+        override_str = " ".join(combo_overrides)
+
+        with locked_state() as s:
+            run_id = allocate_run_id(s)
+            s["runs"][str(run_id)]["config"] = config
+            s["runs"][str(run_id)]["overrides"] = combo_overrides
+
+        train_cmd = f"cd ~/nanoGPT && uv run {config} --out_dir=outputs/{run_id} {override_str}".strip()
+        sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample --out_dir=outputs/{run_id} {override_str}".strip()
+
+        label = " ".join(f"{k}={v}" for k, v in zip(sweep_keys, combo))
+        print(f"  Run {run_id}: {label}")
+        _enqueue_command("train", train_cmd, run_id=run_id)
+        _enqueue_command("sample", sample_cmd, run_id=run_id)
+
+
 def cmd_pull(args):
     require_pod()
     cmd = "cd ~/nanoGPT && git fetch && git reset origin/master --hard"
@@ -1323,6 +1368,10 @@ def main():
 
     p_rm = sub.add_parser("rm", help="Remove a pending or running command")
     p_rm.add_argument("cmd_id", nargs="?", type=int, default=None, help="Command ID to remove (interactive if omitted)")
+    p_sweep = sub.add_parser("sweep", help="Sweep: train+sample for cartesian product of comma-separated overrides")
+    p_sweep.add_argument("config_path", help="Config file path")
+    p_sweep.add_argument("overrides", nargs=argparse.REMAINDER, help="Overrides (comma-separated values are swept)")
+
     p_pull = sub.add_parser("pull", help="Git fetch and reset to origin/master on the pod")
     p_pull.add_argument("-f", action="store_true", help="Flush queue and run immediately")
     sub.add_parser("zombify", help="Prevent auto-shutdown after runs")
@@ -1352,6 +1401,7 @@ def main():
         "rm": cmd_rm,
         "upload": cmd_upload,
         "log": cmd_log,
+        "sweep": cmd_sweep,
         "pull": cmd_pull,
         "zombify": cmd_zombify,
         "mortalize": cmd_mortalize,

@@ -38,6 +38,7 @@ overridable = override(sys.argv, {
     "shape": "balanced",       # "balanced" or "narrow_shell"
     "raster": "linear",        # "linear" or "hilbert"
     "ratio_loss_weight": 0.01,
+    "pos_emb": "learned",          # "learned", "rope_1d", or "rope_2d"
 })
 
 # -----------------------------------------------------------------------------#
@@ -84,35 +85,7 @@ config.vocab_size = 256
 config.block_size = overridable['block_size']
 config.bias = overridable['bias']
 config.device = overridable['device']
-
-# -----------------------------------------------------------------------------#
-# Init Model
-# -----------------------------------------------------------------------------#
-
-torch.manual_seed(overridable['seed'])
-meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
-
-model = HNetLM(config)
-
-optimizer_config = OptimizerConfig(
-    weight_decay=1e-1,
-    learning_rate=overridable['learning_rate'],
-    betas=(0.9, 0.95),
-    device=overridable['device'],
-)
-
-mode = overridable['mode']
-if mode == "from_scratch":
-    iter_num = 0
-    best_val_loss = 1e9
-    optimizer = configure_optimizers(model, optimizer_config)
-elif mode == "resume" or mode == "sample":
-    model, optimizer, iter_num, best_val_loss = load_checkpoint(
-        overridable['out_dir'], overridable['device'], model, optimizer_config,
-    )
-    print("Best val loss: ", best_val_loss)
-else:
-    raise ValueError(f"Unsupported mode={mode}")
+config.pos_emb = overridable['pos_emb']
 
 # -----------------------------------------------------------------------------#
 # Rasterization order
@@ -159,6 +132,44 @@ if raster == "hilbert":
         INV_HILBERT_ORDER[li] = i
     HILBERT_ORDER_T = torch.tensor(HILBERT_ORDER, dtype=torch.long)
     INV_HILBERT_ORDER_T = torch.tensor(INV_HILBERT_ORDER, dtype=torch.long)
+
+# Build pos_coords for rope_2d: map each sequence position to (x, y) on the grid
+if overridable['pos_emb'] == 'rope_2d':
+    if raster == 'hilbert':
+        coords_list = [_hilbert_d2xy(max(H, W), d) for d in range(H * W)]
+    else:
+        coords_list = [(i % W, i // W) for i in range(H * W)]
+    # Pad position 0 (BOS) with (0, 0)
+    config.pos_coords = torch.tensor([(0, 0)] + coords_list, dtype=torch.long)
+
+# -----------------------------------------------------------------------------#
+# Init Model
+# -----------------------------------------------------------------------------#
+
+torch.manual_seed(overridable['seed'])
+meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
+
+model = HNetLM(config)
+
+optimizer_config = OptimizerConfig(
+    weight_decay=1e-1,
+    learning_rate=overridable['learning_rate'],
+    betas=(0.9, 0.95),
+    device=overridable['device'],
+)
+
+mode = overridable['mode']
+if mode == "from_scratch":
+    iter_num = 0
+    best_val_loss = 1e9
+    optimizer = configure_optimizers(model, optimizer_config)
+elif mode == "resume" or mode == "sample":
+    model, optimizer, iter_num, best_val_loss = load_checkpoint(
+        overridable['out_dir'], overridable['device'], model, optimizer_config,
+    )
+    print("Best val loss: ", best_val_loss)
+else:
+    raise ValueError(f"Unsupported mode={mode}")
 
 # -----------------------------------------------------------------------------#
 # Data utils
