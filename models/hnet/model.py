@@ -546,9 +546,11 @@ class HNetConfig:
     bias: bool = False
     tie_embeddings: bool = False
     device: str = 'cuda'
+    pos_emb: str = 'learned'       # "learned", "rope_1d", or "rope_2d"
+    pos_coords: Tensor | None = None  # (block_size, 2) int tensor for rope_2d
 
 
-def _make_attn_stage(n_blocks: int, d_model: int, cfg: HNetConfig, block_size: int) -> Stage:
+def _make_attn_stage(n_blocks: int, d_model: int, cfg: HNetConfig, block_size: int, rope_fn=None) -> Stage:
     """Build a Stage of CsaBlock attention layers."""
     from models.model import CsaBlock
     csa_cfg = CsaConfig(
@@ -560,7 +562,7 @@ def _make_attn_stage(n_blocks: int, d_model: int, cfg: HNetConfig, block_size: i
         dropout=cfg.dropout,
     )
     # CsaBlock already does prenorm+residual, so use it directly (no Block wrapper)
-    blocks = [CsaBlock(csa_cfg, i) for i in range(n_blocks)]
+    blocks = [CsaBlock(csa_cfg, i, rope_fn=rope_fn) for i in range(n_blocks)]
     return Stage(blocks, d_model)
 
 
@@ -581,7 +583,10 @@ class HNetLM(nn.Module):
         self.config = config
 
         self.embeddings = nn.Embedding(config.vocab_size, config.d_model)
-        self.wpe = nn.Embedding(config.block_size, config.d_model)
+        if config.pos_emb == 'learned':
+            self.wpe = nn.Embedding(config.block_size, config.d_model)
+        else:
+            self.wpe = None
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.embeddings.weight
@@ -595,9 +600,20 @@ class HNetLM(nn.Module):
         # Estimate inner block_size as block_size / target_ratio
         inner_block_size = max(1, int(cfg.block_size / cfg.target_ratio))
 
-        main_stage = _make_attn_stage(cfg.n_main, cfg.d_inner, cfg, inner_block_size)
-        pre_stage = _make_attn_stage(cfg.n_pre, cfg.d_model, cfg, cfg.block_size)
-        post_stage = _make_attn_stage(cfg.n_post, cfg.d_model, cfg, cfg.block_size)
+        # Build rope_fn closure if using RoPE
+        rope_fn = None
+        if cfg.pos_emb == 'rope_1d':
+            from models.model import apply_rope_1d
+            rope_fn = apply_rope_1d
+        elif cfg.pos_emb == 'rope_2d':
+            from models.model import apply_rope_2d
+            assert cfg.pos_coords is not None, "pos_coords required for rope_2d"
+            coords = cfg.pos_coords
+            rope_fn = lambda q, k, offset: apply_rope_2d(q, k, offset, coords)
+
+        main_stage = _make_attn_stage(cfg.n_main, cfg.d_inner, cfg, inner_block_size, rope_fn=rope_fn)
+        pre_stage = _make_attn_stage(cfg.n_pre, cfg.d_model, cfg, cfg.block_size, rope_fn=rope_fn)
+        post_stage = _make_attn_stage(cfg.n_post, cfg.d_model, cfg, cfg.block_size, rope_fn=rope_fn)
 
         pad_dim = cfg.d_inner - cfg.d_model
         return HNet(
@@ -627,8 +643,9 @@ class HNetLM(nn.Module):
         from utils import decay_nodecay_groups
         # Embeddings + lm_head at scale 1.0
         embed_params = list(self.embeddings.parameters()) + \
-                       list(self.wpe.parameters()) + \
                        list(self.lm_head.parameters())
+        if self.wpe is not None:
+            embed_params += list(self.wpe.parameters())
         groups = decay_nodecay_groups(embed_params)
         # Backbone gets recursive scaling
         groups += self.backbone.optim_groups()
@@ -636,11 +653,12 @@ class HNetLM(nn.Module):
 
     def forward(self, idx: Tensor, state, targets: Tensor | None = None):
         """TrainModel protocol: (logits, state, loss, metrics)."""
-        # Compute position offset from pre_stage KV cache
-        offset = state['pre'][0][0].size(2)  # cached seq len
         L = idx.size(1)
-        pos = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
-        x = self.embeddings(idx) + self.wpe(pos)  # (B, L, D)
+        x = self.embeddings(idx)
+        if self.wpe is not None:
+            offset = state['pre'][0][0].size(2)  # cached seq len
+            pos = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
+            x = x + self.wpe(pos)
         x, state, ratio_loss, metrics = self.backbone(x, state)
 
         if targets is not None:

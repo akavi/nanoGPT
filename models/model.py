@@ -55,9 +55,49 @@ class LazyWrapper(nn.Module):
         return 0
 
 
+def _rope_freqs(head_dim: int, max_len: int, device: torch.device, base: float = 10000.0) -> Tensor:
+    """Precompute complex RoPE frequencies: (max_len, head_dim//2) complex64."""
+    freqs = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    t = torch.arange(max_len, device=device).float()
+    angles = torch.outer(t, freqs)  # (max_len, head_dim//2)
+    return torch.polar(torch.ones_like(angles), angles)  # complex64
+
+
+def _apply_rope(x: Tensor, freqs: Tensor) -> Tensor:
+    """Apply rotary embeddings to x: (B, n_head, T, head_dim)."""
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    x_rot = x_complex * freqs
+    return torch.view_as_real(x_rot).flatten(-2).to(x.dtype)
+
+
+def apply_rope_1d(q: Tensor, k: Tensor, offset: int) -> tuple[Tensor, Tensor]:
+    """Standard 1D RoPE. q, k: (B, n_head, T, head_dim)."""
+    T, head_dim = q.shape[2], q.shape[3]
+    freqs = _rope_freqs(head_dim, offset + T, q.device)
+    freqs = freqs[offset:offset + T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim//2)
+    return _apply_rope(q, freqs), _apply_rope(k, freqs)
+
+
+def apply_rope_2d(q: Tensor, k: Tensor, offset: int, coords: Tensor) -> tuple[Tensor, Tensor]:
+    """2D RoPE using (x,y) coordinate lookup. coords: (block_size, 2) int tensor.
+    Splits head_dim in half, applies separate rotary frequencies for x and y."""
+    T, head_dim = q.shape[2], q.shape[3]
+    half = head_dim // 2
+    max_coord = int(coords.max().item()) + 1
+    freqs_x = _rope_freqs(half, max_coord, q.device)
+    freqs_y = _rope_freqs(half, max_coord, q.device)
+
+    pos_coords = coords[offset:offset + T]  # (T, 2)
+    fx = freqs_x[pos_coords[:, 0]].unsqueeze(0).unsqueeze(0)  # (1, 1, T, half//2)
+    fy = freqs_y[pos_coords[:, 1]].unsqueeze(0).unsqueeze(0)
+    freqs = torch.cat([fx, fy], dim=-1)  # (1, 1, T, head_dim//2)
+
+    return _apply_rope(q, freqs), _apply_rope(k, freqs)
+
+
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, rope_fn=None):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.layer_idx = layer_idx
@@ -65,6 +105,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_counts = {}
         self.use_decay = config.use_decay
         self.dropout = config.dropout
+        self.rope_fn = rope_fn
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -90,10 +131,14 @@ class CausalSelfAttention(nn.Module):
 
         # fold: concatenate with cached k,v (identity = zero-length tensors)
         cached_k, cached_v = state
+        offset = cached_k.size(2)
+
+        # Apply RoPE before concatenating with cache (cache already has RoPE applied)
+        if self.rope_fn is not None:
+            q, k = self.rope_fn(q, k, offset)
         k = torch.cat([cached_k, k], dim=2)
         v = torch.cat([cached_v, v], dim=2)
         T_full = k.size(2)
-        offset = T_full - T
 
         # causal mask: new queries attend to all cached keys + causal within new tokens
         neg_inf = torch.finfo(torch.float32).min
@@ -154,13 +199,13 @@ class CsaConfig:
 
 class CsaBlock(nn.Module):
 
-    def __init__(self, config, layer):
+    def __init__(self, config, layer, rope_fn=None):
         super().__init__()
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.block_size = config.block_size
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config, layer)
+        self.attn = CausalSelfAttention(config, layer, rope_fn=rope_fn)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config.n_embd, bias=config.bias, dropout=config.dropout)
 

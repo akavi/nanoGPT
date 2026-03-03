@@ -925,6 +925,13 @@ def cmd_resume(args):
     _enqueue_command("resume", resume_cmd, run_id=run_id, force=args.f)
 
 
+def cmd_pull(args):
+    require_pod()
+    cmd = "cd ~/nanoGPT && git fetch && git reset origin/master --hard"
+    _enqueue_command("run", cmd, force=args.f)
+    print("Queued git pull (fetch + reset to origin/master).")
+
+
 def cmd_zombify(args):
     state = require_pod_ready()
     remote_exec(state, "touch ~/.pi_zombify")
@@ -1316,6 +1323,8 @@ def main():
 
     p_rm = sub.add_parser("rm", help="Remove a pending or running command")
     p_rm.add_argument("cmd_id", nargs="?", type=int, default=None, help="Command ID to remove (interactive if omitted)")
+    p_pull = sub.add_parser("pull", help="Git fetch and reset to origin/master on the pod")
+    p_pull.add_argument("-f", action="store_true", help="Flush queue and run immediately")
     sub.add_parser("zombify", help="Prevent auto-shutdown after runs")
     sub.add_parser("mortalize", help="Re-enable auto-shutdown after runs")
     sub.add_parser("restart", help="Restart the daemon for the current pod")
@@ -1343,6 +1352,7 @@ def main():
         "rm": cmd_rm,
         "upload": cmd_upload,
         "log": cmd_log,
+        "pull": cmd_pull,
         "zombify": cmd_zombify,
         "mortalize": cmd_mortalize,
         "restart": cmd_restart,
