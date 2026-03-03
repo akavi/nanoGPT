@@ -219,31 +219,35 @@ def load_checkpoint(
 
     return model, optimizer, checkpoint["iter_num"], checkpoint["best_val_loss"]
 
+def decay_nodecay_groups(params, lr_scale: float = 1.0) -> list[dict]:
+    """Split params into decay (dim >= 2) and no-decay groups."""
+    params = [p for p in params if p.requires_grad]
+    decay = [p for p in params if p.dim() >= 2]
+    nodecay = [p for p in params if p.dim() < 2]
+    groups = []
+    if decay:
+        groups.append({'params': decay, 'weight_decay': 1.0, 'lr_scale': lr_scale})
+    if nodecay:
+        groups.append({'params': nodecay, 'weight_decay': 0.0, 'lr_scale': lr_scale})
+    return groups
+
 def configure_optimizers(model, config):
-    # start with all of the candidate parameters
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    # filter out those that do not require grad
-    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-    # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': config.weight_decay},
-        {'params': nodecay_params, 'weight_decay': 0.0}
-    ]
-    num_decay_params = sum(p.numel() for p in decay_params)
-    num_nodecay_params = sum(p.numel() for p in nodecay_params)
-    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+    optim_groups = model.optim_groups()
+    for g in optim_groups:
+        g['weight_decay'] *= config.weight_decay
+    num_decay_params = sum(p.numel() for g in optim_groups if g['weight_decay'] > 0 for p in g['params'])
+    num_nodecay_params = sum(p.numel() for g in optim_groups if g['weight_decay'] == 0 for p in g['params'])
+    print(f"num decayed parameter tensors: {sum(len(g['params']) for g in optim_groups if g['weight_decay'] > 0)}, with {num_decay_params:,} parameters")
+    print(f"num non-decayed parameter tensors: {sum(len(g['params']) for g in optim_groups if g['weight_decay'] == 0)}, with {num_nodecay_params:,} parameters")
     # Create AdamW optimizer and use the fused version if it is available
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and "cuda" in config.device
     extra_args = dict(fused=True) if use_fused else dict()
     print(f"using fused AdamW: {use_fused}")
+    # lr=0 here; actual lr is set per-group in the training loop via lr_scale
     return torch.optim.AdamW(
         optim_groups,
-        lr=config.learning_rate,
+        lr=0,
         betas=config.betas,
         **extra_args
     )

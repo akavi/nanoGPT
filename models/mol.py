@@ -125,6 +125,10 @@ class MoL(nn.Module):
 
         return x
 
+    def optim_groups(self) -> list[dict]:
+        from utils import decay_nodecay_groups
+        return decay_nodecay_groups(self.parameters())
+
     def initial_state(self, batch_size):
         return self.backbone.initial_state(batch_size)
 

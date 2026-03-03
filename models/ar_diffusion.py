@@ -286,6 +286,10 @@ class ArDiffusion(nn.Module):
         return tok
     
     
+    def optim_groups(self) -> list[dict]:
+        from utils import decay_nodecay_groups
+        return decay_nodecay_groups(self.parameters())
+
     def initial_state(self, batch_size):
         output_buf = torch.zeros(batch_size, 1, self.n_step, self.n_embd_per_step, device=self.device)
         return (output_buf, self.backbone.initial_state(batch_size))

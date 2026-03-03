@@ -494,6 +494,26 @@ class HNet(nn.Module):
         }
         return x, new_state, aux_loss, metrics
 
+    def optim_groups(self, lr_scale: float = 1.0) -> list[dict]:
+        from utils import decay_nodecay_groups
+        # Outer params: pre/post stages, router, residual_proj, detokenizer, pad
+        outer_params = list(self.pre_stage.parameters()) + \
+                       list(self.post_stage.parameters()) + \
+                       list(self.router.parameters()) + \
+                       list(self.residual_proj.parameters()) + \
+                       list(self.detokenizer.parameters())
+        if self.pad_parameter is not None:
+            outer_params.append(self.pad_parameter)
+        groups = decay_nodecay_groups(outer_params, lr_scale)
+
+        # Main stage: lower LR (divided by target_ratio), recurse if nested
+        inner_scale = lr_scale / self.target_ratio
+        if isinstance(self.main_stage, HNet):
+            groups += self.main_stage.optim_groups(lr_scale=inner_scale)
+        else:
+            groups += decay_nodecay_groups(self.main_stage.parameters(), inner_scale)
+        return groups
+
     def initial_state(self, batch_size, device='cpu'):
         return {
             'pre': self.pre_stage.initial_state(batch_size),
@@ -602,6 +622,17 @@ class HNetLM(nn.Module):
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+    def optim_groups(self) -> list[dict]:
+        from utils import decay_nodecay_groups
+        # Embeddings + lm_head at scale 1.0
+        embed_params = list(self.embeddings.parameters()) + \
+                       list(self.wpe.parameters()) + \
+                       list(self.lm_head.parameters())
+        groups = decay_nodecay_groups(embed_params)
+        # Backbone gets recursive scaling
+        groups += self.backbone.optim_groups()
+        return groups
 
     def forward(self, idx: Tensor, state, targets: Tensor | None = None):
         """TrainModel protocol: (logits, state, loss, metrics)."""

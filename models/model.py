@@ -360,6 +360,10 @@ class GPT(nn.Module):
         return logits, state, loss, {}
 
 
+    def optim_groups(self) -> list[dict]:
+        from utils import decay_nodecay_groups
+        return decay_nodecay_groups(self.parameters())
+
     def initial_state(self, batch_size):
         return list(map(lambda block: block.initial_state(batch_size), self.transformer.backbone))
 

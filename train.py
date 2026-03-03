@@ -34,6 +34,7 @@ class TrainModel(Protocol):
 
     def initial_state(self, batch_size: int) -> Any: ...
     def estimate_mfu(self, batch_size: int, dt: float) -> float: ...
+    def optim_groups(self) -> list[dict]: ...
 
     def __call__(
         self,
@@ -124,9 +125,9 @@ def train(
 
     while True:
         lr = get_lr(iter_num, config) if config.decay_lr else config.learning_rate
-        # learning rate
+        # learning rate — scale per group
         for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            param_group["lr"] = lr * param_group["lr_scale"]
 
         # eval + checkpoint
         if iter_num % config.eval_interval == 0:
