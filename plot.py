@@ -1,6 +1,7 @@
 """Plot metrics from training logs.
 
 Usage: uv run plot.py 88:ce_loss,log(loss),scale(mfu,1000),smooth(loss,50) 90:loss
+       uv run plot.py 88,90,91:loss,mfu   # cartesian product: all runs × all metrics
 
 Transforms:
   metric        — raw values
@@ -66,8 +67,9 @@ def eval_expr(expr: str, data: list[dict]) -> tuple[str, list[float]]:
         raise ValueError(f"Unknown transform: {func}")
 
 
-def parse_spec(spec: str) -> tuple[str, list[str]]:
-    run_id, rest = spec.split(":", 1)
+def parse_spec(spec: str) -> list[tuple[str, list[str]]]:
+    lhs, rest = spec.split(":", 1)
+    run_ids = [r.strip() for r in lhs.split(",")]
     # Split on commas not inside parentheses
     exprs = []
     depth = 0
@@ -83,7 +85,7 @@ def parse_spec(spec: str) -> tuple[str, list[str]]:
             continue
         current.append(ch)
     exprs.append("".join(current))
-    return run_id, exprs
+    return [(run_id, exprs) for run_id in run_ids]
 
 
 def main():
@@ -123,7 +125,7 @@ def main():
             current.append(ch)
         if current:
             args.append("".join(current))
-    specs = [parse_spec(s) for s in args]
+    specs = [pair for s in args for pair in parse_spec(s)]
 
     fig, ax = plt.subplots()
     for run_id, exprs in specs:

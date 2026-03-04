@@ -15,14 +15,11 @@ Architecture at each level:
 Everything in one file, reusing Mamba2/ssd from models/mamba.py.
 """
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from models.mamba import RMSNorm
-from models.model import CsaConfig
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +170,8 @@ class CosineSimRouter(nn.Module):
 
         return prob, token_mask, new_state
 
-    def initial_state(self, batch_size, device='cpu'):
+    def initial_state(self, batch_size):
+        device = next(self.parameters()).device
         return (
             torch.zeros(batch_size, self.d_model, device=device),
             torch.zeros(batch_size, device=device, dtype=torch.bool),
@@ -226,6 +224,7 @@ class DeTokenizer(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
         self.d_model = d_model
+        self.register_buffer('_device_buf', torch.empty(0), persistent=False)
 
     def forward(
         self,
@@ -300,7 +299,8 @@ class DeTokenizer(nn.Module):
 
         return output, new_state
 
-    def initial_state(self, batch_size, device='cpu'):
+    def initial_state(self, batch_size):
+        device = self._device_buf.device
         return torch.zeros(batch_size, self.d_model, device=device)
 
 
@@ -382,10 +382,9 @@ class MLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 class HNet(nn.Module):
-    """One level of the H-Net hierarchy.
+    """One level of the H-Net hierarchy. Recursable.
 
-    Contains:
-        pre_stage -> router -> tokenizer -> main_stage -> detokenizer -> post_stage
+    pre_stage -> router -> tokenizer -> main_stage -> detokenizer -> post_stage
 
     main_stage can be either a Stage (leaf) or another HNet (nested).
     """
@@ -399,7 +398,7 @@ class HNet(nn.Module):
         router: CosineSimRouter,
         detokenizer: DeTokenizer,
         residual_proj: nn.Linear,
-        pad_parameter: nn.Parameter | None = None,
+        pad_parameter: nn.Parameter | None,
         target_ratio: float = 4.0,
     ):
         super().__init__()
@@ -412,10 +411,7 @@ class HNet(nn.Module):
         self.detokenizer = detokenizer
         self.residual_proj = residual_proj
         self.target_ratio = target_ratio
-        if pad_parameter is not None:
-            self.pad_parameter = pad_parameter
-        else:
-            self.pad_parameter = None
+        self.pad_parameter = pad_parameter
 
     def _ratio_loss(self, prob: Tensor, token_mask: Tensor) -> Tensor:
         """Ratio loss to regularize compression toward target_ratio.
@@ -466,7 +462,6 @@ class HNet(nn.Module):
             if isinstance(self.main_stage, HNet):
                 chunked, main_state, inner_aux, inner_metrics = self.main_stage(chunked, state['main'])
                 aux_loss = aux_loss + inner_aux
-                # prefix inner metrics to distinguish levels
                 for k, v in inner_metrics.items():
                     metrics[f'inner_{k}'] = v
             else:
@@ -496,7 +491,6 @@ class HNet(nn.Module):
 
     def optim_groups(self, lr_scale: float = 1.0) -> list[dict]:
         from utils import decay_nodecay_groups
-        # Outer params: pre/post stages, router, residual_proj, detokenizer, pad
         outer_params = list(self.pre_stage.parameters()) + \
                        list(self.post_stage.parameters()) + \
                        list(self.router.parameters()) + \
@@ -506,7 +500,6 @@ class HNet(nn.Module):
             outer_params.append(self.pad_parameter)
         groups = decay_nodecay_groups(outer_params, lr_scale)
 
-        # Main stage: lower LR (divided by target_ratio), recurse if nested
         inner_scale = lr_scale / self.target_ratio
         if isinstance(self.main_stage, HNet):
             groups += self.main_stage.optim_groups(lr_scale=inner_scale)
@@ -514,142 +507,42 @@ class HNet(nn.Module):
             groups += decay_nodecay_groups(self.main_stage.parameters(), inner_scale)
         return groups
 
-    def initial_state(self, batch_size, device='cpu'):
+    def initial_state(self, batch_size):
         return {
             'pre': self.pre_stage.initial_state(batch_size),
-            'main': self.main_stage.initial_state(batch_size, device=device) if isinstance(self.main_stage, HNet) else self.main_stage.initial_state(batch_size),
+            'main': self.main_stage.initial_state(batch_size),
             'post': self.post_stage.initial_state(batch_size),
-            'router': self.router.initial_state(batch_size, device=device),
-            'detokenizer': self.detokenizer.initial_state(batch_size, device=device),
+            'router': self.router.initial_state(batch_size),
+            'detokenizer': self.detokenizer.initial_state(batch_size),
         }
 
-
-# ---------------------------------------------------------------------------
-# HNetLM — CausalLM wrapper conforming to TrainModel protocol
-# ---------------------------------------------------------------------------
-
-@dataclass
-class HNetConfig:
-    vocab_size: int = 256
-    d_model: int = 128        # outer (shell) dimension
-    d_inner: int = 384        # inner (core) dimension
-    n_head: int = 8           # attention heads (used at both levels)
-    n_pre: int = 1            # pre/post attention blocks (shell)
-    n_post: int = 1
-    n_main: int = 10          # main stage attention blocks (core)
-    block_size: int = 1024    # max sequence length
-    d_head_detok: int = 32
-    detok_chunk_size: int = 256
-    target_ratio: float = 4.0
-    ratio_loss_weight: float = 0.01
-    dropout: float = 0.0
-    bias: bool = False
-    tie_embeddings: bool = False
-    device: str = 'cuda'
-    pos_emb: str = 'learned'       # "learned", "rope_1d", or "rope_2d"
-    pos_coords: Tensor | None = None  # (block_size, 2) int tensor for rope_2d
-
-
-def _make_attn_stage(n_blocks: int, d_model: int, cfg: HNetConfig, block_size: int, rope_fn=None) -> Stage:
-    """Build a Stage of CsaBlock attention layers."""
-    from models.model import CsaBlock
-    csa_cfg = CsaConfig(
-        n_head=cfg.n_head,
-        n_embd=d_model,
-        n_step=1,
-        block_size=block_size,
-        bias=cfg.bias,
-        dropout=cfg.dropout,
-    )
-    # CsaBlock already does prenorm+residual, so use it directly (no Block wrapper)
-    blocks = [CsaBlock(csa_cfg, i, rope_fn=rope_fn) for i in range(n_blocks)]
-    return Stage(blocks, d_model)
-
-
-def _make_residual_proj(d_model: int) -> nn.Linear:
-    proj = nn.Linear(d_model, d_model, bias=True, dtype=torch.float32)
-    nn.init.eye_(proj.weight)
-    nn.init.zeros_(proj.bias)
-    proj.weight._no_reinit = True
-    proj.bias._no_reinit = True
-    return proj
+    def flops_per_fwdbwd(self):
+        return self.pre_stage.flops_per_fwdbwd() + \
+               self.main_stage.flops_per_fwdbwd() + \
+               self.post_stage.flops_per_fwdbwd()
 
 
 class HNetLM(nn.Module):
-    """H-Net Language Model. Conforms to TrainModel protocol."""
+    """H-Net Language Model wrapper. Conforms to TrainModel protocol.
 
-    def __init__(self, config: HNetConfig):
+    Wraps a fully-assembled HNet backbone with token embeddings, positional
+    embeddings, and an LM head.
+    """
+
+    def __init__(
+        self,
+        backbone: HNet,
+        embeddings: nn.Embedding,
+        lm_head: nn.Linear,
+        wpe: nn.Embedding | None = None,
+        ratio_loss_weight: float = 0.01,
+    ):
         super().__init__()
-        self.config = config
-
-        self.embeddings = nn.Embedding(config.vocab_size, config.d_model)
-        if config.pos_emb == 'learned':
-            self.wpe = nn.Embedding(config.block_size, config.d_model)
-        else:
-            self.wpe = None
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        if config.tie_embeddings:
-            self.lm_head.weight = self.embeddings.weight
-
-        self.backbone = self._build_backbone(config)
-
-        self.apply(self._init_weights)
-        print(f"number of parameters: {self.get_num_params()/1e6:.2f}M")
-
-    def _build_backbone(self, cfg: HNetConfig) -> HNet:
-        # Estimate inner block_size as block_size / target_ratio
-        inner_block_size = max(1, int(cfg.block_size / cfg.target_ratio))
-
-        # Build rope_fn closure if using RoPE
-        rope_fn = None
-        if cfg.pos_emb == 'rope_1d':
-            from models.model import apply_rope_1d
-            rope_fn = apply_rope_1d
-        elif cfg.pos_emb == 'rope_2d':
-            from models.model import apply_rope_2d
-            assert cfg.pos_coords is not None, "pos_coords required for rope_2d"
-            coords = cfg.pos_coords
-            rope_fn = lambda q, k, offset: apply_rope_2d(q, k, offset, coords)
-
-        main_stage = _make_attn_stage(cfg.n_main, cfg.d_inner, cfg, inner_block_size, rope_fn=rope_fn)
-        pre_stage = _make_attn_stage(cfg.n_pre, cfg.d_model, cfg, cfg.block_size, rope_fn=rope_fn)
-        post_stage = _make_attn_stage(cfg.n_post, cfg.d_model, cfg, cfg.block_size, rope_fn=rope_fn)
-
-        pad_dim = cfg.d_inner - cfg.d_model
-        return HNet(
-            d_model=cfg.d_model,
-            pre_stage=pre_stage,
-            main_stage=main_stage,
-            post_stage=post_stage,
-            router=CosineSimRouter(cfg.d_model),
-            detokenizer=DeTokenizer(cfg.d_model),
-            residual_proj=_make_residual_proj(cfg.d_model),
-            pad_parameter=nn.Parameter(torch.zeros(pad_dim)) if pad_dim > 0 else None,
-            target_ratio=cfg.target_ratio,
-        )
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear) and not getattr(module.weight, '_no_reinit', False):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None and not getattr(module.bias, '_no_reinit', False):
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def get_num_params(self):
-        return sum(p.numel() for p in self.parameters())
-
-    def optim_groups(self) -> list[dict]:
-        from utils import decay_nodecay_groups
-        # Embeddings + lm_head at scale 1.0
-        embed_params = list(self.embeddings.parameters()) + \
-                       list(self.lm_head.parameters())
-        if self.wpe is not None:
-            embed_params += list(self.wpe.parameters())
-        groups = decay_nodecay_groups(embed_params)
-        # Backbone gets recursive scaling
-        groups += self.backbone.optim_groups()
-        return groups
+        self.backbone = backbone
+        self.embeddings = embeddings
+        self.lm_head = lm_head
+        self.wpe = wpe
+        self.ratio_loss_weight = ratio_loss_weight
 
     def forward(self, idx: Tensor, state, targets: Tensor | None = None):
         """TrainModel protocol: (logits, state, loss, metrics)."""
@@ -670,7 +563,7 @@ class HNetLM(nn.Module):
             )
             metrics['ce_loss'] = loss.item()
             metrics['ratio_loss'] = ratio_loss.item()
-            loss = loss + self.config.ratio_loss_weight * ratio_loss
+            loss = loss + self.ratio_loss_weight * ratio_loss
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
@@ -678,12 +571,20 @@ class HNetLM(nn.Module):
         return logits, state, loss, metrics
 
     def initial_state(self, batch_size):
-        device = next(self.parameters()).device
-        return self.backbone.initial_state(batch_size, device=device)
+        return self.backbone.initial_state(batch_size)
+
+    def optim_groups(self) -> list[dict]:
+        from utils import decay_nodecay_groups
+        embed_params = list(self.embeddings.parameters()) + \
+                       list(self.lm_head.parameters())
+        if self.wpe is not None:
+            embed_params += list(self.wpe.parameters())
+        groups = decay_nodecay_groups(embed_params)
+        groups += self.backbone.optim_groups()
+        return groups
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
-        # Process the prompt
         for _ in range(max_new_tokens):
             logits, state, _, _ = self(idx, state)
             logits = logits[:, -1, :] / temperature
@@ -695,10 +596,20 @@ class HNetLM(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear) and not getattr(module.weight, '_no_reinit', False):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None and not getattr(module.bias, '_no_reinit', False):
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         return -1.0
 
     def flops_per_fwdbwd(self):
-        return self.backbone.pre_stage.flops_per_fwdbwd() + \
-               self.backbone.main_stage.flops_per_fwdbwd() + \
-               self.backbone.post_stage.flops_per_fwdbwd()
+        return self.backbone.flops_per_fwdbwd()
+

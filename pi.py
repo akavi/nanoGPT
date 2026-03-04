@@ -879,7 +879,7 @@ def cmd_train(args):
     config = args.config_path
     overrides = list(args.overrides) if args.overrides else []
 
-    override_str = " ".join(overrides)
+    override_str = " ".join(shlex.quote(o) for o in overrides)
     with locked_state() as s:
         run_id = allocate_run_id(s)
         s["runs"][str(run_id)]["config"] = config
@@ -901,7 +901,7 @@ def cmd_sample(args):
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    override_str = " ".join(overrides)
+    override_str = " ".join(shlex.quote(o) for o in overrides)
     sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample --out_dir=outputs/{run_id} {override_str}".strip()
 
     print(f"Sampling run {run_id}: {config} → outputs/{run_id}/")
@@ -918,7 +918,7 @@ def cmd_resume(args):
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    override_str = " ".join(overrides)
+    override_str = " ".join(shlex.quote(o) for o in overrides)
     resume_cmd = f"cd ~/nanoGPT && uv run {config} --mode=resume --out_dir=outputs/{run_id} {override_str}".strip()
 
     print(f"Resuming run {run_id}: {config} → outputs/{run_id}/")
@@ -954,7 +954,7 @@ def cmd_sweep(args):
 
     for combo in combos:
         combo_overrides = fixed + [f"{k}={v}" for k, v in zip(sweep_keys, combo)]
-        override_str = " ".join(combo_overrides)
+        override_str = " ".join(shlex.quote(o) for o in combo_overrides)
 
         with locked_state() as s:
             run_id = allocate_run_id(s)
