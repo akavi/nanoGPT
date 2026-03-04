@@ -50,37 +50,19 @@ def ema_scan(
     decay: Tensor,           # (B, L) — decay factors in [0, 1]
     initial_state: Tensor,   # (B, D)
 ) -> Tensor:
-    """Parallel-scan EMA: h[t] = decay[t] * h[t-1] + (1 - decay[t]) * x[t].
+    """Sequential EMA: h[t] = decay[t] * h[t-1] + (1 - decay[t]) * x[t].
 
-    Uses the associative scan identity:
-        (a2, b2) ∘ (a1, b1) = (a2 * a1, a2 * b1 + b2)
-    where a[t] = decay[t], b[t] = (1 - decay[t]) * x[t].
-
-    All arithmetic stays in [0, 1] for the decay terms, so no overflow.
+    O(L) work, O(1) autograd memory (only saves h and inputs, not O(log L)
+    intermediates like the Hillis-Steele parallel scan).
     """
     B, L, D = x.shape
-
-    # a[t] = decay[t], b[t] = (1 - decay[t]) * x[t]
-    a = decay.unsqueeze(-1).expand(B, L, D)       # (B, L, D)
-    b = (1 - decay).unsqueeze(-1).expand(B, L, D) * x  # (B, L, D)
-
-    # Fold initial state into the first position:
-    # h[0] = decay[0] * init + (1 - decay[0]) * x[0]
-    #       = a[0] * init + b[0]
-    b = torch.cat([b[:, :1] + a[:, :1] * initial_state.unsqueeze(1), b[:, 1:]], dim=1)
-
-    # Hillis-Steele parallel prefix scan (out-of-place for autograd)
-    # Each step combines element i with element i-stride.
-    # O(L log L) work, O(log L) depth — simple and correct.
-    stride = 1
-    while stride < L:
-        b = torch.cat([b[:, :stride],
-                        a[:, stride:] * b[:, :-stride] + b[:, stride:]], dim=1)
-        a = torch.cat([a[:, :stride],
-                        a[:, stride:] * a[:, :-stride]], dim=1)
-        stride *= 2
-
-    return b  # b now holds h[t] at each position
+    h = initial_state  # (B, D)
+    outputs = []
+    for t in range(L):
+        d = decay[:, t].unsqueeze(-1)          # (B, 1)
+        h = d * h + (1 - d) * x[:, t]          # (B, D)
+        outputs.append(h)
+    return torch.stack(outputs, dim=1)          # (B, L, D)
 
 
 # ---------------------------------------------------------------------------
@@ -193,25 +175,36 @@ class Tokenizer(nn.Module):
         self,
         hidden_states: Tensor,  # (B, L, D)
         token_mask: Tensor,     # (B, L) bool
-    ) -> tuple[Tensor, Tensor]:
+        positions: Tensor | None = None,  # (L,) original position indices
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         """
         Returns:
             chunked: (B, M, D) where M = max tokens in any batch element
             counts: (B,) number of tokens per batch element
+            selected_positions: (M,) position indices of selected tokens (from batch 0)
         """
         B, L, D = hidden_states.shape
         counts = token_mask.sum(dim=1)  # (B,)
         M = int(counts.max().item())
 
         if M == 0:
-            return hidden_states.new_zeros(B, 0, D), counts
+            return hidden_states.new_zeros(B, 0, D), counts, None
 
         chunked = hidden_states.new_zeros(B, M, D)
         for b in range(B):
             selected = hidden_states[b, token_mask[b]]  # (n_tokens, D)
             chunked[b, :selected.shape[0]] = selected
 
-        return chunked, counts
+        # Compute selected positions from batch 0 (positions are shared across batch)
+        if positions is not None:
+            sel_pos = positions[token_mask[0]]  # (n_tokens_b0,)
+            # Pad to M
+            selected_positions = torch.zeros(M, dtype=torch.long, device=positions.device)
+            selected_positions[:sel_pos.shape[0]] = sel_pos
+        else:
+            selected_positions = None
+
+        return chunked, counts, selected_positions
 
 
 class DeTokenizer(nn.Module):
@@ -336,10 +329,10 @@ class Stage(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x: Tensor, state: list) -> tuple[Tensor, list]:
+    def forward(self, x: Tensor, state: list, positions: Tensor | None = None) -> tuple[Tensor, list]:
         new_state = []
         for block, s in zip(self.blocks, state):
-            x, s_new = block(x, s)
+            x, s_new = block(x, s, positions=positions)
             new_state.append(s_new)
         x = self.final_norm(x)
         return x, new_state
@@ -425,11 +418,11 @@ class HNet(nn.Module):
         G = prob.mean()
         return (N / (N - 1)) * ((N - 1) * F * G + (1 - F) * (1 - G))
 
-    def forward(self, x: Tensor, state: dict) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
+    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
         B, L, D = x.shape
 
         # 1. Pre-stage (encoder)
-        x, pre_state = self.pre_stage(x, state['pre'])
+        x, pre_state = self.pre_stage(x, state['pre'], positions=positions)
 
         # 2. Residual projection (in fp32 for stability)
         device_type = 'cuda' if x.is_cuda else ('mps' if x.is_mps else 'cpu')
@@ -443,7 +436,7 @@ class HNet(nn.Module):
         aux_loss = self._ratio_loss(prob, token_mask)
 
         # 5. Tokenize — compact to boundary positions
-        chunked, counts = self.tokenizer(x, token_mask)
+        chunked, counts, inner_positions = self.tokenizer(x, token_mask, positions=positions)
 
         # Track compression ratio: input_len / num_boundary_tokens
         n_tokens_selected = token_mask.float().sum(dim=1).mean().item()
@@ -460,12 +453,12 @@ class HNet(nn.Module):
         M = chunked.shape[1]
         if M > 0:
             if isinstance(self.main_stage, HNet):
-                chunked, main_state, inner_aux, inner_metrics = self.main_stage(chunked, state['main'])
+                chunked, main_state, inner_aux, inner_metrics = self.main_stage(chunked, state['main'], positions=inner_positions)
                 aux_loss = aux_loss + inner_aux
                 for k, v in inner_metrics.items():
                     metrics[f'inner_{k}'] = v
             else:
-                chunked, main_state = self.main_stage(chunked, state['main'])
+                chunked, main_state = self.main_stage(chunked, state['main'], positions=inner_positions)
         else:
             main_state = state['main']
 
@@ -478,7 +471,7 @@ class HNet(nn.Module):
         )
 
         # 10. Post-stage (decoder)
-        x, post_state = self.post_stage(x, state['post'])
+        x, post_state = self.post_stage(x, state['post'], positions=positions)
 
         new_state = {
             'pre': pre_state,
@@ -547,12 +540,12 @@ class HNetLM(nn.Module):
     def forward(self, idx: Tensor, state, targets: Tensor | None = None):
         """TrainModel protocol: (logits, state, loss, metrics)."""
         L = idx.size(1)
+        offset = state['pre'][0][0].size(2)  # cached seq len
+        positions = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
         x = self.embeddings(idx)
         if self.wpe is not None:
-            offset = state['pre'][0][0].size(2)  # cached seq len
-            pos = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
-            x = x + self.wpe(pos)
-        x, state, ratio_loss, metrics = self.backbone(x, state)
+            x = x + self.wpe(positions)
+        x, state, ratio_loss, metrics = self.backbone(x, state, positions=positions)
 
         if targets is not None:
             logits = self.lm_head(x)
@@ -585,8 +578,10 @@ class HNetLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
+        # Feed prompt or single token, sample, repeat
+        cur = idx
         for _ in range(max_new_tokens):
-            logits, state, _, _ = self(idx, state)
+            logits, state, _, _ = self(cur, state)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -594,6 +589,7 @@ class HNetLM(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
+            cur = idx_next  # subsequent iterations feed only the new token
         return idx
 
     def _init_weights(self, module):

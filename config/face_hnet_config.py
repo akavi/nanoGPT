@@ -247,10 +247,15 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn):
 
 
 def make_hnet(
-    shape_str, block_size, vocab_size,
-    n_head=8, bias=False, dropout=0.0,
+    shape_str,
+    block_size,
+    vocab_size,
+    n_head=8, 
+    bias=False,
+    dropout=0.0,
     ratio_loss_weight=0.01,
-    pos_emb='learned', pos_coords=None,
+    pos_emb='learned',
+    pos_coords=None,
 ):
     nn = torch.nn
     parsed = parse_shape(shape_str)
@@ -264,7 +269,7 @@ def make_hnet(
         from models.model import apply_rope_2d
         assert pos_coords is not None, "pos_coords required for rope_2d"
         coords = pos_coords
-        rope_fn = lambda q, k, offset: apply_rope_2d(q, k, offset, coords)
+        rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
 
     backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn)
 

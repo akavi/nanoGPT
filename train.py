@@ -167,6 +167,7 @@ def train(
             # prefetch for next step / next iter
             x, y = get_batch("train", config.batch_size)
             scaler.scale(loss).backward()
+            del state  # free KV caches / detok state kept alive by autograd refs
 
         # gradient step
         if config.grad_clip != 0.0:

@@ -70,24 +70,25 @@ def _apply_rope(x: Tensor, freqs: Tensor) -> Tensor:
     return torch.view_as_real(x_rot).flatten(-2).to(x.dtype)
 
 
-def apply_rope_1d(q: Tensor, k: Tensor, offset: int) -> tuple[Tensor, Tensor]:
-    """Standard 1D RoPE. q, k: (B, n_head, T, head_dim)."""
-    T, head_dim = q.shape[2], q.shape[3]
-    freqs = _rope_freqs(head_dim, offset + T, q.device)
-    freqs = freqs[offset:offset + T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim//2)
+def apply_rope_1d(q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
+    """Standard 1D RoPE. q, k: (B, n_head, T, head_dim). positions: (T,) int."""
+    head_dim = q.shape[3]
+    max_pos = int(positions.max().item()) + 1
+    freqs = _rope_freqs(head_dim, max_pos, q.device)
+    freqs = freqs[positions].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim//2)
     return _apply_rope(q, freqs), _apply_rope(k, freqs)
 
 
-def apply_rope_2d(q: Tensor, k: Tensor, offset: int, coords: Tensor) -> tuple[Tensor, Tensor]:
+def apply_rope_2d(q: Tensor, k: Tensor, positions: Tensor, coords: Tensor) -> tuple[Tensor, Tensor]:
     """2D RoPE using (x,y) coordinate lookup. coords: (block_size, 2) int tensor.
-    Splits head_dim in half, applies separate rotary frequencies for x and y."""
-    T, head_dim = q.shape[2], q.shape[3]
+    positions: (T,) int indices into coords. Splits head_dim in half for x and y."""
+    head_dim = q.shape[3]
     half = head_dim // 2
     max_coord = int(coords.max().item()) + 1
     freqs_x = _rope_freqs(half, max_coord, q.device)
     freqs_y = _rope_freqs(half, max_coord, q.device)
 
-    pos_coords = coords[offset:offset + T]  # (T, 2)
+    pos_coords = coords[positions]  # (T, 2)
     fx = freqs_x[pos_coords[:, 0]].unsqueeze(0).unsqueeze(0)  # (1, 1, T, half//2)
     fy = freqs_y[pos_coords[:, 1]].unsqueeze(0).unsqueeze(0)
     freqs = torch.cat([fx, fy], dim=-1)  # (1, 1, T, head_dim//2)
@@ -119,7 +120,7 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.decay_raw = nn.Parameter(torch.zeros(self.n_head)) if self.use_decay else None
 
-    def forward(self, x, state):
+    def forward(self, x, state, positions=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         hs = C // self.n_head
 
@@ -135,7 +136,9 @@ class CausalSelfAttention(nn.Module):
 
         # Apply RoPE before concatenating with cache (cache already has RoPE applied)
         if self.rope_fn is not None:
-            q, k = self.rope_fn(q, k, offset)
+            if positions is None:
+                positions = torch.arange(offset, offset + T, device=x.device)
+            q, k = self.rope_fn(q, k, positions)
         k = torch.cat([cached_k, k], dim=2)
         v = torch.cat([cached_v, v], dim=2)
         T_full = k.size(2)
@@ -209,8 +212,8 @@ class CsaBlock(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config.n_embd, bias=config.bias, dropout=config.dropout)
 
-    def forward(self, x, state):
-        attn_out, state = self.attn(self.ln_1(x), state)
+    def forward(self, x, state, positions=None):
+        attn_out, state = self.attn(self.ln_1(x), state, positions=positions)
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
         return x, state
