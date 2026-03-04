@@ -481,7 +481,9 @@ def _execute_command(state, cmd_entry):
     remote_exec(state, f"tmux new-session -d -s {TMUX_SESSION} || true")
 
     # Send command to tmux, tee to log, write exit code
-    wrapped = f'touch {BUSY_FLAG}; eval {shlex.quote(cmd)} 2>&1 | tee -a {CMD_LOG}; echo ${{PIPESTATUS[0]}} > ~/.pi_last_exit; rm -f {BUSY_FLAG}'
+    separator = '"' * 80
+    header = f'printf \'\\n{separator}\\n%s\\n{separator}\\n\' {shlex.quote(cmd)} >> {CMD_LOG}'
+    wrapped = f'touch {BUSY_FLAG}; {header}; eval {shlex.quote(cmd)} 2>&1 | tee -a {CMD_LOG}; echo ${{PIPESTATUS[0]}} > ~/.pi_last_exit; rm -f {BUSY_FLAG}'
     tmux_send(state, wrapped)
 
 
@@ -876,8 +878,25 @@ def cmd_run(args):
 
 def cmd_train(args):
     require_pod()
-    config = args.config_path
     overrides = list(args.overrides) if args.overrides else []
+
+    if args.template is not None:
+        state = load_state()
+        _, template_run = get_run(state, args.template)
+        config = template_run.get("config")
+        if not config:
+            print(f"Error: Template run {args.template} has no config recorded.")
+            sys.exit(1)
+        # Template overrides first, then CLI overrides on top
+        overrides = template_run.get("overrides", []) + overrides
+        if args.config_path:
+            # If config_path was also given, it was probably an override
+            overrides = [args.config_path] + overrides
+    else:
+        if not args.config_path:
+            print("Error: config_path is required (or use --template).")
+            sys.exit(1)
+        config = args.config_path
 
     override_str = " ".join(shlex.quote(o) for o in overrides)
     with locked_state() as s:
@@ -1334,7 +1353,8 @@ def main():
 
     p_train = sub.add_parser("train", help="Train a model")
     p_train.add_argument("-f", action="store_true", help="Flush queue and run immediately")
-    p_train.add_argument("config_path", help="Config file path (e.g. config/face_ard_linear_raster_config.py)")
+    p_train.add_argument("--template", type=int, default=None, help="Run ID to use as template (reuse its config and overrides)")
+    p_train.add_argument("config_path", nargs="?", default=None, help="Config file path (e.g. config/face_ard_linear_raster_config.py)")
     p_train.add_argument("overrides", nargs=argparse.REMAINDER, help="Training overrides (e.g. --n_step=1)")
 
     p_sample = sub.add_parser("sample", help="Sample from a trained model")

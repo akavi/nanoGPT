@@ -116,7 +116,7 @@ if overridable['pos_emb'] == 'rope_2d':
     else:
         coords_list = [(i % W, i // W) for i in range(H * W)]
     # Pad position 0 (BOS) with (0, 0)
-    pos_coords = torch.tensor([(0, 0)] + coords_list, dtype=torch.long)
+    pos_coords = torch.tensor([(0, 0)] + coords_list, dtype=torch.long, device=overridable['device'])
 
 
 # -----------------------------------------------------------------------------#

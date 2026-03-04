@@ -124,6 +124,8 @@ def train(
     best_val_loss = config.initial_val_loss
 
     while True:
+
+        torch.cuda.reset_peak_memory_stats()
         lr = get_lr(iter_num, config) if config.decay_lr else config.learning_rate
         # learning rate — scale per group
         for param_group in optimizer.param_groups:
@@ -166,8 +168,11 @@ def train(
 
             # prefetch for next step / next iter
             x, y = get_batch("train", config.batch_size)
+            print(f"Before backward: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
             scaler.scale(loss).backward()
             del state  # free KV caches / detok state kept alive by autograd refs
+            torch.cuda.empty_cache()
+            print(f"After del state: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
         # gradient step
         if config.grad_clip != 0.0:

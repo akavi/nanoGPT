@@ -56,13 +56,24 @@ def ema_scan(
     intermediates like the Hillis-Steele parallel scan).
     """
     B, L, D = x.shape
-    h = initial_state  # (B, D)
-    outputs = []
-    for t in range(L):
-        d = decay[:, t].unsqueeze(-1)          # (B, 1)
-        h = d * h + (1 - d) * x[:, t]          # (B, D)
-        outputs.append(h)
-    return torch.stack(outputs, dim=1)          # (B, L, D)
+    # a[t] = decay[t], b[t] = (1 - decay[t]) * x[t]
+    a = decay.unsqueeze(-1).expand(B, L, D)       # (B, L, D)
+    b = (1 - decay).unsqueeze(-1).expand(B, L, D) * x  # (B, L, D)
+
+    # Fold initial state into the first position:
+    # h[0] = decay[0] * init + (1 - decay[0]) * x[0]
+    #       = a[0] * init + b[0]
+    b = torch.cat([b[:, :1] + a[:, :1] * initial_state.unsqueeze(1), b[:, 1:]], dim=1)
+
+    stride = 1
+    while stride < L:
+        b = torch.cat([b[:, :stride],
+                        a[:, stride:] * b[:, :-stride] + b[:, stride:]], dim=1)
+        a = torch.cat([a[:, :stride],
+                        a[:, stride:] * a[:, :-stride]], dim=1)
+        stride *= 2
+
+    return b
 
 
 # ---------------------------------------------------------------------------

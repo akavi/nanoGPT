@@ -98,15 +98,16 @@ def apply_rope_2d(q: Tensor, k: Tensor, positions: Tensor, coords: Tensor) -> tu
 
 class CausalSelfAttention(nn.Module):
 
+    _identity_rope = staticmethod(lambda q, k, pos: (q, k))
+
     def __init__(self, config, layer_idx, rope_fn=None):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.layer_idx = layer_idx
         self.attn_sums = {}
         self.attn_counts = {}
-        self.use_decay = config.use_decay
         self.dropout = config.dropout
-        self.rope_fn = rope_fn
+        self.rope_fn = rope_fn or self._identity_rope
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -118,59 +119,43 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.decay_raw = nn.Parameter(torch.zeros(self.n_head)) if self.use_decay else None
+        self.decay_raw = None
 
     def forward(self, x, state, positions=None):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
         hs = C // self.n_head
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2)
 
-        # fold: concatenate with cached k,v (identity = zero-length tensors)
         cached_k, cached_v = state
         offset = cached_k.size(2)
 
-        # Apply RoPE before concatenating with cache (cache already has RoPE applied)
-        if self.rope_fn is not None:
-            if positions is None:
-                positions = torch.arange(offset, offset + T, device=x.device)
-            q, k = self.rope_fn(q, k, positions)
+        if positions is None:
+            positions = torch.arange(offset, offset + T, device=x.device)
+        q, k = self.rope_fn(q, k, positions)
+
         k = torch.cat([cached_k, k], dim=2)
         v = torch.cat([cached_v, v], dim=2)
-        T_full = k.size(2)
 
-        # causal mask: new queries attend to all cached keys + causal within new tokens
+        # causal mask: attend freely to cached keys, causally within new tokens
         neg_inf = torch.finfo(torch.float32).min
-        attn_mask = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)
-        if offset > 0:
-            attn_mask = torch.cat([
-                torch.zeros(T, offset, device=x.device, dtype=torch.float32),
-                attn_mask,
-            ], dim=1)
-
-        if self.use_decay:
-            decay = F.softplus(self.decay_raw).to(q.dtype)                 # (nh,)
-            q_idx = torch.arange(offset, offset + T, device=x.device)
-            k_idx = torch.arange(T_full, device=x.device)
-            dist = (q_idx[:, None] - k_idx[None, :]).clamp_min(0).to(torch.float32)
-            log1p_dist = torch.log1p(dist)                         # (T, T_full)
-            logw = -torch.log1p(decay.view(self.n_head, 1, 1) * log1p_dist)
-            attn_mask = attn_mask + logw
+        causal = torch.triu(torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32), diagonal=1)
+        attn_mask = torch.cat([
+            torch.zeros(T, offset, device=x.device, dtype=torch.float32),
+            causal,
+        ], dim=1)
 
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=attn_mask,
+            attn_mask=None if self.training else attn_mask,
+            is_causal=True if self.training else False,
             dropout_p=self.dropout if self.training else 0,
-            is_causal=False,
         )
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y, (k, v)
 
@@ -198,7 +183,6 @@ class CsaConfig:
     block_size: int
     bias: bool
     dropout: float
-    use_decay: bool = False
 
 class CsaBlock(nn.Module):
 
@@ -297,7 +281,6 @@ class GPTConfig:
     n_chunk: int = 64
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    use_decay: bool = False
     block_type: Literal["attention", "mamba"] = "attention"
     device: str = "cuda"
 
@@ -323,7 +306,6 @@ class GPT(nn.Module):
                     n_chunk=config.n_state,
                     dropout=config.dropout,
                     bias=config.bias,
-                    use_decay=config.use_decay,
                     device=config.device,
                 ), i) for i in range(config.n_layer)
             ])
