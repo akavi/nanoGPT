@@ -254,7 +254,8 @@ class DeTokenizer(nn.Module):
             # EMA-broadcast main-stage contribution via chunk_idx mapping.
             contribution = state.unsqueeze(1).expand(B, L, D)
             output = (residual.float() + contribution.float()).to(residual.dtype)
-            return output, state
+            detok_metrics = {'residual_norm': residual.float().norm().item(), 'main_norm': contribution.float().norm().item()}
+            return output, state, detok_metrics
 
         # Build chunk probs: gather boundary probs at token positions
         chunk_probs = prob.new_zeros(B, M)
@@ -301,7 +302,8 @@ class DeTokenizer(nn.Module):
             elif state is not None:
                 new_state[b] = state[b]
 
-        return output, new_state
+        detok_metrics = {'residual_norm': residual.float().norm().item(), 'main_norm': long_states.float().norm().item()}
+        return output, new_state, detok_metrics
 
     def initial_state(self, batch_size):
         device = self._device_buf.device
@@ -477,9 +479,10 @@ class HNet(nn.Module):
         chunked = chunked[..., :D]
 
         # 9. DeTokenize — EMA upsample + residual
-        x, detok_state = self.detokenizer(
+        x, detok_state, detok_metrics = self.detokenizer(
             chunked, residual, token_mask, prob, counts, state['detokenizer'],
         )
+        metrics.update(detok_metrics)
 
         # 10. Post-stage (decoder)
         x, post_state = self.post_stage(x, state['post'], positions=positions)
