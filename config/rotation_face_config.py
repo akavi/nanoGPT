@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from models.utils import make_csa_backbone
+from models.rotation import make_rotation_backbone, RotationAttention
 from models.categorical import CategoricalConfig, Categorical
 from train import train, TrainConfig
 from sample import sample, SampleConfig
@@ -19,15 +19,17 @@ from data.image_anime_face.prepare import prepare as prepare_image_anime_face
 from data.image_anime_face.utils import make_get_batch, init_gen, save_image
 
 overridable = override(sys.argv, {
-    "out_dir": "out-face-linear-raster",
+    "out_dir": "out-rotation-face",
     "dataset": "image_anime_face",
-    "mode": "from_scratch",  
+    "mode": "from_scratch",
     "device": "cuda",
-    "seed":1337,
-    "learning_rate":3e-4,
-    "min_lr":3e-5,
+    "seed": 1337,
+    "learning_rate": 3e-4,
+    "min_lr": 3e-5,
     "n_layer": 10,
-    "n_embd":384,
+    "n_embd": 384,
+    "n_attn_heads": 12,
+    "d_k": 32,
     "bias": False,
     "block_size": 1024,
     "max_iters": 3000,
@@ -39,13 +41,17 @@ overridable = override(sys.argv, {
 
 torch.manual_seed(overridable['seed'])
 meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
-backbone = make_csa_backbone(
+
+backbone = make_rotation_backbone(
     n_layer=overridable['n_layer'],
     n_embd=overridable['n_embd'],
+    n_attn_heads=overridable['n_attn_heads'],
+    d_k=overridable['d_k'],
     block_size=overridable['block_size'],
     bias=overridable['bias'],
     dropout=0.05,
 )
+
 model = Categorical(CategoricalConfig(
     n_block=overridable['block_size'],
     n_vocab=meta['vocab_size'],
@@ -53,6 +59,12 @@ model = Categorical(CategoricalConfig(
     bias=overridable['bias'],
     dropout=0.05,
 ), backbone)
+
+# Re-init rotation value projections near zero (Categorical._init_weights
+# overwrites with std=0.02; we need ~identity rotations at init)
+for m in model.modules():
+    if isinstance(m, RotationAttention):
+        torch.nn.init.normal_(m.W_V.weight, std=1e-4)
 
 optimizer_config = OptimizerConfig(
     weight_decay=1e-1,
@@ -65,12 +77,7 @@ mode = overridable['mode']
 if mode == "from_scratch":
     iter_num = 0
     best_val_loss = 1e9
-
-    optimizer = configure_optimizers(
-        model,
-        optimizer_config,
-    )
-
+    optimizer = configure_optimizers(model, optimizer_config)
 elif mode == "resume" or mode == "sample":
     model, optimizer, iter_num, best_val_loss = load_checkpoint(
         overridable['out_dir'], overridable['device'], model, optimizer_config,
@@ -97,7 +104,7 @@ train_config = TrainConfig(
 
     grad_clip=1.0,
     gradient_accumulation_steps=1,
-    batch_size=128,                # also used in get_batch
+    batch_size=128,
 
     eval_only=False,
     eval_interval=250,
@@ -117,12 +124,7 @@ if mode == "resume" or mode == "from_scratch":
         optimizer=optimizer,
         get_batch=get_batch,
         save_checkpoint=lambda it, val_loss, cfg, mdl, opt: save_config_checkpoint(
-            overridable['out_dir'],
-            it,
-            val_loss,
-            cfg,
-            mdl,
-            opt,
+            overridable['out_dir'], it, val_loss, cfg, mdl, opt,
         ),
         config=train_config,
     )
