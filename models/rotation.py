@@ -49,6 +49,10 @@ class RotationAttention(nn.Module):
         self.W_QK = nn.Linear(config.n_embd, 2 * config.n_attn_heads * config.d_k, bias=False)
         # Value: (n_embd) -> (n_embd // 2), one scalar per rotation plane
         self.W_V = nn.Linear(config.n_embd, config.n_embd // 2, bias=False)
+        # Orthogonal output projection (Householder parameterization) — preserves sphere
+        self.W_out = torch.nn.utils.parametrizations.orthogonal(
+            nn.Linear(config.n_embd, config.n_embd, bias=False)
+        )
         self.attn_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: Tensor, state: tuple[Tensor, Tensor], positions=None) -> tuple[Tensor, tuple[Tensor, Tensor]]:
@@ -85,7 +89,7 @@ class RotationAttention(nn.Module):
             dropout_p=self.dropout if self.training else 0,
         )
 
-        # Reshape phi to (B, T, n_embd//2) for vectorized rotation
+        # Reshape phi to (B, T, n_embd//2)
         phi = phi.transpose(1, 2).reshape(B, T, C // 2)
 
         # Apply 2D rotations
@@ -98,6 +102,7 @@ class RotationAttention(nn.Module):
         y = torch.cat([cos_phi * x0 - sin_phi * x1,
                         sin_phi * x0 + cos_phi * x1], dim=-1)
         y = y.reshape(B, T, C)
+        y = self.W_out(y)
 
         return y, (k, theta)
 
