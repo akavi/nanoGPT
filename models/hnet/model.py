@@ -92,9 +92,9 @@ class CosineSimRouter(nn.Module):
         self.d_model = d_model
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        # Initialize as identity so routing starts neutral
-        nn.init.eye_(self.q_proj.weight)
-        nn.init.eye_(self.k_proj.weight)
+        # Initialize as random orthogonal so cos_sim ≈ 0 → prob ≈ 0.5
+        nn.init.orthogonal_(self.q_proj.weight)
+        nn.init.orthogonal_(self.k_proj.weight)
         self.q_proj.weight._no_reinit = True
         self.k_proj.weight._no_reinit = True
 
