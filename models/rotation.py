@@ -170,3 +170,182 @@ def make_rotation_backbone(*, n_layer, n_embd, n_attn_heads=12, d_k=32, block_si
     )
     blocks = ModuleList([RotationBlock(config, i) for i in range(n_layer)])
     return NormalizeInput(blocks)
+
+
+# ---------------------------------------------------------------------------
+# Kronecker Rotation Attention
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KroneckerRotationConfig:
+    n_embd: int
+    n_attn_heads: int
+    d_k: int              # QK head dimension
+    factors: tuple[int, ...]  # product must == n_embd
+    block_size: int
+    bias: bool
+    dropout: float
+
+
+def _skew_exp(params: Tensor, size: int) -> Tensor:
+    """Rotation matrices from skew-symmetric parameters via matrix_exp.
+
+    params: (..., size*(size-1)//2)  — upper-triangle entries
+    returns: (..., size, size)       — rotation matrices
+    """
+    orig_dtype = params.dtype
+    params = params.float()
+    batch_shape = params.shape[:-1]
+    mat = params.new_zeros(*batch_shape, size, size)
+    rows, cols = torch.triu_indices(size, size, offset=1)
+    mat[..., rows, cols] = params
+    S = mat - mat.transpose(-2, -1)
+    return torch.matrix_exp(S).to(orig_dtype)
+
+
+class KroneckerRotationAttention(nn.Module):
+    """Kronecker-factored rotation attention.
+
+    Each position produces skew-symmetric params for small factor matrices.
+    Exponentiating gives rotation matrices; their Kronecker product acts on
+    the input without materializing the full d×d rotation.
+    """
+
+    def __init__(self, config: KroneckerRotationConfig, layer_idx: int):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_attn_heads = config.n_attn_heads
+        self.d_k = config.d_k
+        self.factors = config.factors
+        self.dropout = config.dropout
+
+        prod = 1
+        for f in config.factors:
+            prod *= f
+        assert prod == config.n_embd, (
+            f"Product of factors {config.factors} = {prod} != n_embd={config.n_embd}"
+        )
+
+        self.factor_params = tuple(f * (f - 1) // 2 for f in config.factors)
+        self.d_v = sum(self.factor_params)
+        # Pad d_v to next power of 2 so flash/mem-efficient SDPA kernels can be used
+        self.d_v_padded = 1 << (self.d_v - 1).bit_length()
+
+        # Q/K projection (all heads fused)
+        self.W_QK = nn.Linear(config.n_embd, 2 * config.n_attn_heads * config.d_k, bias=False)
+        # V projection: each head produces d_v skew-symmetric params
+        self.W_V = nn.Linear(config.n_embd, config.n_attn_heads * self.d_v, bias=False)
+
+    def forward(
+        self, x: Tensor, state: tuple[Tensor, Tensor], positions=None,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        B, T, C = x.size()
+        H, d_k, d_v = self.n_attn_heads, self.d_k, self.d_v
+
+        # --- Q / K / V projections ---
+        qk = self.W_QK(x)
+        q, k = qk.split(H * d_k, dim=-1)
+        q = q.view(B, T, H, d_k).transpose(1, 2)
+        k = k.view(B, T, H, d_k).transpose(1, 2)
+
+        v = self.W_V(x).view(B, T, H, d_v).transpose(1, 2)
+        # Pad v to power-of-2 for flash attention compatibility
+        if self.d_v_padded != d_v:
+            v = F.pad(v, (0, self.d_v_padded - d_v))
+
+        # --- KV cache ---
+        cached_k, cached_v = state
+        offset = cached_k.size(2)
+        k = torch.cat([cached_k, k], dim=2)
+        v = torch.cat([cached_v, v], dim=2)
+
+        # --- Attention: aggregate rotation params ---
+        neg_inf = torch.finfo(torch.float32).min
+        causal = torch.triu(
+            torch.full((T, T), neg_inf, device=x.device, dtype=torch.float32),
+            diagonal=1,
+        )
+        attn_mask = torch.cat([
+            torch.zeros(T, offset, device=x.device, dtype=torch.float32),
+            causal,
+        ], dim=1)
+
+        # (B, H, T_new, d_v_padded)
+        rot_params = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None if self.training else attn_mask,
+            is_causal=True if self.training else False,
+            dropout_p=self.dropout if self.training else 0,
+        )
+        # Slice off padding
+        if self.d_v_padded != d_v:
+            rot_params = rot_params[..., :d_v]
+
+        # Sum across heads in Lie algebra space: (B, T, d_v)
+        rot_params = rot_params.transpose(1, 2).sum(dim=2)
+
+        # --- Build rotation matrices and apply via Kronecker product ---
+        param_splits = rot_params.split(list(self.factor_params), dim=-1)
+        y = x.view(B, T, *self.factors)
+        for i, (p, f) in enumerate(zip(param_splits, self.factors)):
+            R = _skew_exp(p, f)  # (B, T, f, f)
+            # Contract R along factor axis i (position 2+i in y).
+            # Move target axis to position 2, matmul, move back.
+            y = y.movedim(2 + i, 2)                       # target axis -> pos 2
+            shape = y.shape
+            y = (R @ y.reshape(B, T, f, -1)).reshape(shape)
+            y = y.movedim(2, 2 + i)                        # pos 2 -> target axis
+        y = y.reshape(B, T, C)
+
+        return y, (k, v)
+
+
+class KroneckerRotationBlock(nn.Module):
+    """Kronecker rotation attention (no residual) + MLP (with residual) + normalize."""
+
+    def __init__(self, config: KroneckerRotationConfig, layer_idx: int):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_attn_heads = config.n_attn_heads
+        self.d_k = config.d_k
+        self.factors = config.factors
+        self.block_size = config.block_size
+        self.d_v = sum(f * (f - 1) // 2 for f in config.factors)
+        self.d_v_padded = 1 << (self.d_v - 1).bit_length()
+
+        self.attn = KroneckerRotationAttention(config, layer_idx)
+        self.mlp = MLP(config.n_embd, bias=config.bias, dropout=config.dropout)
+
+    def forward(self, x: Tensor, state, positions=None) -> tuple[Tensor, tuple]:
+        x, state = self.attn(x, state, positions)
+        x = F.normalize(x + self.mlp(x), dim=-1)
+        return x, state
+
+    def initial_state(self, batch_size: int):
+        device = next(self.parameters()).device
+        empty_k = torch.zeros(batch_size, self.n_attn_heads, 0, self.d_k, device=device)
+        empty_v = torch.zeros(batch_size, self.n_attn_heads, 0, self.d_v_padded, device=device)
+        return (empty_k, empty_v)
+
+    def flops_per_fwdbwd(self):
+        N = sum(p.numel() for p in self.parameters())
+        H, d_k, T = self.n_attn_heads, self.d_k, self.block_size
+        flops_per_token = 6 * N + 12 * H * d_k * T
+        return flops_per_token * T
+
+
+def make_kronecker_rotation_backbone(
+    *, n_layer, n_embd, n_attn_heads, d_k, factors, block_size, bias, dropout,
+):
+    """Build a NormalizeInput-wrapped ModuleList of KroneckerRotationBlocks."""
+    config = KroneckerRotationConfig(
+        n_embd=n_embd,
+        n_attn_heads=n_attn_heads,
+        d_k=d_k,
+        factors=factors,
+        block_size=block_size,
+        bias=bias,
+        dropout=dropout,
+    )
+    blocks = ModuleList([KroneckerRotationBlock(config, i) for i in range(n_layer)])
+    return NormalizeInput(blocks)

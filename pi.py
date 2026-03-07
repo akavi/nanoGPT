@@ -113,6 +113,25 @@ def require_pod():
     return state
 
 
+def require_pod_or_start():
+    """Like require_pod(), but offers to start a pod if none is running."""
+    state = load_state()
+    if state.get("pod_id"):
+        return state
+    answer = input("No active pod. Start one? [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        sys.exit(1)
+    # Build a minimal args namespace with defaults for cmd_up
+    up_args = argparse.Namespace(
+        repo=DEFAULT_REPO,
+        branch=DEFAULT_BRANCH,
+        gpu_type=DEFAULT_GPU_TYPE,
+        gpu_count=DEFAULT_GPU_COUNT,
+    )
+    cmd_up(up_args)
+    return load_state()
+
+
 def require_pod_ready():
     """Require an active pod that has finished provisioning."""
     state = load_state()
@@ -867,7 +886,7 @@ def cmd_restart(args):
 
 
 def cmd_run(args):
-    require_pod()
+    require_pod_or_start()
     cmd = " ".join(args.command)
     if not cmd:
         print("Error: No command specified.")
@@ -877,7 +896,7 @@ def cmd_run(args):
 
 
 def cmd_train(args):
-    require_pod()
+    require_pod_or_start()
     overrides = list(args.overrides) if args.overrides else []
 
     if args.template is not None:
@@ -911,7 +930,7 @@ def cmd_train(args):
 
 
 def cmd_sample(args):
-    state = require_pod()
+    state = require_pod_or_start()
     overrides = list(args.overrides) if args.overrides else []
 
     run_id, run = get_run(state, args.run)
@@ -928,7 +947,7 @@ def cmd_sample(args):
 
 
 def cmd_resume(args):
-    state = require_pod()
+    state = require_pod_or_start()
     overrides = list(args.overrides) if args.overrides else []
 
     run_id, run = get_run(state, args.run)
@@ -948,7 +967,7 @@ def cmd_sweep(args):
     """Enqueue train + sample for the cartesian product of comma-separated overrides."""
     import itertools
 
-    require_pod()
+    require_pod_or_start()
     config = args.config_path
     overrides = list(args.overrides) if args.overrides else []
 

@@ -3,7 +3,11 @@ import os
 
 import torch
 
-from models.rotation import make_rotation_backbone, RotationAttention
+from models.rotation import (
+    make_rotation_backbone, RotationAttention,
+    make_kronecker_rotation_backbone, KroneckerRotationAttention,
+)
+from models.utils import make_csa_backbone
 from models.categorical import CategoricalConfig, Categorical
 from train import train, TrainConfig
 from sample import sample, SampleConfig
@@ -21,6 +25,7 @@ from data.image_anime_face.utils import make_get_batch, init_gen, save_image
 overridable = override(sys.argv, {
     "out_dir": "out-rotation-face",
     "dataset": "image_anime_face",
+    "attn_type": "rotation",  # "rotation", "kronecker", or "normal"
     "mode": "from_scratch",
     "device": "cuda",
     "seed": 1337,
@@ -42,15 +47,40 @@ overridable = override(sys.argv, {
 torch.manual_seed(overridable['seed'])
 meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
 
-backbone = make_rotation_backbone(
-    n_layer=overridable['n_layer'],
-    n_embd=overridable['n_embd'],
-    n_attn_heads=overridable['n_attn_heads'],
-    d_k=overridable['d_k'],
-    block_size=overridable['block_size'],
-    bias=overridable['bias'],
-    dropout=0.05,
-)
+attn_type = overridable['attn_type']
+if attn_type == "rotation":
+    backbone = make_rotation_backbone(
+        n_layer=overridable['n_layer'],
+        n_embd=overridable['n_embd'],
+        n_attn_heads=overridable['n_attn_heads'],
+        d_k=overridable['d_k'],
+        block_size=overridable['block_size'],
+        bias=overridable['bias'],
+        dropout=0.05,
+    )
+elif attn_type == "kronecker":
+    # 384 = 8 * 8 * 6
+    backbone = make_kronecker_rotation_backbone(
+        n_layer=overridable['n_layer'],
+        n_embd=overridable['n_embd'],
+        n_attn_heads=overridable['n_attn_heads'],
+        d_k=overridable['d_k'],
+        factors=(8, 8, 6),
+        block_size=overridable['block_size'],
+        bias=overridable['bias'],
+        dropout=0.05,
+    )
+elif attn_type == "normal":
+    backbone = make_csa_backbone(
+        n_layer=overridable['n_layer'],
+        n_embd=overridable['n_embd'],
+        n_head=overridable['n_attn_heads'],
+        block_size=overridable['block_size'],
+        bias=overridable['bias'],
+        dropout=0.05,
+    )
+else:
+    raise ValueError(f"Unknown attn_type={attn_type!r}")
 
 model = Categorical(CategoricalConfig(
     n_block=overridable['block_size'],
@@ -64,6 +94,8 @@ model = Categorical(CategoricalConfig(
 # overwrites with std=0.02; we need ~identity rotations at init)
 for m in model.modules():
     if isinstance(m, RotationAttention):
+        torch.nn.init.normal_(m.W_V.weight, std=1e-4)
+    if isinstance(m, KroneckerRotationAttention):
         torch.nn.init.normal_(m.W_V.weight, std=1e-4)
 
 optimizer_config = OptimizerConfig(
