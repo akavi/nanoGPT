@@ -317,7 +317,8 @@ class KroneckerRotationBlock(nn.Module):
         self.mlp = MLP(config.n_embd, bias=config.bias, dropout=config.dropout)
 
     def forward(self, x: Tensor, state, positions=None) -> tuple[Tensor, tuple]:
-        x, state = self.attn(x, state, positions)
+        attn_out, state = self.attn(x, state, positions)
+        x = x + attn_out
         x = F.normalize(x + self.mlp(x), dim=-1)
         return x, state
 

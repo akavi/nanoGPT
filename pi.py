@@ -439,6 +439,9 @@ def ssh_opts(state):
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "LogLevel=ERROR",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=3",
         f"{user}@{ip}",
     ]
 
@@ -1152,6 +1155,38 @@ def cmd_status(args):
         print(f"\nRecent output:\n{output}")
 
 
+def cmd_debug(args):
+    """Check if the state lock is held and diagnose hangs."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        print("Lock: free")
+    except BlockingIOError:
+        print("Lock: HELD (this is why commands hang)")
+    finally:
+        lock_fd.close()
+
+    state = load_state()
+    daemon_pid = state.get("daemon_pid")
+    if daemon_pid:
+        try:
+            os.kill(daemon_pid, 0)
+            heartbeat = state.get("daemon_heartbeat")
+            if heartbeat:
+                ago = int(time.time() - heartbeat)
+                print(f"Daemon: pid {daemon_pid}, last heartbeat {ago}s ago")
+                if ago > 30:
+                    print(f"  ⚠ Heartbeat is stale — daemon is likely stuck in an SSH call")
+            else:
+                print(f"Daemon: pid {daemon_pid}, no heartbeat recorded")
+        except ProcessLookupError:
+            print(f"Daemon: dead (stale pid {daemon_pid} in state)")
+    else:
+        print("Daemon: not running")
+
+
 def cmd_log(args):
     """Show the remote command log (synced to ~/.pi/cmd.log)."""
     state = require_pod_ready()
@@ -1417,6 +1452,7 @@ def main():
     sub.add_parser("mortalize", help="Re-enable auto-shutdown after runs")
     sub.add_parser("restart", help="Restart the daemon for the current pod")
     sub.add_parser("reset", help="Kill daemon and clear pod state (keeps run history)")
+    sub.add_parser("debug", help="Check if state lock is held and by whom")
 
     args = parser.parse_args()
 
@@ -1446,6 +1482,7 @@ def main():
         "mortalize": cmd_mortalize,
         "restart": cmd_restart,
         "reset": cmd_reset,
+        "debug": cmd_debug,
     }
     cmds[args.cmd](args)
 
