@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from models.mamba import RMSNorm
+from models.hnet.router import Router
 
 
 # ---------------------------------------------------------------------------
@@ -76,112 +77,6 @@ def ema_scan(
     return b
 
 
-# ---------------------------------------------------------------------------
-# CosineSimRouter
-# ---------------------------------------------------------------------------
-
-class CosineSimRouter(nn.Module):
-    """Computes boundary probabilities from adjacent cosine similarities.
-
-    Position 0 always gets prob=1.0 (always a boundary).
-    For position i>0: prob = (1 - cos_sim(q(h[i-1]), k(h[i]))) / 2.
-    """
-
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.d_model = d_model
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        # Initialize as random orthogonal so cos_sim ≈ 0 → prob ≈ 0.5
-        nn.init.orthogonal_(self.q_proj.weight)
-        nn.init.orthogonal_(self.k_proj.weight)
-        self.q_proj.weight._no_reinit = True
-        self.k_proj.weight._no_reinit = True
-
-    def prob_boundary(self, hidden_states: Tensor, return_cos_sim: bool = False) -> Tensor | tuple[Tensor, Tensor]:
-        """Compute per-position boundary probabilities.
-
-        Args:
-            hidden_states: (B, L, D)
-            return_cos_sim: if True, also return raw cos_sim tensor
-        Returns:
-            (B, L) boundary probabilities in [0, 1], and optionally (B, L-1) cos_sim.
-        """
-        B, L, D = hidden_states.shape
-        if L <= 1:
-            prob = torch.ones(B, L, device=hidden_states.device, dtype=torch.float32)
-            if return_cos_sim:
-                return prob, torch.zeros(B, 0, device=hidden_states.device)
-            return prob
-
-        cos_sim = torch.einsum(
-            'b l d, b l d -> b l',
-            F.normalize(self.q_proj(hidden_states[:, :-1]).float(), dim=-1),
-            F.normalize(self.k_proj(hidden_states[:, 1:]).float(), dim=-1),
-        )  # (B, L-1)
-
-        default = torch.ones(B, 1, device=hidden_states.device, dtype=cos_sim.dtype)
-        prob = torch.cat([default, ((1 - cos_sim) / 2).clamp(0, 1)], dim=1)
-        if return_cos_sim:
-            return prob, cos_sim
-        return prob
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        state: tuple[Tensor, Tensor] | None = None,
-    ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None, dict[str, float]]:
-        """Compute routing decisions.
-
-        Args:
-            hidden_states: (B, L, D)
-            state: (last_token (B,D), has_seen_token (B,)) or None
-
-        Returns:
-            (prob, token_mask, new_state, metrics)
-            - prob: (B, L) boundary probabilities
-            - token_mask: (B, L) boolean — True where prob > 0.5
-            - new_state: (last_token, has_seen_token)
-            - metrics: cos_sim stats
-        """
-        B, L, D = hidden_states.shape
-
-        prob, cos_sim = self.prob_boundary(hidden_states, return_cos_sim=True)  # (B, L)
-
-        # Handle cross-boundary state from previous forward call
-        if state is not None:
-            last_token, has_seen_token = state
-            # Compute boundary prob between last_token and first token of each sequence
-            pairs = torch.stack([last_token, hidden_states[:, 0]], dim=1)  # (B, 2, D)
-            cross_prob = self.prob_boundary(pairs)[:, 1]  # (B,)
-            prob = prob.clone()
-            prob[:, 0] = torch.where(has_seen_token, cross_prob, torch.ones_like(cross_prob))
-        else:
-            prob = prob.clone()
-            prob[:, 0] = 1.0  # First position is always a boundary
-
-        token_mask = prob > 0.5
-
-        # Update state
-        new_state = (
-            hidden_states[:, -1].detach().clone(),  # last_token
-            torch.ones(B, device=hidden_states.device, dtype=torch.bool),  # has_seen_token
-        )
-
-        # Router diagnostics
-        metrics: dict[str, float] = {}
-        if cos_sim.numel() > 0:
-            metrics['cos_sim_mean'] = cos_sim.mean().item()
-            metrics['cos_sim_std'] = cos_sim.std().item()
-
-        return prob, token_mask, new_state, metrics
-
-    def initial_state(self, batch_size):
-        device = next(self.parameters()).device
-        return (
-            torch.zeros(batch_size, self.d_model, device=device),
-            torch.zeros(batch_size, device=device, dtype=torch.bool),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +316,7 @@ class HNet(nn.Module):
         pre_stage: Stage,
         main_stage: nn.Module,  # Stage or HNet
         post_stage: Stage,
-        router: CosineSimRouter,
+        router: Router,
         detokenizer: DeTokenizer,
         residual_proj: nn.Linear,
         pad_parameter: nn.Parameter | None,
