@@ -283,6 +283,58 @@ def sync_cmd_log(state):
     subprocess.run(cmd, check=False, capture_output=True)
 
 
+def push_to_toedb(run_id):
+    """Push run data to toeDB server after sync."""
+    config_path = os.path.expanduser("~/.toedb.json")
+    if not os.path.exists(config_path):
+        return
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        url = config.get("url", "")
+        token = config.get("token", "")
+        if not url or not token:
+            return
+
+        run_dir = f"outputs/{run_id}"
+        run_json_path = os.path.join(run_dir, "run.json")
+        log_json_path = os.path.join(run_dir, "log.json")
+
+        if not os.path.exists(run_json_path):
+            return
+
+        import re
+        def fix_json(s):
+            s = re.sub(r'\bNaN\b', 'null', s)
+            s = re.sub(r'-Infinity\b', 'null', s)
+            s = re.sub(r'\bInfinity\b', 'null', s)
+            return s
+
+        with open(run_json_path) as f:
+            run_data = json.loads(fix_json(f.read()))
+
+        metrics = None
+        if os.path.exists(log_json_path):
+            with open(log_json_path) as f:
+                metrics = json.loads(fix_json(f.read()))
+
+        payload = {"run": run_data}
+        if metrics:
+            payload["metrics"] = metrics
+
+        r = requests.post(
+            f"{url}/api/runs/{run_id}/upload",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        if r.ok:
+            print(f"Pushed run {run_id} to toeDB")
+    except Exception as e:
+        # Don't let toeDB errors break the main flow
+        print(f"Warning: toeDB push failed for run {run_id}: {e}")
+
+
 def check_remote_exit(state):
     """Read the remote command's exit status. Returns exit code as string, or None."""
     r = remote_exec(state, "cat ~/.pi_last_exit 2>/dev/null", check=False)
@@ -352,6 +404,7 @@ def _daemon(pod_id, skip_provision=False):
                     if run_id:
                         _log(f"Syncing run {run_id}...")
                         sync_run(s, run_id)
+                        push_to_toedb(run_id)
 
                     running_entry["status"] = "failed" if failed else "completed"
                     _log(f"Command {running_id} {'failed' if failed else 'completed'}.")

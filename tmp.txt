@@ -1,4 +1,4 @@
 uv run pi.py sweep config/face_hnet_config.py --max_iters=2000 --raster=hilbert \
 --learning_rate=3e-4,1e-3 \
---shape='3x64-4(5x512)-3x64,3x64-16(5x512)-3x64' \
---inner_lr_ratio=0.0,1.0 \
+--shape='6x64' \
+--inner_lr_ratio=1.0
