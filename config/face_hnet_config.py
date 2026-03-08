@@ -6,7 +6,7 @@ import torch
 import os
 
 from models.hnet.model import HNet, HNetLM, StageLM, Stage, DeTokenizer
-from models.hnet.router import Router, CosineSimRouting, LinearSigmoidRouting, MLPSigmoidRouting
+from models.hnet.router import Router, CosineSimRouting, LinearSigmoidRouting, MLPSigmoidRouting, MLPPairwiseRouting
 from models.model import CsaConfig, CsaBlock
 from train import train, TrainConfig
 from sample import sample, SampleConfig
@@ -219,6 +219,7 @@ def _make_router(routing: str, d_model: int) -> Router:
         'cosine_sim': lambda: CosineSimRouting(d_model),
         'linear_sigmoid': lambda: LinearSigmoidRouting(d_model),
         'mlp_sigmoid': lambda: MLPSigmoidRouting(d_model),
+        'mlp_pairwise': lambda: MLPPairwiseRouting(d_model),
     }
     if routing not in strategies:
         raise ValueError(f"Unknown routing strategy {routing!r}, expected one of {list(strategies)}")

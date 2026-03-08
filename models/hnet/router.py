@@ -98,6 +98,34 @@ class MLPSigmoidRouting(RoutingStrategy):
         return torch.sigmoid(logits)
 
 
+class MLPPairwiseRouting(RoutingStrategy):
+    """Pairwise MLP: concatenates adjacent hidden states and runs through SwiGLU MLP.
+
+    Like CosineSimRouting, boundary prob at position i depends on (h[i-1], h[i]),
+    but can learn arbitrary nonlinear functions of the pair.
+    """
+
+    def __init__(self, d_model: int, *, expansion_factor: float = 2.0, bias: bool = True):
+        super().__init__()
+        hidden = int(d_model * expansion_factor)
+        self.layer1 = nn.Linear(2 * d_model, hidden * 2, bias=bias)
+        self.layer2 = nn.Linear(hidden, 1, bias=bias)
+
+    def prob_boundary(self, hidden_states: Tensor) -> Tensor:
+        B, L, D = hidden_states.shape
+        if L <= 1:
+            return torch.ones(B, L, device=hidden_states.device, dtype=torch.float32)
+
+        pairs = torch.cat([hidden_states[:, :-1], hidden_states[:, 1:]], dim=-1)  # (B, L-1, 2D)
+        x = self.layer1(pairs)
+        a, b = x.chunk(2, dim=-1)
+        x = b * F.silu(a)
+        logits = self.layer2(x).squeeze(-1).float()  # (B, L-1)
+
+        default = torch.ones(B, 1, device=hidden_states.device, dtype=torch.float32)
+        return torch.cat([default, torch.sigmoid(logits)], dim=1)
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
