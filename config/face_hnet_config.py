@@ -138,7 +138,7 @@ def _make_attn_stage(n_blocks, d_model, n_head, block_size, bias, dropout, rope_
 
 def _make_residual_proj(d_model):
     proj = torch.nn.Linear(d_model, d_model, bias=True, dtype=torch.float32)
-    torch.nn.init.eye_(proj.weight)
+    torch.nn.init.normal_(proj.weight, std=0.01)
     torch.nn.init.zeros_(proj.bias)
     proj.weight._no_reinit = True
     proj.bias._no_reinit = True
