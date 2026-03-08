@@ -251,7 +251,7 @@ class DeTokenizer(nn.Module):
         prob: Tensor,           # (B, L) boundary probabilities
         counts: Tensor,         # (B,) tokens per batch element
         state: Tensor | None = None,  # (B, D) previous EMA value
-        main_scale: float = 1.0,
+        detach_residual: bool = False,
         residual_drop: float = 0.0,
     ) -> tuple[Tensor, Tensor]:
         """
@@ -263,11 +263,13 @@ class DeTokenizer(nn.Module):
         M = hidden_states.shape[1]
         device = hidden_states.device
 
+        if detach_residual:
+            residual = residual.detach()
+
         if M == 0:
             contribution = state.unsqueeze(1).expand(B, L, D)
-            main_f = contribution.float() * main_scale
-            output = (residual.float() + main_f).to(residual.dtype)
-            detok_metrics = {'residual_norm': residual.float().norm().item(), 'main_norm': main_f.norm().item()}
+            output = (residual.float() + contribution.float()).to(residual.dtype)
+            detok_metrics = {'residual_norm': residual.float().norm().item(), 'main_norm': contribution.float().norm().item()}
             return output, state, detok_metrics
 
         # Build chunk probs: gather boundary probs at token positions
@@ -304,13 +306,12 @@ class DeTokenizer(nn.Module):
 
         # Residual add-back (in fp32)
         out_dtype = long_states.dtype
-        main_f = long_states.float() * main_scale
+        res_f = residual.float()
         if self.training and residual_drop > 0:
-            # Stochastic depth: drop entire residual path per-sample
-            keep = torch.bernoulli(torch.full((B, 1, 1), 1 - residual_drop, device=device))
-            output = (residual.float() * keep + main_f).to(out_dtype)
-        else:
-            output = (residual.float() + main_f).to(out_dtype)
+            # Per-position dropout on residual path
+            keep = torch.bernoulli(torch.full((B, L, 1), 1 - residual_drop, device=device))
+            res_f = res_f * keep
+        output = (res_f + long_states.float()).to(out_dtype)
 
         # Compute new state: last EMA output per batch element
         new_state = residual.new_zeros(B, D)
@@ -426,7 +427,7 @@ class HNet(nn.Module):
         pad_parameter: nn.Parameter | None,
         target_ratio: float = 4.0,
         inner_lr_ratio: float | None = None,
-        main_scale: float = 1.0,
+        detach_residual: bool = False,
         residual_drop: float = 0.0,
     ):
         super().__init__()
@@ -440,7 +441,7 @@ class HNet(nn.Module):
         self.residual_proj = residual_proj
         self.target_ratio = target_ratio
         self.inner_lr_ratio = inner_lr_ratio if inner_lr_ratio is not None else target_ratio
-        self.main_scale = main_scale
+        self.detach_residual = detach_residual
         self.residual_drop = residual_drop
         self.pad_parameter = pad_parameter
 
@@ -507,7 +508,7 @@ class HNet(nn.Module):
         # 9. DeTokenize — EMA upsample + residual
         x, detok_state, detok_metrics = self.detokenizer(
             chunked, residual, token_mask, prob, counts, state['detokenizer'],
-            main_scale=self.main_scale, residual_drop=self.residual_drop,
+            detach_residual=self.detach_residual, residual_drop=self.residual_drop,
         )
         metrics.update(detok_metrics)
 

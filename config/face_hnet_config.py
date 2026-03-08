@@ -40,7 +40,7 @@ overridable = override(sys.argv, {
     "raster": "linear",        # "linear" or "hilbert"
     "ratio_loss_weight": 0.03,
     "inner_lr_ratio": 0.0,         # 0 = use target_ratio; set to override inner stage LR scaling
-    "main_scale": 1.0,             # multiplier on main-stage contribution in detokenizer
+    "detach_residual": False,       # detach residual path so loss gradients flow only through main stage
     "residual_drop": 0.0,          # prob of dropping residual path during training (stochastic depth)
     "pos_emb": "rope_2d",          # "learned", "rope_1d", or "rope_2d"
 })
@@ -211,7 +211,7 @@ def parse_shape(s):
 
 
 
-def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, inner_lr_ratio=None, main_scale=1.0, residual_drop=0.0):
+def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, inner_lr_ratio=None, detach_residual=False, residual_drop=0.0):
     """Recursively build from a parsed shape. Returns (module, d_model).
 
     For 'leaf': returns (Stage, d_model)
@@ -232,7 +232,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, inner_lr_
 
     pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
     post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
-    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, inner_lr_ratio=inner_lr_ratio, main_scale=main_scale, residual_drop=residual_drop)
+    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, inner_lr_ratio=inner_lr_ratio, detach_residual=detach_residual, residual_drop=residual_drop)
 
     pad_dim = d_inner - d_model
     hnet = HNet(
@@ -246,7 +246,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, inner_lr_
         pad_parameter=torch.nn.Parameter(torch.zeros(pad_dim)) if pad_dim > 0 else None,
         target_ratio=float(ratio),
         inner_lr_ratio=inner_lr_ratio,
-        main_scale=main_scale,
+        detach_residual=detach_residual,
         residual_drop=residual_drop,
     )
     return hnet, d_model
@@ -263,7 +263,7 @@ def make_hnet(
     pos_emb='learned',
     pos_coords=None,
     inner_lr_ratio=None,
-    main_scale=1.0,
+    detach_residual=False,
     residual_drop=0.0,
 ):
     nn = torch.nn
@@ -280,7 +280,7 @@ def make_hnet(
         coords = pos_coords
         rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
 
-    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, inner_lr_ratio=inner_lr_ratio, main_scale=main_scale, residual_drop=residual_drop)
+    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, inner_lr_ratio=inner_lr_ratio, detach_residual=detach_residual, residual_drop=residual_drop)
 
     embeddings = nn.Embedding(vocab_size, d_model)
     lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -324,7 +324,7 @@ model = make_hnet(
     pos_emb=overridable['pos_emb'],
     pos_coords=pos_coords,
     inner_lr_ratio=overridable['inner_lr_ratio'] or None,
-    main_scale=overridable['main_scale'],
+    detach_residual=overridable['detach_residual'],
     residual_drop=overridable['residual_drop'],
 )
 
