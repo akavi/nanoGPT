@@ -98,17 +98,21 @@ class CosineSimRouter(nn.Module):
         self.q_proj.weight._no_reinit = True
         self.k_proj.weight._no_reinit = True
 
-    def prob_boundary(self, hidden_states: Tensor) -> Tensor:
+    def prob_boundary(self, hidden_states: Tensor, return_cos_sim: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """Compute per-position boundary probabilities.
 
         Args:
             hidden_states: (B, L, D)
+            return_cos_sim: if True, also return raw cos_sim tensor
         Returns:
-            (B, L) boundary probabilities in [0, 1].
+            (B, L) boundary probabilities in [0, 1], and optionally (B, L-1) cos_sim.
         """
         B, L, D = hidden_states.shape
         if L <= 1:
-            return torch.ones(B, L, device=hidden_states.device, dtype=torch.float32)
+            prob = torch.ones(B, L, device=hidden_states.device, dtype=torch.float32)
+            if return_cos_sim:
+                return prob, torch.zeros(B, 0, device=hidden_states.device)
+            return prob
 
         cos_sim = torch.einsum(
             'b l d, b l d -> b l',
@@ -118,13 +122,15 @@ class CosineSimRouter(nn.Module):
 
         default = torch.ones(B, 1, device=hidden_states.device, dtype=cos_sim.dtype)
         prob = torch.cat([default, ((1 - cos_sim) / 2).clamp(0, 1)], dim=1)
+        if return_cos_sim:
+            return prob, cos_sim
         return prob
 
     def forward(
         self,
         hidden_states: Tensor,
         state: tuple[Tensor, Tensor] | None = None,
-    ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None]:
+    ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None, dict[str, float]]:
         """Compute routing decisions.
 
         Args:
@@ -132,14 +138,15 @@ class CosineSimRouter(nn.Module):
             state: (last_token (B,D), has_seen_token (B,)) or None
 
         Returns:
-            (prob, token_mask, new_state)
+            (prob, token_mask, new_state, metrics)
             - prob: (B, L) boundary probabilities
             - token_mask: (B, L) boolean — True where prob > 0.5
             - new_state: (last_token, has_seen_token)
+            - metrics: cos_sim stats
         """
         B, L, D = hidden_states.shape
 
-        prob = self.prob_boundary(hidden_states)  # (B, L)
+        prob, cos_sim = self.prob_boundary(hidden_states, return_cos_sim=True)  # (B, L)
 
         # Handle cross-boundary state from previous forward call
         if state is not None:
@@ -161,7 +168,13 @@ class CosineSimRouter(nn.Module):
             torch.ones(B, device=hidden_states.device, dtype=torch.bool),  # has_seen_token
         )
 
-        return prob, token_mask, new_state
+        # Router diagnostics
+        metrics: dict[str, float] = {}
+        if cos_sim.numel() > 0:
+            metrics['cos_sim_mean'] = cos_sim.mean().item()
+            metrics['cos_sim_std'] = cos_sim.std().item()
+
+        return prob, token_mask, new_state, metrics
 
     def initial_state(self, batch_size):
         device = next(self.parameters()).device
@@ -406,6 +419,7 @@ class HNet(nn.Module):
         residual_proj: nn.Linear,
         pad_parameter: nn.Parameter | None,
         target_ratio: float = 4.0,
+        inner_lr_ratio: float | None = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -417,6 +431,7 @@ class HNet(nn.Module):
         self.detokenizer = detokenizer
         self.residual_proj = residual_proj
         self.target_ratio = target_ratio
+        self.inner_lr_ratio = inner_lr_ratio if inner_lr_ratio is not None else target_ratio
         self.pad_parameter = pad_parameter
 
     def _ratio_loss(self, prob: Tensor, token_mask: Tensor) -> Tensor:
@@ -443,7 +458,7 @@ class HNet(nn.Module):
             residual = self.residual_proj(x.float())
 
         # 3. Router — compute boundary probabilities
-        prob, token_mask, router_state = self.router(x, state['router'])
+        prob, token_mask, router_state, router_metrics = self.router(x, state['router'])
 
         # 4. Ratio loss at this level
         aux_loss = self._ratio_loss(prob, token_mask)
@@ -454,6 +469,7 @@ class HNet(nn.Module):
         # Track compression ratio: input_len / num_boundary_tokens
         n_tokens_selected = token_mask.float().sum(dim=1).mean().item()
         ratio = L / max(n_tokens_selected, 1.0)
+        prob_mean = prob[:, 1:].mean().item() if L > 1 else 1.0
 
         # 6. Pad to deeper dimension if needed
         B_c, M, D_c = chunked.shape
@@ -462,7 +478,7 @@ class HNet(nn.Module):
             chunked = torch.cat([chunked, pad], dim=-1)
 
         # 7. Main stage (on compressed sequence) — skip if empty
-        metrics: dict[str, float] = {'ratio': ratio}
+        metrics: dict[str, float] = {'ratio': ratio, 'prob_mean': prob_mean, **router_metrics}
         M = chunked.shape[1]
         if M > 0:
             if isinstance(self.main_stage, HNet):
@@ -507,7 +523,7 @@ class HNet(nn.Module):
             outer_params.append(self.pad_parameter)
         groups = decay_nodecay_groups(outer_params, lr_scale)
 
-        inner_scale = lr_scale / self.target_ratio
+        inner_scale = lr_scale / self.inner_lr_ratio
         if isinstance(self.main_stage, HNet):
             groups += self.main_stage.optim_groups(lr_scale=inner_scale)
         else:
@@ -604,6 +620,91 @@ class HNetLM(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
             cur = idx_next  # subsequent iterations feed only the new token
+        return idx
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear) and not getattr(module.weight, '_no_reinit', False):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None and not getattr(module.bias, '_no_reinit', False):
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        return -1.0
+
+    def flops_per_fwdbwd(self):
+        return self.backbone.flops_per_fwdbwd()
+
+
+class StageLM(nn.Module):
+    """Flat (no-hierarchy) LM wrapper. Conforms to TrainModel protocol.
+
+    Wraps a bare Stage with token embeddings, positional embeddings, and LM head.
+    Used when the shape string is a leaf (e.g. "6x64") with no HNet hierarchy.
+    """
+
+    def __init__(
+        self,
+        backbone: Stage,
+        embeddings: nn.Embedding,
+        lm_head: nn.Linear,
+        wpe: nn.Embedding | None = None,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.embeddings = embeddings
+        self.lm_head = lm_head
+        self.wpe = wpe
+
+    def forward(self, idx: Tensor, state, targets: Tensor | None = None):
+        L = idx.size(1)
+        offset = state[0][0].size(2)  # cached seq len from first block's K cache
+        positions = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
+        x = self.embeddings(idx)
+        if self.wpe is not None:
+            x = x + self.wpe(positions)
+        x, state = self.backbone(x, state, positions=positions)
+
+        metrics: dict[str, float] = {}
+        if targets is not None:
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+            metrics['ce_loss'] = loss.item()
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
+
+        return logits, state, loss, metrics
+
+    def initial_state(self, batch_size):
+        return self.backbone.initial_state(batch_size)
+
+    def optim_groups(self) -> list[dict]:
+        from utils import decay_nodecay_groups
+        params = list(self.parameters())
+        return decay_nodecay_groups(params)
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
+        cur = idx
+        for _ in range(max_new_tokens):
+            logits, state, _, _ = self(cur, state)
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+            cur = idx_next
         return idx
 
     def _init_weights(self, module):

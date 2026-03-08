@@ -1,0 +1,1 @@
+uv run pi.py sweep config/face_hnet_config.py --raster=linear,hilbert --pos_emb=rope_2d --ratio_loss_weight=0.03 --max_iters=2000 --shape='3x64-4(5x512)-3x64,3x64-16(5x512)-3x64' --learning_rate=3e-4,1e-3

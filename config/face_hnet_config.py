@@ -5,7 +5,7 @@ from PIL import Image
 import torch
 import os
 
-from models.hnet.model import HNet, HNetLM, Stage, CosineSimRouter, DeTokenizer
+from models.hnet.model import HNet, HNetLM, StageLM, Stage, CosineSimRouter, DeTokenizer
 from models.model import CsaConfig, CsaBlock
 from train import train, TrainConfig
 from sample import sample, SampleConfig
@@ -39,6 +39,7 @@ overridable = override(sys.argv, {
     "shape": "balanced",       # "balanced" or "narrow_shell"
     "raster": "linear",        # "linear" or "hilbert"
     "ratio_loss_weight": 0.01,
+    "inner_lr_ratio": 0.0,         # 0 = use target_ratio; set to override inner stage LR scaling
     "pos_emb": "learned",          # "learned", "rope_1d", or "rope_2d"
 })
 
@@ -208,7 +209,7 @@ def parse_shape(s):
 
 
 
-def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn):
+def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, inner_lr_ratio=None):
     """Recursively build from a parsed shape. Returns (module, d_model).
 
     For 'leaf': returns (Stage, d_model)
@@ -229,7 +230,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn):
 
     pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
     post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
-    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn)
+    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, inner_lr_ratio=inner_lr_ratio)
 
     pad_dim = d_inner - d_model
     hnet = HNet(
@@ -242,6 +243,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn):
         residual_proj=_make_residual_proj(d_model),
         pad_parameter=torch.nn.Parameter(torch.zeros(pad_dim)) if pad_dim > 0 else None,
         target_ratio=float(ratio),
+        inner_lr_ratio=inner_lr_ratio,
     )
     return hnet, d_model
 
@@ -250,12 +252,13 @@ def make_hnet(
     shape_str,
     block_size,
     vocab_size,
-    n_head=8, 
+    n_head=8,
     bias=False,
     dropout=0.0,
     ratio_loss_weight=0.01,
     pos_emb='learned',
     pos_coords=None,
+    inner_lr_ratio=None,
 ):
     nn = torch.nn
     parsed = parse_shape(shape_str)
@@ -271,25 +274,27 @@ def make_hnet(
         coords = pos_coords
         rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
 
-    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn)
-
-    # If shape is a bare leaf (no HNet), we still need to wrap it
-    # but HNetLM expects an HNet backbone. For a leaf, just make a
-    # trivial HNet with 0-layer pre/post stages... or raise.
-    assert isinstance(backbone, HNet), \
-        f"Shape {shape_str!r} is a bare stage with no hierarchy. Use at least NxD-R(NxD)-NxD."
+    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, inner_lr_ratio=inner_lr_ratio)
 
     embeddings = nn.Embedding(vocab_size, d_model)
     lm_head = nn.Linear(d_model, vocab_size, bias=False)
     wpe = nn.Embedding(block_size, d_model) if pos_emb == 'learned' else None
 
-    model = HNetLM(
-        backbone=backbone,
-        embeddings=embeddings,
-        lm_head=lm_head,
-        wpe=wpe,
-        ratio_loss_weight=ratio_loss_weight,
-    )
+    if isinstance(backbone, HNet):
+        model = HNetLM(
+            backbone=backbone,
+            embeddings=embeddings,
+            lm_head=lm_head,
+            wpe=wpe,
+            ratio_loss_weight=ratio_loss_weight,
+        )
+    else:
+        model = StageLM(
+            backbone=backbone,
+            embeddings=embeddings,
+            lm_head=lm_head,
+            wpe=wpe,
+        )
 
     model.apply(model._init_weights)
     print(f"number of parameters: {model.get_num_params()/1e6:.2f}M")
@@ -312,6 +317,7 @@ model = make_hnet(
     ratio_loss_weight=overridable['ratio_loss_weight'],
     pos_emb=overridable['pos_emb'],
     pos_coords=pos_coords,
+    inner_lr_ratio=overridable['inner_lr_ratio'] or None,
 )
 
 optimizer_config = OptimizerConfig(
