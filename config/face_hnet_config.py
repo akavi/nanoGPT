@@ -38,9 +38,9 @@ overridable = override(sys.argv, {
     # H-Net options
     "shape": "balanced",       # "balanced" or "narrow_shell"
     "raster": "linear",        # "linear" or "hilbert"
-    "ratio_loss_weight": 0.01,
+    "ratio_loss_weight": 0.03,
     "inner_lr_ratio": 0.0,         # 0 = use target_ratio; set to override inner stage LR scaling
-    "pos_emb": "learned",          # "learned", "rope_1d", or "rope_2d"
+    "pos_emb": "rope_2d",          # "learned", "rope_1d", or "rope_2d"
 })
 
 # -----------------------------------------------------------------------------#
