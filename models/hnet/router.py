@@ -98,6 +98,25 @@ class MLPSigmoidRouting(RoutingStrategy):
         return torch.sigmoid(logits)
 
 
+class FixedStrideRouting(RoutingStrategy):
+    """Deterministic routing: select every Nth position as a boundary.
+
+    No learned parameters — purely structural compression.
+    """
+
+    def __init__(self, stride: int):
+        super().__init__()
+        self.stride = stride
+        # Dummy buffer so Router.initial_state can find the device
+        self.register_buffer('_device_buf', torch.empty(0), persistent=False)
+
+    def prob_boundary(self, hidden_states: Tensor) -> Tensor:
+        B, L, _ = hidden_states.shape
+        prob = torch.zeros(B, L, device=hidden_states.device, dtype=torch.float32)
+        prob[:, ::self.stride] = 1.0
+        return prob
+
+
 class MLPPairwiseRouting(RoutingStrategy):
     """Pairwise MLP: concatenates adjacent hidden states and runs through SwiGLU MLP.
 
@@ -141,6 +160,7 @@ class Router(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.strategy = strategy
+        self.register_buffer('_device_buf', torch.empty(0), persistent=False)
 
     def forward(
         self,
@@ -161,7 +181,10 @@ class Router(nn.Module):
         prob = self.strategy.prob_boundary(hidden_states)  # (B, L)
 
         # Handle cross-boundary state from previous forward call
-        if state is not None:
+        # (skip for fixed-stride routing which doesn't depend on content)
+        if isinstance(self.strategy, FixedStrideRouting):
+            pass
+        elif state is not None:
             last_token, has_seen_token = state
             pairs = torch.stack([last_token, hidden_states[:, 0]], dim=1)  # (B, 2, D)
             cross_prob = self.strategy.prob_boundary(pairs)[:, 1]  # (B,)
@@ -193,7 +216,7 @@ class Router(nn.Module):
         return prob, token_mask, new_state, metrics
 
     def initial_state(self, batch_size: int) -> tuple[Tensor, Tensor]:
-        device = next(self.parameters()).device
+        device = self._device_buf.device
         return (
             torch.zeros(batch_size, self.d_model, device=device),
             torch.zeros(batch_size, device=device, dtype=torch.bool),

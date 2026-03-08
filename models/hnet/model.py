@@ -225,6 +225,87 @@ class DeTokenizer(nn.Module):
         return torch.zeros(batch_size, self.d_model, device=device)
 
 
+class CrossAttentionDeTokenizer(nn.Module):
+    """Cross-attention upsampling + residual add-back.
+
+    Each full-resolution position attends to all compressed tokens,
+    allowing content-based routing independent of sequence order.
+    Drop-in replacement for DeTokenizer.
+    """
+
+    def __init__(self, d_model: int, n_head: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.n_head = n_head
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.register_buffer('_device_buf', torch.empty(0), persistent=False)
+
+    def forward(
+        self,
+        hidden_states: Tensor,  # (B, M, D) — compacted chunk states
+        residual: Tensor,       # (B, L, D) — pre-router residual
+        token_mask: Tensor,     # (B, L) bool — unused, kept for interface
+        prob: Tensor,           # (B, L) — unused, kept for interface
+        counts: Tensor,         # (B,) tokens per batch element
+        state: Tensor | None = None,  # (B, D) previous value
+        detach_residual: bool = False,
+        residual_drop: float = 0.0,
+    ) -> tuple[Tensor, Tensor, dict]:
+        B, L, D = residual.shape
+        M = hidden_states.shape[1]
+        device = hidden_states.device
+
+        if detach_residual:
+            residual = residual.detach()
+
+        if M == 0:
+            contribution = state.unsqueeze(1).expand(B, L, D)
+            output = (residual.float() + contribution.float()).to(residual.dtype)
+            return output, state, {'residual_norm': residual.float().norm().item(), 'main_norm': contribution.float().norm().item()}
+
+        hs = D // self.n_head
+        q = self.q_proj(residual).view(B, L, self.n_head, hs).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(B, M, self.n_head, hs).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(B, M, self.n_head, hs).transpose(1, 2)
+
+        # Mask invalid compressed positions
+        valid_mask = torch.arange(M, device=device)[None, :] < counts[:, None]  # (B, M)
+        attn_bias = torch.where(
+            valid_mask[:, None, None, :].expand(B, self.n_head, L, M),
+            torch.zeros(1, device=device, dtype=torch.float32),
+            torch.full((1,), float('-inf'), device=device, dtype=torch.float32),
+        )
+
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        long_states = self.out_proj(attn_out.transpose(1, 2).contiguous().view(B, L, D))
+
+        # Residual add-back (in fp32)
+        out_dtype = long_states.dtype
+        res_f = residual.float()
+        if self.training and residual_drop > 0:
+            keep = torch.bernoulli(torch.full((B, L, 1), 1 - residual_drop, device=device))
+            res_f = res_f * keep
+        output = (res_f + long_states.float()).to(out_dtype)
+
+        # State: last valid compressed token per batch element
+        new_state = residual.new_zeros(B, D)
+        for b in range(B):
+            c = int(counts[b].item())
+            if c > 0:
+                new_state[b] = hidden_states[b, c - 1]
+            elif state is not None:
+                new_state[b] = state[b]
+
+        return output, new_state, {'residual_norm': res_f.norm().item(), 'main_norm': long_states.float().norm().item()}
+
+    def initial_state(self, batch_size):
+        device = self._device_buf.device
+        return torch.zeros(batch_size, self.d_model, device=device)
+
+
 # ---------------------------------------------------------------------------
 # Block / Stage
 # ---------------------------------------------------------------------------

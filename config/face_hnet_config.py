@@ -5,8 +5,8 @@ from PIL import Image
 import torch
 import os
 
-from models.hnet.model import HNet, HNetLM, StageLM, Stage, DeTokenizer
-from models.hnet.router import Router, CosineSimRouting, LinearSigmoidRouting, MLPSigmoidRouting, MLPPairwiseRouting
+from models.hnet.model import HNet, HNetLM, StageLM, Stage, DeTokenizer, CrossAttentionDeTokenizer
+from models.hnet.router import Router, CosineSimRouting, LinearSigmoidRouting, MLPSigmoidRouting, MLPPairwiseRouting, FixedStrideRouting
 from models.model import CsaConfig, CsaBlock
 from train import train, TrainConfig
 from sample import sample, SampleConfig
@@ -43,7 +43,8 @@ overridable = override(sys.argv, {
     "inner_lr_ratio": 0.0,         # 0 = use target_ratio; set to override inner stage LR scaling
     "detach_residual": False,       # detach residual path so loss gradients flow only through main stage
     "residual_drop": 0.0,          # prob of dropping residual path during training (stochastic depth)
-    "routing": "cosine_sim",       # "cosine_sim", "linear_sigmoid", or "mlp_sigmoid"
+    "routing": "cosine_sim",       # "cosine_sim", "linear_sigmoid", "mlp_sigmoid", "mlp_pairwise", "fixed_stride"
+    "detokenizer": "ema",          # "ema" or "cross_attention"
     "pos_emb": "rope_2d",          # "learned", "rope_1d", or "rope_2d"
 })
 
@@ -213,20 +214,31 @@ def parse_shape(s):
 
 
 
-def _make_router(routing: str, d_model: int) -> Router:
+def _make_router(routing: str, d_model: int, ratio: int = 4) -> Router:
     """Build a Router with the specified strategy."""
     strategies = {
         'cosine_sim': lambda: CosineSimRouting(d_model),
         'linear_sigmoid': lambda: LinearSigmoidRouting(d_model),
         'mlp_sigmoid': lambda: MLPSigmoidRouting(d_model),
         'mlp_pairwise': lambda: MLPPairwiseRouting(d_model),
+        'fixed_stride': lambda: FixedStrideRouting(ratio),
     }
     if routing not in strategies:
         raise ValueError(f"Unknown routing strategy {routing!r}, expected one of {list(strategies)}")
     return Router(d_model, strategies[routing]())
 
 
-def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing='cosine_sim', inner_lr_ratio=None, detach_residual=False, residual_drop=0.0):
+def _make_detokenizer(detokenizer: str, d_model: int):
+    """Build a DeTokenizer variant."""
+    if detokenizer == 'ema':
+        return DeTokenizer(d_model)
+    elif detokenizer == 'cross_attention':
+        return CrossAttentionDeTokenizer(d_model)
+    else:
+        raise ValueError(f"Unknown detokenizer {detokenizer!r}, expected 'ema' or 'cross_attention'")
+
+
+def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop):
     """Recursively build from a parsed shape. Returns (module, d_model).
 
     For 'leaf': returns (Stage, d_model)
@@ -247,7 +259,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing='
 
     pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
     post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
-    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing=routing, inner_lr_ratio=inner_lr_ratio, detach_residual=detach_residual, residual_drop=residual_drop)
+    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop)
 
     pad_dim = d_inner - d_model
     hnet = HNet(
@@ -255,8 +267,8 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing='
         pre_stage=pre_stage,
         main_stage=main_stage,
         post_stage=post_stage,
-        router=_make_router(routing, d_model),
-        detokenizer=DeTokenizer(d_model),
+        router=_make_router(routing, d_model, ratio=int(ratio)),
+        detokenizer=_make_detokenizer(detokenizer, d_model),
         residual_proj=_make_residual_proj(d_model),
         pad_parameter=torch.nn.Parameter(torch.zeros(pad_dim)) if pad_dim > 0 else None,
         target_ratio=float(ratio),
@@ -271,16 +283,17 @@ def make_hnet(
     shape_str,
     block_size,
     vocab_size,
-    n_head=8,
-    bias=False,
-    dropout=0.0,
-    ratio_loss_weight=0.01,
-    pos_emb='learned',
-    pos_coords=None,
-    routing='cosine_sim',
-    inner_lr_ratio=None,
-    detach_residual=False,
-    residual_drop=0.0,
+    n_head,
+    bias,
+    dropout,
+    ratio_loss_weight,
+    pos_emb,
+    pos_coords,
+    routing,
+    detokenizer,
+    inner_lr_ratio,
+    detach_residual,
+    residual_drop,
 ):
     nn = torch.nn
     parsed = parse_shape(shape_str)
@@ -296,7 +309,7 @@ def make_hnet(
         coords = pos_coords
         rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
 
-    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing=routing, inner_lr_ratio=inner_lr_ratio, detach_residual=detach_residual, residual_drop=residual_drop)
+    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop)
 
     embeddings = nn.Embedding(vocab_size, d_model)
     lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -334,12 +347,14 @@ model = make_hnet(
     shape_str=shape_str,
     vocab_size=256,
     block_size=overridable['block_size'],
+    n_head=8,
     bias=overridable['bias'],
     dropout=0.0,
     ratio_loss_weight=overridable['ratio_loss_weight'],
     pos_emb=overridable['pos_emb'],
     pos_coords=pos_coords,
     routing=overridable['routing'],
+    detokenizer=overridable['detokenizer'],
     inner_lr_ratio=overridable['inner_lr_ratio'] or None,
     detach_residual=overridable['detach_residual'],
     residual_drop=overridable['residual_drop'],
