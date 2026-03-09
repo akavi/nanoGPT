@@ -407,6 +407,7 @@ class HNet(nn.Module):
         inner_lr_ratio: float | None = None,
         detach_residual: bool = False,
         residual_drop_fn: Callable[[float], float] = lambda _: 0.0,
+        ratio_override_fn: Callable[[float], float] | None = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -421,16 +422,25 @@ class HNet(nn.Module):
         self.inner_lr_ratio = inner_lr_ratio if inner_lr_ratio is not None else target_ratio
         self.detach_residual = detach_residual
         self.residual_drop_fn = residual_drop_fn
+        self.ratio_override_fn = ratio_override_fn
         self.pad_parameter = pad_parameter
 
-    def _ratio_loss(self, prob: Tensor, token_mask: Tensor) -> Tensor:
+    def _get_effective_ratio(self, train_step: tuple[int, int] | None) -> float:
+        """Return the effective target ratio, respecting ratio_override_fn if set."""
+        if self.ratio_override_fn is not None and train_step is not None:
+            iter_num, max_iters = train_step
+            progress = iter_num / max_iters if max_iters > 0 else 1.0
+            return self.ratio_override_fn(progress)
+        return self.target_ratio
+
+    def _ratio_loss(self, prob: Tensor, token_mask: Tensor, train_step: tuple[int, int] | None = None) -> Tensor:
         """Ratio loss to regularize compression toward target_ratio.
 
         ℒ = (N/(N-1)) * ((N-1)*F*G + (1-F)*(1-G))
         where F = fraction selected (discrete), G = mean prob (continuous), N = target ratio.
         Minimized when F = G = 1/N.
         """
-        N = self.target_ratio
+        N = self._get_effective_ratio(train_step)
         F = token_mask.float().mean()
         G = prob.mean()
         return (N / (N - 1)) * ((N - 1) * F * G + (1 - F) * (1 - G))
@@ -458,7 +468,7 @@ class HNet(nn.Module):
         prob, token_mask, router_state, router_metrics = self.router(x, state['router'])
 
         # 4. Ratio loss at this level
-        aux_loss = self._ratio_loss(prob, token_mask)
+        aux_loss = self._ratio_loss(prob, token_mask, train_step=train_step)
 
         # 5. Tokenize — compact to boundary positions
         chunked, counts, inner_positions = self.tokenizer(x, token_mask, positions=positions)

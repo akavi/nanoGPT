@@ -44,19 +44,20 @@ overridable = override(sys.argv, {
     "inner_lr_ratio": 0.0,         # 0 = use target_ratio; set to override inner stage LR scaling
     "detach_residual": False,       # detach residual path so loss gradients flow only through main stage
     "residual_drop": "0.0",         # float or "cos:start:end" / "lin:start:end" schedule
+    "ratio_override": "",              # "" = use shape ratio; float or "cos:start:end" / "lin:start:end" schedule
     "routing": "cosine_sim",       # "cosine_sim", "linear_sigmoid", "mlp_sigmoid", "mlp_pairwise", "fixed_stride"
     "detokenizer": "ema",          # "ema" or "cross_attention"
     "pos_emb": "rope_2d",          # "learned", "rope_1d", or "rope_2d"
 })
 
 # -----------------------------------------------------------------------------#
-# Residual drop schedule
+# Schedule parser (shared by residual_drop & ratio_override)
 # -----------------------------------------------------------------------------#
 
-def _parse_residual_drop(spec: str):
-    """Parse residual_drop: "0.3" (constant) or "cos:1:0" / "lin:1:0" (schedule).
+def _parse_schedule(spec: str, name: str = "schedule"):
+    """Parse a schedule spec: "0.3" (constant) or "cos:start:end" / "lin:start:end".
 
-    Returns a function mapping progress in [0,1] to drop rate.
+    Returns a function mapping progress in [0,1] to a float value.
     """
     parts = spec.split(':')
     if len(parts) == 1:
@@ -70,9 +71,10 @@ def _parse_residual_drop(spec: str):
             return lambda p, s=start, e=end: s + (e - s) * p
         else:
             raise ValueError(f"Unknown schedule type {kind!r}, expected 'cos' or 'lin'")
-    raise ValueError(f"residual_drop must be a float or 'cos:start:end' / 'lin:start:end', got {spec!r}")
+    raise ValueError(f"{name} must be a float or 'cos:start:end' / 'lin:start:end', got {spec!r}")
 
-_residual_drop_fn = _parse_residual_drop(overridable['residual_drop'])
+_residual_drop_fn = _parse_schedule(overridable['residual_drop'], 'residual_drop')
+_ratio_override_fn = _parse_schedule(overridable['ratio_override'], 'ratio_override') if overridable['ratio_override'] else None
 
 # -----------------------------------------------------------------------------#
 # Shape string parser
@@ -264,7 +266,7 @@ def _make_detokenizer(detokenizer: str, d_model: int):
         raise ValueError(f"Unknown detokenizer {detokenizer!r}, expected 'ema' or 'cross_attention'")
 
 
-def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn):
+def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn):
     """Recursively build from a parsed shape. Returns (module, d_model).
 
     For 'leaf': returns (Stage, d_model)
@@ -285,7 +287,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
 
     pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
     post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
-    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn)
+    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn)
 
     pad_dim = d_inner - d_model
     hnet = HNet(
@@ -301,6 +303,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
         inner_lr_ratio=inner_lr_ratio,
         detach_residual=detach_residual,
         residual_drop_fn=residual_drop_fn,
+        ratio_override_fn=ratio_override_fn,
     )
     return hnet, d_model
 
@@ -320,6 +323,7 @@ def make_hnet(
     inner_lr_ratio,
     detach_residual,
     residual_drop_fn,
+    ratio_override_fn,
 ):
     nn = torch.nn
     parsed = parse_shape(shape_str)
@@ -335,7 +339,7 @@ def make_hnet(
         coords = pos_coords
         rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
 
-    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn)
+    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn)
 
     embeddings = nn.Embedding(vocab_size, d_model)
     lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -384,6 +388,7 @@ model = make_hnet(
     inner_lr_ratio=overridable['inner_lr_ratio'] or None,
     detach_residual=overridable['detach_residual'],
     residual_drop_fn=_residual_drop_fn,
+    ratio_override_fn=_ratio_override_fn,
 )
 
 optimizer_config = OptimizerConfig(
