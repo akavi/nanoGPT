@@ -385,6 +385,84 @@ class MLP(nn.Module):
 # HNet (one level of the hierarchy)
 # ---------------------------------------------------------------------------
 
+class AnisotropicStack(nn.Module):
+    """Dimension-changing stack: pre → proj_up → inner → proj_down → post.
+
+    No routing or sequence compression — all stages see the same sequence length.
+    Dimensions change via linear projections between stages.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        pre_stage: Stage,
+        main_stage: nn.Module,  # Stage, HNet, or AnisotropicStack
+        post_stage: Stage,
+        up_proj: nn.Linear,
+        down_proj: nn.Linear,
+        inner_lr_ratio: float = 1.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.pre_stage = pre_stage
+        self.main_stage = main_stage
+        self.post_stage = post_stage
+        self.up_proj = up_proj
+        self.down_proj = down_proj
+        self.inner_lr_ratio = inner_lr_ratio
+
+    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
+        # 1. Pre-stage
+        x, pre_state = self.pre_stage(x, state['pre'], positions=positions)
+
+        # 2. Project up to inner dimension
+        x = self.up_proj(x)
+
+        # 3. Main stage (inner dimension)
+        if isinstance(self.main_stage, (HNet, AnisotropicStack)):
+            x, main_state, aux_loss, metrics = self.main_stage(x, state['main'], positions=positions, train_step=train_step)
+        else:
+            x, main_state = self.main_stage(x, state['main'], positions=positions)
+            aux_loss = torch.tensor(0.0, device=x.device)
+            metrics = {}
+
+        # 4. Project down to outer dimension
+        x = self.down_proj(x)
+
+        # 5. Post-stage
+        x, post_state = self.post_stage(x, state['post'], positions=positions)
+
+        new_state = {'pre': pre_state, 'main': main_state, 'post': post_state}
+        return x, new_state, aux_loss, metrics
+
+    def optim_groups(self, lr_scale: float = 1.0) -> list[dict]:
+        from utils import decay_nodecay_groups
+        outer_params = list(self.pre_stage.parameters()) + \
+                       list(self.post_stage.parameters()) + \
+                       list(self.up_proj.parameters()) + \
+                       list(self.down_proj.parameters())
+        groups = decay_nodecay_groups(outer_params, lr_scale)
+
+        inner_scale = lr_scale / self.inner_lr_ratio
+        if isinstance(self.main_stage, (HNet, AnisotropicStack)):
+            groups += self.main_stage.optim_groups(lr_scale=inner_scale)
+        else:
+            groups += decay_nodecay_groups(self.main_stage.parameters(), inner_scale)
+        return groups
+
+    def initial_state(self, batch_size):
+        return {
+            'pre': self.pre_stage.initial_state(batch_size),
+            'main': self.main_stage.initial_state(batch_size),
+            'post': self.post_stage.initial_state(batch_size),
+        }
+
+    def flops_per_fwdbwd(self):
+        return self.pre_stage.flops_per_fwdbwd() + \
+               self.main_stage.flops_per_fwdbwd() + \
+               self.post_stage.flops_per_fwdbwd()
+
+
 class HNet(nn.Module):
     """One level of the H-Net hierarchy. Recursable.
 

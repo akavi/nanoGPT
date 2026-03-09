@@ -6,7 +6,7 @@ from PIL import Image
 import torch
 import os
 
-from models.hnet.model import HNet, HNetLM, StageLM, Stage, DeTokenizer, CrossAttentionDeTokenizer
+from models.hnet.model import HNet, HNetLM, StageLM, Stage, DeTokenizer, CrossAttentionDeTokenizer, AnisotropicStack
 from models.hnet.router import Router, CosineSimRouting, LinearSigmoidRouting, MLPSigmoidRouting, MLPPairwiseRouting, FixedStrideRouting
 from models.model import CsaConfig, CsaBlock
 from train import train, TrainConfig
@@ -79,11 +79,13 @@ _ratio_override_fn = _parse_schedule(overridable['ratio_override'], 'ratio_overr
 # -----------------------------------------------------------------------------#
 # Shape string parser
 # -----------------------------------------------------------------------------#
-# Syntax:  Shape = NxD | NxDxH | NxD-R(Shape)-NxD | NxDxH-R(Shape)-NxDxH
+# Syntax:  Shape = NxD | NxDxH | NxD-R(Shape)-NxD | NxDxH-R(Shape)-NxDxH | NxD-Shape-NxD
 # Examples:
-#   "2x288-4(5x480)-2x288"                — 1-level HNet
+#   "2x288-4(5x480)-2x288"                — 1-level HNet (routed compression)
 #   "2x288-4(3x480-4(5x640)-3x480)-2x288" — 2-level nested HNet
 #   "5x384"                                — flat (no HNet, just a Stage)
+#   "4x128-4x256-4x128"                   — anisotropic (linear proj, no routing)
+#   "4x128-4x256-4x512-4x256-4x128"      — nested anisotropic
 #
 # Named aliases for backwards compat:
 
@@ -194,6 +196,8 @@ def parse_shape(s):
       ('hnet', pre, ratio, inner, post)              — an HNet level
         where pre/post = (n_layers, d_model, n_head)
         and inner is another parsed shape (recursive)
+      ('aniso', pre, inner, post)                    — anisotropic dim stack (no routing)
+        same as hnet but no ratio/router, just linear projections between dims
     """
     # Try to match: cluster-R(inner)-cluster
     # Find the first R( pattern
@@ -208,9 +212,18 @@ def parse_shape(s):
     # Find first R( where R is a number
     idx = s.find('(')
     if idx == -1:
-        # Leaf: just NxD or NxDxH
-        n, d, h = _parse_cluster(s)
-        return ('leaf', n, d, h)
+        # No parens — leaf or anisotropic stack
+        parts = s.split('-')
+        if len(parts) == 1:
+            n, d, h = _parse_cluster(s)
+            return ('leaf', n, d, h)
+        assert len(parts) >= 3, f"Anisotropic shape needs at least 3 clusters (pre-inner-post), got: {s!r}"
+        pre_n, pre_d, pre_h = _parse_cluster(parts[0])
+        post_n, post_d, post_h = _parse_cluster(parts[-1])
+        assert pre_d == post_d, f"Pre/post dim mismatch: {pre_d} vs {post_d}"
+        inner_str = '-'.join(parts[1:-1])
+        inner = parse_shape(inner_str)
+        return ('aniso', (pre_n, pre_d, pre_h), inner, (post_n, post_d, post_h))
 
     # Find the ratio number before '('
     dash_before = s.rfind('-', 0, idx)
@@ -271,12 +284,37 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
 
     For 'leaf': returns (Stage, d_model)
     For 'hnet': returns (HNet, d_model)
+    For 'aniso': returns (AnisotropicStack, d_model)
     """
     if parsed[0] == 'leaf':
         _, n_layers, d_model, n_head = parsed
         n_head = n_head or n_head_default
         stage = _make_attn_stage(n_layers, d_model, n_head, block_size, bias, dropout, rope_fn=rope_fn)
         return stage, d_model
+
+    if parsed[0] == 'aniso':
+        _, (pre_n, pre_d, pre_h), inner_parsed, (post_n, post_d, post_h) = parsed
+        d_model = pre_d
+        pre_h = pre_h or n_head_default
+        post_h = post_h or n_head_default
+
+        pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
+        post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
+        main_stage, d_inner = _build(inner_parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn)
+
+        up_proj = torch.nn.Linear(d_model, d_inner, bias=False)
+        down_proj = torch.nn.Linear(d_inner, d_model, bias=False)
+
+        stack = AnisotropicStack(
+            d_model=d_model,
+            pre_stage=pre_stage,
+            main_stage=main_stage,
+            post_stage=post_stage,
+            up_proj=up_proj,
+            down_proj=down_proj,
+            inner_lr_ratio=inner_lr_ratio or 1.0,
+        )
+        return stack, d_model
 
     _, (pre_n, pre_d, pre_h), ratio, inner_parsed, (post_n, post_d, post_h) = parsed
     d_model = pre_d
@@ -345,7 +383,7 @@ def make_hnet(
     lm_head = nn.Linear(d_model, vocab_size, bias=False)
     wpe = nn.Embedding(block_size, d_model) if pos_emb == 'learned' else None
 
-    if isinstance(backbone, HNet):
+    if isinstance(backbone, (HNet, AnisotropicStack)):
         model = HNetLM(
             backbone=backbone,
             embeddings=embeddings,
