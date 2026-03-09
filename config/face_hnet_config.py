@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 import numpy as np
@@ -42,11 +43,36 @@ overridable = override(sys.argv, {
     "ratio_loss_weight": 0.03,
     "inner_lr_ratio": 0.0,         # 0 = use target_ratio; set to override inner stage LR scaling
     "detach_residual": False,       # detach residual path so loss gradients flow only through main stage
-    "residual_drop": 0.0,          # prob of dropping residual path during training (stochastic depth)
+    "residual_drop": "0.0",         # float or "cos:start:end" / "lin:start:end" schedule
     "routing": "cosine_sim",       # "cosine_sim", "linear_sigmoid", "mlp_sigmoid", "mlp_pairwise", "fixed_stride"
     "detokenizer": "ema",          # "ema" or "cross_attention"
     "pos_emb": "rope_2d",          # "learned", "rope_1d", or "rope_2d"
 })
+
+# -----------------------------------------------------------------------------#
+# Residual drop schedule
+# -----------------------------------------------------------------------------#
+
+def _parse_residual_drop(spec: str):
+    """Parse residual_drop: "0.3" (constant) or "cos:1:0" / "lin:1:0" (schedule).
+
+    Returns a function mapping progress in [0,1] to drop rate.
+    """
+    parts = spec.split(':')
+    if len(parts) == 1:
+        val = float(spec)
+        return lambda _p, v=val: v
+    if len(parts) == 3:
+        kind, start, end = parts[0], float(parts[1]), float(parts[2])
+        if kind == 'cos':
+            return lambda p, s=start, e=end: e + (s - e) * 0.5 * (1 + math.cos(math.pi * p))
+        elif kind == 'lin':
+            return lambda p, s=start, e=end: s + (e - s) * p
+        else:
+            raise ValueError(f"Unknown schedule type {kind!r}, expected 'cos' or 'lin'")
+    raise ValueError(f"residual_drop must be a float or 'cos:start:end' / 'lin:start:end', got {spec!r}")
+
+_residual_drop_fn = _parse_residual_drop(overridable['residual_drop'])
 
 # -----------------------------------------------------------------------------#
 # Shape string parser
@@ -238,7 +264,7 @@ def _make_detokenizer(detokenizer: str, d_model: int):
         raise ValueError(f"Unknown detokenizer {detokenizer!r}, expected 'ema' or 'cross_attention'")
 
 
-def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop):
+def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn):
     """Recursively build from a parsed shape. Returns (module, d_model).
 
     For 'leaf': returns (Stage, d_model)
@@ -259,7 +285,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
 
     pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
     post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
-    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop)
+    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn)
 
     pad_dim = d_inner - d_model
     hnet = HNet(
@@ -274,7 +300,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
         target_ratio=float(ratio),
         inner_lr_ratio=inner_lr_ratio,
         detach_residual=detach_residual,
-        residual_drop=residual_drop,
+        residual_drop_fn=residual_drop_fn,
     )
     return hnet, d_model
 
@@ -293,7 +319,7 @@ def make_hnet(
     detokenizer,
     inner_lr_ratio,
     detach_residual,
-    residual_drop,
+    residual_drop_fn,
 ):
     nn = torch.nn
     parsed = parse_shape(shape_str)
@@ -309,7 +335,7 @@ def make_hnet(
         coords = pos_coords
         rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
 
-    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop)
+    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn)
 
     embeddings = nn.Embedding(vocab_size, d_model)
     lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -357,7 +383,7 @@ model = make_hnet(
     detokenizer=overridable['detokenizer'],
     inner_lr_ratio=overridable['inner_lr_ratio'] or None,
     detach_residual=overridable['detach_residual'],
-    residual_drop=overridable['residual_drop'],
+    residual_drop_fn=_residual_drop_fn,
 )
 
 optimizer_config = OptimizerConfig(

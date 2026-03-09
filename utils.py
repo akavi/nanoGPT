@@ -265,8 +265,6 @@ def override(argv, config):
             except (SyntaxError, ValueError):
                 # if that goes wrong, just use the string
                 attempt = val
-            # ensure the types match ok
-            assert type(attempt) == type(config[key])
             # cross fingers
             print(f"Overriding: {key} = {attempt}")
             config[key] = attempt

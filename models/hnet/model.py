@@ -15,6 +15,8 @@ Architecture at each level:
 Everything in one file, reusing Mamba2/ssd from models/mamba.py.
 """
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -404,7 +406,7 @@ class HNet(nn.Module):
         target_ratio: float = 4.0,
         inner_lr_ratio: float | None = None,
         detach_residual: bool = False,
-        residual_drop: float = 0.0,
+        residual_drop_fn: Callable[[float], float] = lambda _: 0.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -418,7 +420,7 @@ class HNet(nn.Module):
         self.target_ratio = target_ratio
         self.inner_lr_ratio = inner_lr_ratio if inner_lr_ratio is not None else target_ratio
         self.detach_residual = detach_residual
-        self.residual_drop = residual_drop
+        self.residual_drop_fn = residual_drop_fn
         self.pad_parameter = pad_parameter
 
     def _ratio_loss(self, prob: Tensor, token_mask: Tensor) -> Tensor:
@@ -433,7 +435,15 @@ class HNet(nn.Module):
         G = prob.mean()
         return (N / (N - 1)) * ((N - 1) * F * G + (1 - F) * (1 - G))
 
-    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
+    def _get_residual_drop(self, train_step: tuple[int, int] | None) -> float:
+        """Compute current residual drop rate."""
+        if train_step is None:
+            return 0.0  # no dropout at eval
+        iter_num, max_iters = train_step
+        progress = iter_num / max_iters if max_iters > 0 else 1.0
+        return self.residual_drop_fn(progress)
+
+    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
         B, L, D = x.shape
 
         # 1. Pre-stage (encoder)
@@ -469,7 +479,7 @@ class HNet(nn.Module):
         M = chunked.shape[1]
         if M > 0:
             if isinstance(self.main_stage, HNet):
-                chunked, main_state, inner_aux, inner_metrics = self.main_stage(chunked, state['main'], positions=inner_positions)
+                chunked, main_state, inner_aux, inner_metrics = self.main_stage(chunked, state['main'], positions=inner_positions, train_step=train_step)
                 aux_loss = aux_loss + inner_aux
                 for k, v in inner_metrics.items():
                     metrics[f'inner_{k}'] = v
@@ -482,10 +492,12 @@ class HNet(nn.Module):
         chunked = chunked[..., :D]
 
         # 9. DeTokenize — EMA upsample + residual
+        residual_drop = self._get_residual_drop(train_step)
         x, detok_state, detok_metrics = self.detokenizer(
             chunked, residual, token_mask, prob, counts, state['detokenizer'],
-            detach_residual=self.detach_residual, residual_drop=self.residual_drop,
+            detach_residual=self.detach_residual, residual_drop=residual_drop,
         )
+        metrics['residual_drop'] = residual_drop
         metrics.update(detok_metrics)
 
         # 10. Post-stage (decoder)
@@ -555,7 +567,7 @@ class HNetLM(nn.Module):
         self.wpe = wpe
         self.ratio_loss_weight = ratio_loss_weight
 
-    def forward(self, idx: Tensor, state, targets: Tensor | None = None):
+    def forward(self, idx: Tensor, state, targets: Tensor | None = None, train_step: tuple[int, int] | None = None):
         """TrainModel protocol: (logits, state, loss, metrics)."""
         L = idx.size(1)
         offset = state['pre'][0][0].size(2)  # cached seq len
@@ -563,7 +575,7 @@ class HNetLM(nn.Module):
         x = self.embeddings(idx)
         if self.wpe is not None:
             x = x + self.wpe(positions)
-        x, state, ratio_loss, metrics = self.backbone(x, state, positions=positions)
+        x, state, ratio_loss, metrics = self.backbone(x, state, positions=positions, train_step=train_step)
 
         if targets is not None:
             logits = self.lm_head(x)
@@ -648,7 +660,7 @@ class StageLM(nn.Module):
         self.lm_head = lm_head
         self.wpe = wpe
 
-    def forward(self, idx: Tensor, state, targets: Tensor | None = None):
+    def forward(self, idx: Tensor, state, targets: Tensor | None = None, train_step: tuple[int, int] | None = None):
         L = idx.size(1)
         offset = state[0][0].size(2)  # cached seq len from first block's K cache
         positions = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)

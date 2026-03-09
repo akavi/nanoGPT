@@ -808,8 +808,8 @@ def cmd_up(args):
                     s["commands"][cid]["status"] = "abandoned"
             print("All pending commands abandoned.")
         elif choice in ("s", "select"):
-            keep = input(f"Enter command IDs to keep (comma-separated): ").strip()
-            keep_ids = {x.strip() for x in keep.split(",") if x.strip()}
+            keep = input(f"Enter command IDs to keep (comma-separated, ranges with dashes): ").strip()
+            keep_ids = set(parse_id_ranges(keep))
             with locked_state() as s:
                 for cid in pending_cmds:
                     if cid not in keep_ids:
@@ -1348,6 +1348,22 @@ def cmd_history(args):
         print(f"  {cid}. [{c['status']}] {ts} {c['type']}{run_str}: {c['cmd'][:100]}")
 
 
+def parse_id_ranges(s):
+    """Parse comma-separated IDs with optional dash ranges, e.g. '1-3,5,7-9' -> ['1','2','3','5','7','8','9']."""
+    ids = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo, hi = int(lo.strip()), int(hi.strip())
+            ids.extend(str(i) for i in range(lo, hi + 1))
+        else:
+            ids.append(part)
+    return ids
+
+
 def _rm_command(s, cmd_id):
     """Cancel or kill a single command by ID. Caller must hold locked_state()."""
     cmd_id = str(cmd_id)
@@ -1374,8 +1390,10 @@ def _rm_command(s, cmd_id):
 def cmd_rm(args):
     """Remove a command — cancel if pending, kill if running."""
     if args.cmd_id is not None:
+        ids = parse_id_ranges(args.cmd_id)
         with locked_state() as s:
-            _rm_command(s, args.cmd_id)
+            for cid in ids:
+                _rm_command(s, cid)
         return
 
     # Interactive mode: show active commands and let user pick
@@ -1392,13 +1410,13 @@ def cmd_rm(args):
         print(f"  {cid}. [{c['status']}] {c['type']}{run_str}: {c['cmd'][:100]}")
 
     print()
-    choice = input("Command ID(s) to remove (comma-separated, or 'all'): ").strip()
+    choice = input("Command ID(s) to remove (comma-separated, ranges with dashes, or 'all'): ").strip()
     if not choice:
         return
     if choice == "all":
         ids = [cid for cid, _ in active]
     else:
-        ids = [x.strip() for x in choice.split(",")]
+        ids = parse_id_ranges(choice)
 
     with locked_state() as s:
         for cid in ids:
@@ -1494,7 +1512,7 @@ def main():
     p_log.add_argument("-n", type=int, default=50, help="Number of lines to show (default: 50)")
 
     p_rm = sub.add_parser("rm", help="Remove a pending or running command")
-    p_rm.add_argument("cmd_id", nargs="?", type=int, default=None, help="Command ID to remove (interactive if omitted)")
+    p_rm.add_argument("cmd_id", nargs="?", default=None, help="Command ID(s) to remove: single, comma-separated, or ranges (e.g. 3-7)")
     p_sweep = sub.add_parser("sweep", help="Sweep: train+sample for cartesian product of comma-separated overrides")
     p_sweep.add_argument("config_path", help="Config file path")
     p_sweep.add_argument("overrides", nargs=argparse.REMAINDER, help="Overrides (comma-separated values are swept)")

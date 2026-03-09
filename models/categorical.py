@@ -48,7 +48,7 @@ class Categorical(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, state, targets=None):
+    def forward(self, idx, state, targets=None, train_step=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.n_block, f"Cannot forward sequence of length {t}, block size is only {self.n_block}"

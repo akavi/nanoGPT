@@ -41,8 +41,10 @@ class TrainModel(Protocol):
         x: Tensor,
         state: Any,
         y: Tensor,
+        train_step: tuple[int, int] | None = None,
     ) -> tuple[Tensor, Any, Tensor, dict[str, float]]: ...
     # (logits, new_state, loss, metrics)
+    # train_step = (iter_num, max_iters) when training, None at eval
 
 GetBatchFn = Callable[[Split, int], tuple[Tensor, Tensor]]
 SaveCheckpointFn = Callable[
@@ -159,7 +161,7 @@ def train(
             B = x.shape[0]
             state = model.initial_state(B)
             with ctx:
-                _, state, loss, metrics = model(x, state, y)
+                _, state, loss, metrics = model(x, state, y, train_step=(iter_num, config.max_iters))
                 loss = loss / config.gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
             # accumulate metrics (average across micro steps)

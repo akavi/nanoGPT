@@ -27,6 +27,7 @@ uv run sample.py --out_dir=out-shakespeare-char
 # Remote GPU training (Prime Intellect)
 uv run pi.py up                              # provision pod
 uv run pi.py train config/some_config.py     # queue training run
+uv run pi.py sweep config/some_config.py --lr=1e-3,1e-4 --dropout=0.0,0.1  # cartesian product sweep
 uv run pi.py sample --run=1                  # sample from run
 uv run pi.py fetch --run=1                   # rsync outputs locally
 uv run pi.py down                            # terminate pod
