@@ -230,7 +230,7 @@ def parse_shape(s):
     assert dash_before != -1, f"Expected dash before ratio in: {s!r}"
     pre_str = s[:dash_before]
     ratio_str = s[dash_before+1:idx]
-    ratio = int(ratio_str)
+    ratio = float(ratio_str)
 
     # Find matching closing paren
     depth = 1
