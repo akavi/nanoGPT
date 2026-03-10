@@ -1020,7 +1020,7 @@ def cmd_resume(args):
 
 
 def cmd_sweep(args):
-    """Enqueue train + sample for the cartesian product of comma-separated overrides."""
+    """Enqueue train for the cartesian product of comma-separated overrides."""
     import itertools
 
     require_pod_or_start()
@@ -1061,7 +1061,8 @@ def cmd_sweep(args):
         label = " ".join(f"{k}={v}" for k, v in zip(sweep_keys, combo))
         print(f"  Run {run_id}: {label}")
         _enqueue_command("train", train_cmd, run_id=run_id)
-        _enqueue_command("sample", sample_cmd, run_id=run_id)
+        if args.sample:
+            _enqueue_command("sample", sample_cmd, run_id=run_id)
 
 
 def cmd_pull(args):
@@ -1513,8 +1514,9 @@ def main():
 
     p_rm = sub.add_parser("rm", help="Remove a pending or running command")
     p_rm.add_argument("cmd_id", nargs="?", default=None, help="Command ID(s) to remove: single, comma-separated, or ranges (e.g. 3-7)")
-    p_sweep = sub.add_parser("sweep", help="Sweep: train+sample for cartesian product of comma-separated overrides")
+    p_sweep = sub.add_parser("sweep", help="Sweep: train for cartesian product of comma-separated overrides")
     p_sweep.add_argument("config_path", help="Config file path")
+    p_sweep.add_argument("--sample", action="store_true", help="Also enqueue a sample command for each run")
     p_sweep.add_argument("overrides", nargs=argparse.REMAINDER, help="Overrides (comma-separated values are swept)")
 
     p_pull = sub.add_parser("pull", help="Git fetch and reset to origin/master on the pod")
