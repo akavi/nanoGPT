@@ -135,9 +135,11 @@ class DeTokenizer(nn.Module):
     to original sequence length via cumulative chunk indexing.
     """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, norm: bool = False):
         super().__init__()
         self.d_model = d_model
+        self.norm_main = RMSNorm(d_model) if norm else None
+        self.norm_res = RMSNorm(d_model) if norm else None
         self.register_buffer('_device_buf', torch.empty(0), persistent=False)
 
     def forward(
@@ -203,12 +205,16 @@ class DeTokenizer(nn.Module):
 
         # Residual add-back (in fp32)
         out_dtype = long_states.dtype
-        res_f = residual.float()
+        if self.norm_main is not None:
+            long_states = self.norm_main(long_states)
         if self.training and residual_drop > 0:
-            # Per-position dropout on residual path
             keep = torch.bernoulli(torch.full((B, L, 1), 1 - residual_drop, device=device))
-            res_f = res_f * keep
-        output = (res_f + long_states.float()).to(out_dtype)
+            residual = residual * keep
+            output = (residual.float() + long_states.float()).to(out_dtype)
+        else:
+            if self.norm_res is not None:
+                residual = self.norm_res(residual)
+            output = (residual.float() + long_states.float()).to(out_dtype)
 
         # Compute new state: last EMA output per batch element
         new_state = residual.new_zeros(B, D)
@@ -235,7 +241,7 @@ class CrossAttentionDeTokenizer(nn.Module):
     Drop-in replacement for DeTokenizer.
     """
 
-    def __init__(self, d_model: int, n_head: int = 4):
+    def __init__(self, d_model: int, n_head: int = 4, norm: bool = False):
         super().__init__()
         self.d_model = d_model
         self.n_head = n_head
@@ -243,6 +249,8 @@ class CrossAttentionDeTokenizer(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.norm_main = RMSNorm(d_model) if norm else None
+        self.norm_res = RMSNorm(d_model) if norm else None
         self.register_buffer('_device_buf', torch.empty(0), persistent=False)
 
     def forward(
@@ -286,11 +294,16 @@ class CrossAttentionDeTokenizer(nn.Module):
 
         # Residual add-back (in fp32)
         out_dtype = long_states.dtype
-        res_f = residual.float()
+        if self.norm_main is not None:
+            long_states = self.norm_main(long_states)
         if self.training and residual_drop > 0:
             keep = torch.bernoulli(torch.full((B, L, 1), 1 - residual_drop, device=device))
-            res_f = res_f * keep
-        output = (res_f + long_states.float()).to(out_dtype)
+            residual = residual * keep
+            output = (residual.float() + long_states.float()).to(out_dtype)
+        else:
+            if self.norm_res is not None:
+                residual = self.norm_res(residual)
+            output = (residual.float() + long_states.float()).to(out_dtype)
 
         # State: last valid compressed token per batch element
         new_state = residual.new_zeros(B, D)
@@ -301,7 +314,7 @@ class CrossAttentionDeTokenizer(nn.Module):
             elif state is not None:
                 new_state[b] = state[b]
 
-        return output, new_state, {'residual_norm': res_f.norm().item(), 'main_norm': long_states.float().norm().item()}
+        return output, new_state, {'residual_norm': residual.float().norm().item(), 'main_norm': long_states.float().norm().item()}
 
     def initial_state(self, batch_size):
         device = self._device_buf.device

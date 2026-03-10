@@ -47,6 +47,7 @@ overridable = override(sys.argv, {
     "ratio_override": "",              # "" = use shape ratio; float or "cos:start:end" / "lin:start:end" schedule
     "routing": "cosine_sim",       # "cosine_sim", "linear_sigmoid", "mlp_sigmoid", "mlp_pairwise", "fixed_stride"
     "detokenizer": "ema",          # "ema" or "cross_attention"
+    "detok_norm": False,           # RMSNorm both paths before detokenizer residual add
     "pos_emb": "rope_2d",          # "learned", "rope_1d", or "rope_2d"
 })
 
@@ -269,17 +270,17 @@ def _make_router(routing: str, d_model: int, ratio: int = 4) -> Router:
     return Router(d_model, strategies[routing]())
 
 
-def _make_detokenizer(detokenizer: str, d_model: int):
+def _make_detokenizer(detokenizer: str, d_model: int, detok_norm: bool = False):
     """Build a DeTokenizer variant."""
     if detokenizer == 'ema':
-        return DeTokenizer(d_model)
+        return DeTokenizer(d_model, norm=detok_norm)
     elif detokenizer == 'cross_attention':
-        return CrossAttentionDeTokenizer(d_model)
+        return CrossAttentionDeTokenizer(d_model, norm=detok_norm)
     else:
         raise ValueError(f"Unknown detokenizer {detokenizer!r}, expected 'ema' or 'cross_attention'")
 
 
-def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn):
+def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn, detok_norm=False):
     """Recursively build from a parsed shape. Returns (module, d_model).
 
     For 'leaf': returns (Stage, d_model)
@@ -300,7 +301,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
 
         pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
         post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
-        main_stage, d_inner = _build(inner_parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn)
+        main_stage, d_inner = _build(inner_parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn, detok_norm)
 
         up_proj = torch.nn.Linear(d_model, d_inner, bias=False)
         down_proj = torch.nn.Linear(d_inner, d_model, bias=False)
@@ -325,7 +326,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
 
     pre_stage = _make_attn_stage(pre_n, d_model, pre_h, block_size, bias, dropout, rope_fn=rope_fn)
     post_stage = _make_attn_stage(post_n, d_model, post_h, block_size, bias, dropout, rope_fn=rope_fn)
-    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn)
+    main_stage, d_inner = _build(inner_parsed, inner_block_size, n_head_default, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn, detok_norm)
 
     pad_dim = d_inner - d_model
     hnet = HNet(
@@ -334,7 +335,7 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
         main_stage=main_stage,
         post_stage=post_stage,
         router=_make_router(routing, d_model, ratio=int(ratio)),
-        detokenizer=_make_detokenizer(detokenizer, d_model),
+        detokenizer=_make_detokenizer(detokenizer, d_model, detok_norm),
         residual_proj=_make_residual_proj(d_model),
         pad_parameter=torch.nn.Parameter(torch.zeros(pad_dim)) if pad_dim > 0 else None,
         target_ratio=float(ratio),
@@ -362,6 +363,7 @@ def make_hnet(
     detach_residual,
     residual_drop_fn,
     ratio_override_fn,
+    detok_norm=False,
 ):
     nn = torch.nn
     parsed = parse_shape(shape_str)
@@ -377,7 +379,7 @@ def make_hnet(
         coords = pos_coords
         rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
 
-    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn)
+    backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn, detok_norm)
 
     embeddings = nn.Embedding(vocab_size, d_model)
     lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -427,6 +429,7 @@ model = make_hnet(
     detach_residual=overridable['detach_residual'],
     residual_drop_fn=_residual_drop_fn,
     ratio_override_fn=_ratio_override_fn,
+    detok_norm=overridable['detok_norm'],
 )
 
 optimizer_config = OptimizerConfig(
