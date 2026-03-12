@@ -353,16 +353,20 @@ class Stage(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x: Tensor, state: list, positions: Tensor | None = None) -> tuple[Tensor, list]:
+    def forward(self, x: Tensor, state: list, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, list, tuple[Tensor, dict[str, float]]]:
         new_state = []
         for block, s in zip(self.blocks, state):
             x, s_new = block(x, s, positions=positions)
             new_state.append(s_new)
         x = self.final_norm(x)
-        return x, new_state
+        return x, new_state, (torch.tensor(0.0, device=x.device), {})
 
     def initial_state(self, batch_size):
         return [block.initial_state(batch_size) for block in self.blocks]
+
+    def optim_groups(self, lr_scale: float = 1.0) -> list[dict]:
+        from utils import decay_nodecay_groups
+        return decay_nodecay_groups(list(self.parameters()), lr_scale)
 
     def flops_per_fwdbwd(self):
         return sum(block.flops_per_fwdbwd() for block in self.blocks)
@@ -424,7 +428,7 @@ class AnisotropicStack(nn.Module):
         self.down_proj = down_proj
         self.inner_lr_ratio = inner_lr_ratio
 
-    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
+    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, dict, tuple[Tensor, dict[str, float]]]:
         # 1. Pre-stage
         x, pre_state = self.pre_stage(x, state['pre'], positions=positions)
 
@@ -432,12 +436,7 @@ class AnisotropicStack(nn.Module):
         x = self.up_proj(x)
 
         # 3. Main stage (inner dimension)
-        if isinstance(self.main_stage, (HNet, AnisotropicStack)):
-            x, main_state, aux_loss, metrics = self.main_stage(x, state['main'], positions=positions, train_step=train_step)
-        else:
-            x, main_state = self.main_stage(x, state['main'], positions=positions)
-            aux_loss = torch.tensor(0.0, device=x.device)
-            metrics = {}
+        x, main_state, (aux_loss, metrics) = self.main_stage(x, state['main'], positions=positions, train_step=train_step)
 
         # 4. Project down to outer dimension
         x = self.down_proj(x)
@@ -446,7 +445,7 @@ class AnisotropicStack(nn.Module):
         x, post_state = self.post_stage(x, state['post'], positions=positions)
 
         new_state = {'pre': pre_state, 'main': main_state, 'post': post_state}
-        return x, new_state, aux_loss, metrics
+        return x, new_state, (aux_loss, metrics)
 
     def optim_groups(self, lr_scale: float = 1.0) -> list[dict]:
         from utils import decay_nodecay_groups
@@ -457,10 +456,7 @@ class AnisotropicStack(nn.Module):
         groups = decay_nodecay_groups(outer_params, lr_scale)
 
         inner_scale = lr_scale / self.inner_lr_ratio
-        if isinstance(self.main_stage, (HNet, AnisotropicStack)):
-            groups += self.main_stage.optim_groups(lr_scale=inner_scale)
-        else:
-            groups += decay_nodecay_groups(self.main_stage.parameters(), inner_scale)
+        groups += self.main_stage.optim_groups(lr_scale=inner_scale)
         return groups
 
     def initial_state(self, batch_size):
@@ -544,7 +540,7 @@ class HNet(nn.Module):
         progress = iter_num / max_iters if max_iters > 0 else 1.0
         return self.residual_drop_fn(progress)
 
-    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, dict, Tensor, dict[str, float]]:
+    def forward(self, x: Tensor, state: dict, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, dict, tuple[Tensor, dict[str, float]]]:
         B, L, D = x.shape
 
         # 1. Pre-stage (encoder)
@@ -579,13 +575,10 @@ class HNet(nn.Module):
         metrics: dict[str, float] = {'ratio': ratio, 'prob_mean': prob_mean, **router_metrics}
         M = chunked.shape[1]
         if M > 0:
-            if isinstance(self.main_stage, HNet):
-                chunked, main_state, inner_aux, inner_metrics = self.main_stage(chunked, state['main'], positions=inner_positions, train_step=train_step)
-                aux_loss = aux_loss + inner_aux
-                for k, v in inner_metrics.items():
-                    metrics[f'inner_{k}'] = v
-            else:
-                chunked, main_state = self.main_stage(chunked, state['main'], positions=inner_positions)
+            chunked, main_state, (inner_aux, inner_metrics) = self.main_stage(chunked, state['main'], positions=inner_positions, train_step=train_step)
+            aux_loss = aux_loss + inner_aux
+            for k, v in inner_metrics.items():
+                metrics[f'inner_{k}'] = v
         else:
             main_state = state['main']
 
@@ -611,7 +604,7 @@ class HNet(nn.Module):
             'router': router_state,
             'detokenizer': detok_state,
         }
-        return x, new_state, aux_loss, metrics
+        return x, new_state, (aux_loss, metrics)
 
     def optim_groups(self, lr_scale: float = 1.0) -> list[dict]:
         from utils import decay_nodecay_groups
@@ -625,10 +618,7 @@ class HNet(nn.Module):
         groups = decay_nodecay_groups(outer_params, lr_scale)
 
         inner_scale = lr_scale / self.inner_lr_ratio
-        if isinstance(self.main_stage, HNet):
-            groups += self.main_stage.optim_groups(lr_scale=inner_scale)
-        else:
-            groups += decay_nodecay_groups(self.main_stage.parameters(), inner_scale)
+        groups += self.main_stage.optim_groups(lr_scale=inner_scale)
         return groups
 
     def initial_state(self, batch_size):
@@ -646,182 +636,4 @@ class HNet(nn.Module):
                self.post_stage.flops_per_fwdbwd()
 
 
-class HNetLM(nn.Module):
-    """H-Net Language Model wrapper. Conforms to TrainModel protocol.
-
-    Wraps a fully-assembled HNet backbone with token embeddings, positional
-    embeddings, and an LM head.
-    """
-
-    def __init__(
-        self,
-        backbone: HNet,
-        embeddings: nn.Embedding,
-        lm_head: nn.Linear,
-        wpe: nn.Embedding | None = None,
-        ratio_loss_weight: float = 0.01,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.embeddings = embeddings
-        self.lm_head = lm_head
-        self.wpe = wpe
-        self.ratio_loss_weight = ratio_loss_weight
-
-    def forward(self, idx: Tensor, state, targets: Tensor | None = None, train_step: tuple[int, int] | None = None):
-        """TrainModel protocol: (logits, state, loss, metrics)."""
-        L = idx.size(1)
-        offset = state['pre'][0][0].size(2)  # cached seq len
-        positions = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
-        x = self.embeddings(idx)
-        if self.wpe is not None:
-            x = x + self.wpe(positions)
-        x, state, ratio_loss, metrics = self.backbone(x, state, positions=positions, train_step=train_step)
-
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-            )
-            metrics['ce_loss'] = loss.item()
-            metrics['ratio_loss'] = ratio_loss.item()
-            loss = loss + self.ratio_loss_weight * ratio_loss
-        else:
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
-
-        return logits, state, loss, metrics
-
-    def initial_state(self, batch_size):
-        return self.backbone.initial_state(batch_size)
-
-    def optim_groups(self) -> list[dict]:
-        from utils import decay_nodecay_groups
-        embed_params = list(self.embeddings.parameters()) + \
-                       list(self.lm_head.parameters())
-        if self.wpe is not None:
-            embed_params += list(self.wpe.parameters())
-        groups = decay_nodecay_groups(embed_params)
-        groups += self.backbone.optim_groups()
-        return groups
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
-        # Feed prompt or single token, sample, repeat
-        cur = idx
-        for _ in range(max_new_tokens):
-            logits, state, _, _ = self(cur, state)
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-            cur = idx_next  # subsequent iterations feed only the new token
-        return idx
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear) and not getattr(module.weight, '_no_reinit', False):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None and not getattr(module.bias, '_no_reinit', False):
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def get_num_params(self):
-        return sum(p.numel() for p in self.parameters())
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        return -1.0
-
-    def flops_per_fwdbwd(self):
-        return self.backbone.flops_per_fwdbwd()
-
-
-class StageLM(nn.Module):
-    """Flat (no-hierarchy) LM wrapper. Conforms to TrainModel protocol.
-
-    Wraps a bare Stage with token embeddings, positional embeddings, and LM head.
-    Used when the shape string is a leaf (e.g. "6x64") with no HNet hierarchy.
-    """
-
-    def __init__(
-        self,
-        backbone: Stage,
-        embeddings: nn.Embedding,
-        lm_head: nn.Linear,
-        wpe: nn.Embedding | None = None,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.embeddings = embeddings
-        self.lm_head = lm_head
-        self.wpe = wpe
-
-    def forward(self, idx: Tensor, state, targets: Tensor | None = None, train_step: tuple[int, int] | None = None):
-        L = idx.size(1)
-        offset = state[0][0].size(2)  # cached seq len from first block's K cache
-        positions = torch.arange(offset, offset + L, dtype=torch.long, device=idx.device)
-        x = self.embeddings(idx)
-        if self.wpe is not None:
-            x = x + self.wpe(positions)
-        x, state = self.backbone(x, state, positions=positions)
-
-        metrics: dict[str, float] = {}
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-            )
-            metrics['ce_loss'] = loss.item()
-        else:
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
-
-        return logits, state, loss, metrics
-
-    def initial_state(self, batch_size):
-        return self.backbone.initial_state(batch_size)
-
-    def optim_groups(self) -> list[dict]:
-        from utils import decay_nodecay_groups
-        params = list(self.parameters())
-        return decay_nodecay_groups(params)
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, state, temperature=1.0, top_k=None):
-        cur = idx
-        for _ in range(max_new_tokens):
-            logits, state, _, _ = self(cur, state)
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-            cur = idx_next
-        return idx
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear) and not getattr(module.weight, '_no_reinit', False):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None and not getattr(module.bias, '_no_reinit', False):
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def get_num_params(self):
-        return sum(p.numel() for p in self.parameters())
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        return -1.0
-
-    def flops_per_fwdbwd(self):
-        return self.backbone.flops_per_fwdbwd()
 

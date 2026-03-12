@@ -10,6 +10,7 @@ from typing import Any, Protocol, Literal
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import Optimizer
 
@@ -22,8 +23,7 @@ class TrainModel(Protocol):
 
     Any nn.Module that:
     - has initial_state(B) -> some state
-    - has estimate_mfu(batch_size, dt) -> float
-    - is callable as model(x, state, y) -> (logits, new_state, loss)
+    - is callable as model(x, state) -> (logits, new_state, aux)
     - supports .to(), .train(), .eval()
     will satisfy this.
     """
@@ -40,12 +40,12 @@ class TrainModel(Protocol):
         self,
         x: Tensor,
         state: Any,
-        y: Tensor,
         train_step: tuple[int, int] | None = None,
-    ) -> tuple[Tensor, Any, Tensor, dict[str, float]]: ...
-    # (logits, new_state, loss, metrics)
+    ) -> tuple[Tensor, Any, Any]: ...
+    # (logits, new_state, aux)
     # train_step = (iter_num, max_iters) when training, None at eval
 
+LossFn = Callable[[Tensor, Tensor, Any], tuple[Tensor, dict[str, float]]]
 GetBatchFn = Callable[[Split, int], tuple[Tensor, Tensor]]
 SaveCheckpointFn = Callable[
     [int, float, "TrainConfig", TrainModel, Optimizer],
@@ -93,6 +93,10 @@ def train(
     get_batch: GetBatchFn,
     save_checkpoint: SaveCheckpointFn,
     config: TrainConfig,
+    loss_fn: LossFn = lambda logits, targets, aux: (
+        F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1),
+        {},
+    ),
 ) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -135,7 +139,7 @@ def train(
 
         # eval + checkpoint
         if iter_num % config.eval_interval == 0:
-            losses = estimate_loss(model, get_batch, config, ctx)
+            losses = estimate_loss(model, get_batch, config, ctx, loss_fn)
             print(
                 f"step {iter_num}: "
                 f"train loss {losses['train']:.4f}, "
@@ -161,7 +165,8 @@ def train(
             B = x.shape[0]
             state = model.initial_state(B)
             with ctx:
-                _, state, loss, metrics = model(x, state, y, train_step=(iter_num, config.max_iters))
+                logits, state, aux = model(x, state, train_step=(iter_num, config.max_iters))
+                loss, metrics = loss_fn(logits, y, aux)
                 loss = loss / config.gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
             # accumulate metrics (average across micro steps)
@@ -254,6 +259,10 @@ def estimate_loss(
     get_batch: GetBatchFn,
     config: TrainConfig,
     ctx: AbstractContextManager[None],
+    loss_fn: LossFn = lambda logits, targets, aux: (
+        F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1),
+        {},
+    ),
 ) -> dict[str, float]:
     """
     Simple (non-chunked) evaluation over eval_iters batches.
@@ -269,7 +278,8 @@ def estimate_loss(
             B, T = x.shape[0], x.shape[1]
             state = model.initial_state(B)
             with ctx:
-                _, state, loss, _ = model(x, state, y)
+                logits, state, aux = model(x, state)
+                loss, _ = loss_fn(logits, y, aux)
 
             total_loss_weighted += loss.item() * (B * T)
             total_tokens += B * T

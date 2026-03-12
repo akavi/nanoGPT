@@ -6,7 +6,10 @@ from PIL import Image
 import torch
 import os
 
-from models.hnet.model import HNet, HNetLM, StageLM, Stage, DeTokenizer, CrossAttentionDeTokenizer, AnisotropicStack
+import torch.nn.functional as F
+
+from models.hnet.model import HNet, Stage, DeTokenizer, CrossAttentionDeTokenizer, AnisotropicStack
+from models.lm import PatchLM, CategoricalLM
 from models.hnet.router import Router, CosineSimRouting, LinearSigmoidRouting, MLPSigmoidRouting, MLPPairwiseRouting, FixedStrideRouting
 from models.model import CsaConfig, CsaBlock
 from train import train, TrainConfig
@@ -23,6 +26,7 @@ from utils import (
     override,
 )
 from data.image_anime_face.prepare import prepare as prepare_image_anime_face
+from data.image_imagenet64.prepare import prepare as prepare_image_imagenet64
 
 overridable = override(sys.argv, {
     "out_dir": "out-face-hnet",
@@ -33,8 +37,10 @@ overridable = override(sys.argv, {
     "learning_rate": 3e-4,
     "min_lr": 3e-5,
     "bias": False,
-    "block_size": 1024,
+    "block_size": 0,            # 0 = auto from image dims / patch_size
     "batch_size": 128,
+    "patch_size": 1,            # 1 = pixel-level, 4 = 4x4 patches
+    "embedding": "linear",      # "linear" (nn.Linear patch projection) or "categorical" (nn.Embedding lookup)
     "max_iters": 3000,
     "sampled_batch": True,
     # H-Net options
@@ -100,12 +106,28 @@ shape = overridable['shape']
 shape_str = SHAPE_ALIASES.get(shape, shape)
 
 # -----------------------------------------------------------------------------#
-# Rasterization order
+# Dataset + patch config & rasterization order
 # -----------------------------------------------------------------------------#
 
+DATASET_CONFIGS = {
+    "image_anime_face": {"H": 32, "W": 32, "C": 1, "prepare": prepare_image_anime_face},
+    "image_imagenet64": {"H": 64, "W": 64, "C": 3, "prepare": prepare_image_imagenet64},
+}
+
+_ds_cfg = DATASET_CONFIGS[overridable['dataset']]
 BOS_ID = 0
-H, W, C = 32, 32, 1
-TOKENS_LINEAR = H * W * C
+H, W, C = _ds_cfg['H'], _ds_cfg['W'], _ds_cfg['C']
+P = overridable['patch_size']
+assert H % P == 0 and W % P == 0, f"patch_size {P} must divide image dims {H}x{W}"
+
+n_patches = (H // P) * (W // P)
+patch_dim = P * P * C
+
+if overridable['block_size'] == 0:
+    if overridable['embedding'] == 'categorical':
+        overridable['block_size'] = n_patches * patch_dim
+    else:
+        overridable['block_size'] = n_patches
 
 def _hilbert_d2xy(n, d):
     x = y = 0
@@ -134,11 +156,15 @@ def _build_hilbert_order(h, w):
             order.append(y * w + x)
     return order
 
+# Grid dimensions for rasterization (= patch grid; P=1 degenerates to pixel grid)
+GRID_H = H // P
+GRID_W = W // P
+
 raster = overridable['raster']
 assert raster in ("linear", "hilbert"), f"raster must be 'linear' or 'hilbert', got {raster!r}"
 
 if raster == "hilbert":
-    HILBERT_ORDER = _build_hilbert_order(H, W)
+    HILBERT_ORDER = _build_hilbert_order(GRID_H, GRID_W)
     INV_HILBERT_ORDER = [0] * len(HILBERT_ORDER)
     for i, li in enumerate(HILBERT_ORDER):
         INV_HILBERT_ORDER[li] = i
@@ -149,9 +175,9 @@ if raster == "hilbert":
 pos_coords = None
 if overridable['pos_emb'] == 'rope_2d':
     if raster == 'hilbert':
-        coords_list = [_hilbert_d2xy(max(H, W), d) for d in range(H * W)]
+        coords_list = [_hilbert_d2xy(max(GRID_H, GRID_W), d) for d in range(GRID_H * GRID_W)]
     else:
-        coords_list = [(i % W, i // W) for i in range(H * W)]
+        coords_list = [(i % GRID_W, i // GRID_W) for i in range(GRID_H * GRID_W)]
     # Pad position 0 (BOS) with (0, 0)
     pos_coords = torch.tensor([(0, 0)] + coords_list, dtype=torch.long, device=overridable['device'])
 
@@ -347,6 +373,30 @@ def _build(parsed, block_size, n_head_default, bias, dropout, rope_fn, routing, 
     return hnet, d_model
 
 
+# -----------------------------------------------------------------------------#
+# Patch helpers
+# -----------------------------------------------------------------------------#
+
+def _pixels_to_patches(pixels, B):
+    """Reshape [B, H*W*C] pixel values to [B, n_patches, patch_dim] patches."""
+    return (pixels.view(B, H, W, C)
+            .view(B, H // P, P, W // P, P, C)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(B, n_patches, patch_dim))
+
+
+def _patches_to_image(patches):
+    """Reshape [n_patches, patch_dim] patches to numpy [H, W, C] uint8."""
+    t = (patches.view(H // P, W // P, P, P, C)
+         .permute(0, 2, 1, 3, 4)
+         .reshape(H, W, C))
+    return t.cpu().numpy().astype(np.uint8)
+
+
+# -----------------------------------------------------------------------------#
+# Model factory
+# -----------------------------------------------------------------------------#
+
 def make_hnet(
     shape_str,
     block_size,
@@ -354,7 +404,7 @@ def make_hnet(
     n_head,
     bias,
     dropout,
-    ratio_loss_weight,
+    embedding,
     pos_emb,
     pos_coords,
     routing,
@@ -364,6 +414,7 @@ def make_hnet(
     residual_drop_fn,
     ratio_override_fn,
     detok_norm=False,
+    patch_dim=1,
 ):
     nn = torch.nn
     parsed = parse_shape(shape_str)
@@ -381,25 +432,23 @@ def make_hnet(
 
     backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn, detok_norm)
 
-    embeddings = nn.Embedding(vocab_size, d_model)
-    lm_head = nn.Linear(d_model, vocab_size, bias=False)
     wpe = nn.Embedding(block_size, d_model) if pos_emb == 'learned' else None
 
-    if isinstance(backbone, (HNet, AnisotropicStack)):
-        model = HNetLM(
-            backbone=backbone,
-            embeddings=embeddings,
-            lm_head=lm_head,
-            wpe=wpe,
-            ratio_loss_weight=ratio_loss_weight,
+    if embedding == 'linear':
+        embeddings = nn.Linear(patch_dim, d_model, bias=False)
+        lm_head = nn.Linear(d_model, patch_dim * vocab_size, bias=False)
+        model = PatchLM(
+            backbone=backbone, embeddings=embeddings, lm_head=lm_head, wpe=wpe,
+            patch_dim=patch_dim, vocab_size=vocab_size,
+        )
+    elif embedding == 'categorical':
+        embeddings = nn.Embedding(vocab_size, d_model)
+        lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        model = CategoricalLM(
+            backbone=backbone, embeddings=embeddings, lm_head=lm_head, wpe=wpe,
         )
     else:
-        model = StageLM(
-            backbone=backbone,
-            embeddings=embeddings,
-            lm_head=lm_head,
-            wpe=wpe,
-        )
+        raise ValueError(f"Unknown embedding type {embedding!r}, expected 'linear' or 'categorical'")
 
     model.apply(model._init_weights)
     print(f"number of parameters: {model.get_num_params()/1e6:.2f}M")
@@ -411,16 +460,17 @@ def make_hnet(
 # -----------------------------------------------------------------------------#
 
 torch.manual_seed(overridable['seed'])
-meta = init_sampled_data(overridable['dataset'], prepare_image_anime_face)
+meta = init_sampled_data(overridable['dataset'], _ds_cfg['prepare'])
 
 model = make_hnet(
     shape_str=shape_str,
     vocab_size=256,
     block_size=overridable['block_size'],
+    patch_dim=patch_dim,
     n_head=8,
     bias=overridable['bias'],
     dropout=0.0,
-    ratio_loss_weight=overridable['ratio_loss_weight'],
+    embedding=overridable['embedding'],
     pos_emb=overridable['pos_emb'],
     pos_coords=pos_coords,
     routing=overridable['routing'],
@@ -457,33 +507,48 @@ else:
 # -----------------------------------------------------------------------------#
 
 def detokenize(tokens: torch.Tensor) -> Image.Image:
+    """Inverse rasterization: tokens (with BOS at index 0) -> PIL Image.
+
+    For linear embedding: [n_patches+1, patch_dim] int
+    For categorical embedding: [n_patches*patch_dim+1] int
+    """
     t = tokens[1:].cpu()
+    if _embedding == 'categorical':
+        # [n_patches * patch_dim] -> [n_patches, patch_dim]
+        t = t[:n_patches * patch_dim].view(n_patches, patch_dim)
     if raster == "hilbert":
-        linear = torch.zeros(TOKENS_LINEAR, dtype=t.dtype)
+        linear = torch.zeros(n_patches, patch_dim, dtype=t.dtype)
         linear[HILBERT_ORDER_T] = t
         t = linear
-    img = np.asarray(t, dtype=np.uint8).reshape(H, W)
-    return Image.fromarray(img, mode="L")
+    arr = _patches_to_image(t)
+    if C == 1:
+        return Image.fromarray(arr.squeeze(-1), mode="L")
+    return Image.fromarray(arr, mode="RGB")
 
 _get_raw_batch = get_sampled_batch if overridable['sampled_batch'] else get_fixed_batch
+_data_config = DataConfig(dataset=overridable['dataset'], device=overridable['device'])
+_embedding = overridable['embedding']
 
 def get_batch(split, batch_size):
-    rows = _get_raw_batch(
-        split,
-        batch_size,
-        DataConfig(
-            dataset=overridable['dataset'],
-            device=overridable['device'],
-        ),
-    )
+    rows = _get_raw_batch(split, batch_size, _data_config)
+    B = rows.shape[0]
+    patches = _pixels_to_patches(rows, B)  # [B, n_patches, patch_dim]
     if raster == "hilbert":
-        rows = rows[:, HILBERT_ORDER_T.to(rows.device)]
-
+        patches = patches[:, HILBERT_ORDER_T.to(patches.device)]
     block_size = overridable['block_size']
-    first_col = torch.full((batch_size, 1), BOS_ID, dtype=rows.dtype, device=rows.device)
-    x_out = torch.cat([first_col, rows[:, :-1]], dim=1).long()
-    y_out = rows[:, 0:block_size + 1].contiguous().long()
-    return x_out, y_out
+
+    if _embedding == 'linear':
+        # x: [B, T, patch_dim] float, y: [B, T, patch_dim] int
+        bos = torch.zeros(B, 1, patch_dim, dtype=torch.float32, device=patches.device)
+        x = torch.cat([bos, patches[:, :block_size - 1].float() / 255.0], dim=1)
+        y = patches[:, :block_size].contiguous().long()
+    else:
+        # Flatten patches to scalar tokens: [B, n_patches * patch_dim]
+        flat = patches.reshape(B, -1).long()  # [B, n_patches * patch_dim]
+        bos = torch.zeros(B, 1, dtype=torch.long, device=flat.device)
+        x = torch.cat([bos, flat[:, :block_size - 1]], dim=1)
+        y = flat[:, :block_size].contiguous()
+    return x, y
 
 # -----------------------------------------------------------------------------#
 # TrainConfig and train() call
@@ -515,6 +580,17 @@ train_config = TrainConfig(
     compile=False,
 )
 
+_ratio_loss_weight = overridable['ratio_loss_weight']
+
+def loss_fn(logits, targets, aux):
+    """Compute cross-entropy + weighted ratio loss from backbone aux."""
+    ratio_loss, backbone_metrics = aux
+    V = logits.shape[-1]
+    ce_loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=-1)
+    metrics = {'ce_loss': ce_loss.item(), 'ratio_loss': ratio_loss.item(), **backbone_metrics}
+    loss = ce_loss + _ratio_loss_weight * ratio_loss
+    return loss, metrics
+
 if mode == "resume" or mode == "from_scratch":
     train(
         model=model,
@@ -524,10 +600,14 @@ if mode == "resume" or mode == "from_scratch":
             overridable['out_dir'], it, val_loss, cfg, mdl, opt,
         ),
         config=train_config,
+        loss_fn=loss_fn,
     )
 else:
     def init_gen(device):
-        return torch.zeros((1, 1), dtype=int, device=device)
+        if _embedding == 'linear':
+            return torch.zeros((1, 1, patch_dim), dtype=torch.float32, device=device)
+        else:
+            return torch.zeros((1, 1), dtype=torch.long, device=device)
 
     def detokenize_and_save(tokens: np.ndarray, path: str):
         img = detokenize(tokens)
@@ -536,7 +616,7 @@ else:
 
     sample_config = SampleConfig(
         num_samples=10,
-        max_new_tokens=1024,
+        max_new_tokens=overridable['block_size'],
         temperature=0.8,
         top_k=200,
         seed=1337,

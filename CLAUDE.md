@@ -60,6 +60,7 @@ CLI for Prime Intellect GPU pods. State in `~/.pi/state.json`. Commands queued t
 
 ## Key Conventions
 
+- **Degenerate cases over special-case branches.** Before writing an `if`/`else` that separates a "simple" case from a "general" case, check whether the simple case is just the general case with trivial parameters (size-1, identity, etc.). If so, delete the branch. If almost, consider whether a cost-free data-structure change (e.g. adding a trivial dimension) makes it degenerate — for example, giving a pixel tensor a trailing patch dim of 1 so pixel-level and patch-level code share a single path.
 - Trust the invariants. Don't add `Optional`/`None` paths defensively — we own the code and can enforce invariants at the source. If `initial_state()` returns a tensor, the parameter type is `Tensor`, not `Tensor | None`.
 - `state` is explicitly threaded through model forward passes (not hidden in the model) to support both transformer KV-cache and SSM inference state
 - Weight tying between token embeddings and output head is standard
