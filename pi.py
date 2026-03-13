@@ -995,7 +995,8 @@ def cmd_sample(args):
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    override_str = " ".join(shlex.quote(o) for o in overrides)
+    all_overrides = run.get("overrides", []) + overrides
+    override_str = " ".join(shlex.quote(o) for o in all_overrides)
     sample_cmd = f"cd ~/nanoGPT && uv run {config} --mode=sample --out_dir=outputs/{run_id} {override_str}".strip()
 
     print(f"Sampling run {run_id}: {config} → outputs/{run_id}/")
@@ -1012,7 +1013,8 @@ def cmd_resume(args):
         print(f"Error: Run {run_id} has no config recorded.")
         sys.exit(1)
 
-    override_str = " ".join(shlex.quote(o) for o in overrides)
+    all_overrides = run.get("overrides", []) + overrides
+    override_str = " ".join(shlex.quote(o) for o in all_overrides)
     resume_cmd = f"cd ~/nanoGPT && uv run {config} --mode=resume --out_dir=outputs/{run_id} {override_str}".strip()
 
     print(f"Resuming run {run_id}: {config} → outputs/{run_id}/")
