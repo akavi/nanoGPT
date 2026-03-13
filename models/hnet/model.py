@@ -430,7 +430,7 @@ class AnisotropicStack(nn.Module):
 
     def forward(self, x: Tensor, state: dict, positions: Tensor | None = None, train_step: tuple[int, int] | None = None) -> tuple[Tensor, dict, tuple[Tensor, dict[str, float]]]:
         # 1. Pre-stage
-        x, pre_state = self.pre_stage(x, state['pre'], positions=positions)
+        x, pre_state, _ = self.pre_stage(x, state['pre'], positions=positions)
 
         # 2. Project up to inner dimension
         x = self.up_proj(x)
@@ -442,7 +442,7 @@ class AnisotropicStack(nn.Module):
         x = self.down_proj(x)
 
         # 5. Post-stage
-        x, post_state = self.post_stage(x, state['post'], positions=positions)
+        x, post_state, _ = self.post_stage(x, state['post'], positions=positions)
 
         new_state = {'pre': pre_state, 'main': main_state, 'post': post_state}
         return x, new_state, (aux_loss, metrics)
@@ -544,7 +544,7 @@ class HNet(nn.Module):
         B, L, D = x.shape
 
         # 1. Pre-stage (encoder)
-        x, pre_state = self.pre_stage(x, state['pre'], positions=positions)
+        x, pre_state, _ = self.pre_stage(x, state['pre'], positions=positions)
 
         # 2. Residual projection (in fp32 for stability)
         device_type = 'cuda' if x.is_cuda else ('mps' if x.is_mps else 'cpu')
@@ -595,7 +595,7 @@ class HNet(nn.Module):
         metrics.update(detok_metrics)
 
         # 10. Post-stage (decoder)
-        x, post_state = self.post_stage(x, state['post'], positions=positions)
+        x, post_state, _ = self.post_stage(x, state['post'], positions=positions)
 
         new_state = {
             'pre': pre_state,
