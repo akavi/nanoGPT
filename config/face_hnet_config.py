@@ -27,6 +27,7 @@ from utils import (
 )
 from data.image_anime_face.prepare import prepare as prepare_image_anime_face
 from data.image_imagenet64.prepare import prepare as prepare_image_imagenet64
+from data.image_ffhq64.prepare import prepare as prepare_image_ffhq64
 
 overridable = override(sys.argv, {
     "out_dir": "out-face-hnet",
@@ -113,6 +114,7 @@ shape_str = SHAPE_ALIASES.get(shape, shape)
 DATASET_CONFIGS = {
     "image_anime_face": {"H": 32, "W": 32, "C": 1, "prepare": prepare_image_anime_face},
     "image_imagenet64": {"H": 64, "W": 64, "C": 3, "prepare": prepare_image_imagenet64},
+    "image_ffhq64":     {"H": 64, "W": 64, "C": 3, "prepare": prepare_image_ffhq64},
 }
 
 _ds_cfg = DATASET_CONFIGS[overridable['dataset']]
