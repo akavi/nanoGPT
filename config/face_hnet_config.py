@@ -42,6 +42,7 @@ overridable = override(sys.argv, {
     "patch_size": 1,            # 1 = pixel-level, 4 = 4x4 patches
     "embedding": "linear",      # "linear" (nn.Linear patch projection) or "categorical" (nn.Embedding lookup)
     "max_iters": 3000,
+    "warmup_iters": 300,
     "sampled_batch": True,
     # H-Net options
     "shape": "balanced",       # "balanced" or "narrow_shell"
@@ -571,7 +572,7 @@ train_config = TrainConfig(
     eval_only=False,
     eval_interval=250,
     eval_iters=20,
-    warmup_iters=300,
+    warmup_iters=overridable['warmup_iters'],
     max_iters=overridable['max_iters'],
 
     log_interval=1,

@@ -558,7 +558,7 @@ def _execute_command(state, cmd_entry):
     # Send command to tmux, tee to log, write exit code
     separator = '"' * 80
     header = f'printf \'\\n{separator}\\n%s\\n{separator}\\n\' {shlex.quote(cmd)} >> {CMD_LOG}'
-    wrapped = f'touch {BUSY_FLAG}; {header}; eval {shlex.quote(cmd)} 2>&1 | tee -a {CMD_LOG}; echo ${{PIPESTATUS[0]}} > ~/.pi_last_exit; rm -f {BUSY_FLAG}'
+    wrapped = f'export PATH="$HOME/.local/bin:$PATH"; touch {BUSY_FLAG}; {header}; eval {shlex.quote(cmd)} 2>&1 | tee -a {CMD_LOG}; echo ${{PIPESTATUS[0]}} > ~/.pi_last_exit; rm -f {BUSY_FLAG}'
     tmux_send(state, wrapped)
 
 
