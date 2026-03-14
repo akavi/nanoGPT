@@ -542,7 +542,7 @@ def get_batch(split, batch_size):
 
     if _embedding == 'linear':
         # x: [B, T, patch_dim] float, y: [B, T, patch_dim] int
-        bos = torch.zeros(B, 1, patch_dim, dtype=torch.float32, device=patches.device)
+        bos = torch.full((B, 1, patch_dim), 0.5, dtype=torch.float32, device=patches.device)
         x = torch.cat([bos, patches[:, :block_size - 1].float() / 255.0], dim=1)
         y = patches[:, :block_size].contiguous().long()
     else:

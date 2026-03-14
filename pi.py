@@ -134,10 +134,7 @@ def require_pod_or_start():
 
 def require_pod_ready():
     """Require an active pod that has finished provisioning."""
-    state = load_state()
-    if not state.get("pod_id"):
-        print("Error: No active pod. Run `pi up` first.")
-        sys.exit(1)
+    state = require_pod_or_start()
     if state.get("provision_error"):
         print(f"Error: Pod provisioning failed: {state['provision_error']}")
         sys.exit(1)
@@ -250,16 +247,13 @@ def sync_run(state, run_id):
         print(f"Warning: rsync failed with code {result.returncode}")
 
 
-def upload_run(state, run_id):
-    """Rsync outputs/$run_id/ from local to remote (inverse of sync_run)."""
+def _rsync_to_remote(state, local_path, remote_subdir):
+    """Rsync a local directory to remote ~/nanoGPT/<remote_subdir>/."""
     user = state.get("ssh_user", "root")
     ip = state["ip"]
     port = state.get("port", 22)
-    local_path = f"outputs/{run_id}/"
-    remote_path = f"{user}@{ip}:~/nanoGPT/outputs/{run_id}/"
-    if not os.path.exists(local_path):
-        return False
-    remote_exec(state, f"mkdir -p ~/nanoGPT/outputs/{run_id}")
+    remote_path = f"{user}@{ip}:~/nanoGPT/{remote_subdir}/"
+    remote_exec(state, f"mkdir -p ~/nanoGPT/{remote_subdir}")
     cmd = [
         "rsync", "-avz",
         "-e", f"ssh -i {SSH_KEY} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
@@ -267,6 +261,14 @@ def upload_run(state, run_id):
     ]
     result = subprocess.run(cmd, check=False)
     return result.returncode == 0
+
+
+def upload_run(state, run_id):
+    """Rsync outputs/$run_id/ from local to remote (inverse of sync_run)."""
+    local_path = f"outputs/{run_id}/"
+    if not os.path.exists(local_path):
+        return False
+    return _rsync_to_remote(state, local_path, f"outputs/{run_id}")
 
 
 def sync_cmd_log(state):
@@ -439,8 +441,19 @@ def _daemon(pod_id, skip_provision=False):
                                     else:
                                         _log(f"Warning: no checkpoint on remote or locally for run {run_id}")
 
-                            _execute_command(s, cmd_entry)
-                            cmd_entry["status"] = "running"
+                            # Local commands (rsync from host) complete synchronously
+                            if cmd_entry["type"] == "push-data":
+                                dataset = cmd_entry["cmd"]
+                                local_path = f"data/{dataset}/"
+                                if _rsync_to_remote(s, local_path, f"data/{dataset}"):
+                                    _log(f"Pushed data/{dataset}/ to remote.")
+                                    cmd_entry["status"] = "completed"
+                                else:
+                                    _log(f"Failed to push data/{dataset}/.")
+                                    cmd_entry["status"] = "failed"
+                            else:
+                                _execute_command(s, cmd_entry)
+                                cmd_entry["status"] = "running"
                             idle_since = None
                             break
                     else:
@@ -738,8 +751,23 @@ def cmd_up(args):
     r.raise_for_status()
     data = r.json()
     items = data.get("items", [])
+    gpu_type = args.gpu_type
+    if not items and gpu_type == "H100_80GB":
+        fallback = "A100_80GB"
+        print(f"No {gpu_type} x{args.gpu_count} available right now.")
+        choice = input(f"Try {fallback} instead? [y/n] (default: y): ").strip().lower()
+        if choice not in ("n", "no"):
+            print(f"Checking {fallback} x{args.gpu_count} availability...")
+            r = requests.get(
+                f"{API_BASE}/availability/gpus",
+                headers=api_headers(),
+                params={"gpu_type": fallback, "gpu_count": args.gpu_count},
+            )
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            gpu_type = fallback
     if not items:
-        print(f"No {args.gpu_type} x{args.gpu_count} available right now.")
+        print(f"No {gpu_type} x{args.gpu_count} available right now.")
         sys.exit(1)
 
     items.sort(key=lambda x: x["prices"]["onDemand"])
@@ -767,7 +795,7 @@ def cmd_up(args):
     body = {
         "pod": {
             "cloudId": cloud_id,
-            "gpuType": args.gpu_type,
+            "gpuType": gpu_type,
             "socket": socket,
             "gpuCount": args.gpu_count,
             "name": pod_name,
@@ -1454,6 +1482,19 @@ def cmd_upload(args):
         sys.exit(1)
 
 
+def cmd_push_data(args):
+    dataset = args.dataset
+    local_path = f"data/{dataset}/"
+    if not os.path.exists(local_path):
+        print(f"Error: Local data directory not found: {local_path}")
+        sys.exit(1)
+    if not os.path.exists(os.path.join(local_path, "meta.pkl")):
+        print(f"Error: {local_path} has no meta.pkl — run the prepare script first.")
+        sys.exit(1)
+    require_pod_or_start()
+    _enqueue_command("push-data", dataset)
+
+
 def cmd_ssh(args):
     state = require_pod_ready()
     cmd = ssh_opts(state) + ["-t", f"tmux attach -t {TMUX_SESSION} || tmux new -s {TMUX_SESSION}"]
@@ -1521,6 +1562,9 @@ def main():
     p_sweep.add_argument("--sample", action="store_true", help="Also enqueue a sample command for each run")
     p_sweep.add_argument("overrides", nargs=argparse.REMAINDER, help="Overrides (comma-separated values are swept)")
 
+    p_push_data = sub.add_parser("push-data", help="Upload a prepared dataset to the remote pod")
+    p_push_data.add_argument("dataset", help="Dataset name (e.g. image_ffhq64)")
+
     p_pull = sub.add_parser("pull", help="Git fetch and reset to origin/master on the pod")
     p_pull.add_argument("-f", action="store_true", help="Flush queue and run immediately")
     sub.add_parser("zombify", help="Prevent auto-shutdown after runs")
@@ -1552,6 +1596,7 @@ def main():
         "upload": cmd_upload,
         "log": cmd_log,
         "sweep": cmd_sweep,
+        "push-data": cmd_push_data,
         "pull": cmd_pull,
         "zombify": cmd_zombify,
         "mortalize": cmd_mortalize,
