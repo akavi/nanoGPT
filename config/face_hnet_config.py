@@ -40,6 +40,7 @@ overridable = override(sys.argv, {
     "bias": False,
     "block_size": 0,            # 0 = auto from image dims / patch_size
     "batch_size": 128,
+    "gradient_accumulation_steps": 1,
     "patch_size": 1,            # 1 = pixel-level, 4 = 4x4 patches
     "embedding": "linear",      # "linear" (nn.Linear patch projection) or "categorical" (nn.Embedding lookup)
     "max_iters": 3000,
@@ -582,7 +583,7 @@ train_config = TrainConfig(
     min_lr=overridable['min_lr'],
 
     grad_clip=1.0,
-    gradient_accumulation_steps=1,
+    gradient_accumulation_steps=overridable['gradient_accumulation_steps'],
     batch_size=overridable['batch_size'],
 
     eval_only=False,
