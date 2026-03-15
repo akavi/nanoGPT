@@ -56,7 +56,7 @@ overridable = override(sys.argv, {
     "routing": "cosine_sim",       # "cosine_sim", "linear_sigmoid", "mlp_sigmoid", "mlp_pairwise", "fixed_stride"
     "detokenizer": "ema",          # "ema" or "cross_attention"
     "detok_norm": False,           # RMSNorm both paths before detokenizer residual add
-    "pos_emb": "rope_2d",          # "learned", "rope_1d", or "rope_2d"
+    "pos_emb": "rope_2d",          # "learned", "learned_nd", "rope_1d", or "rope_2d"
 })
 
 # -----------------------------------------------------------------------------#
@@ -176,7 +176,7 @@ if raster == "hilbert":
 
 # Build pos_coords for rope_2d: map each sequence position to (x, y) on the grid
 pos_coords = None
-if overridable['pos_emb'] == 'rope_2d':
+if overridable['pos_emb'] in ('rope_2d', 'learned_nd'):
     if raster == 'hilbert':
         coords_list = [_hilbert_d2xy(max(GRID_H, GRID_W), d) for d in range(GRID_H * GRID_W)]
     else:
@@ -442,7 +442,14 @@ def make_hnet(
 
     backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn, detok_norm)
 
-    wpe = nn.Embedding(block_size, d_model) if pos_emb == 'learned' else None
+    if pos_emb == 'learned':
+        wpe = nn.Embedding(block_size, d_model)
+    elif pos_emb == 'learned_nd':
+        from models.lm import LearnedNdEmbedding
+        assert pos_coords is not None, "pos_coords required for learned_nd"
+        wpe = LearnedNdEmbedding(pos_coords, d_model)
+    else:
+        wpe = None
 
     if embedding == 'linear':
         embeddings = nn.Linear(patch_dim, d_model, bias=False)

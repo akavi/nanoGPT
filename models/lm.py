@@ -16,6 +16,27 @@ from torch import Tensor
 A = TypeVar('A')
 
 
+class LearnedNdEmbedding(nn.Module):
+    """Factored learned positional embedding over N coordinate axes.
+
+    Each sequence position maps to an N-dim coordinate via a lookup table,
+    and the final embedding is the sum of per-axis learned embeddings.
+    """
+
+    def __init__(self, coords: Tensor, d_model: int):
+        super().__init__()
+        self.register_buffer('coords', coords)
+        max_per_dim = coords.max(dim=0).values + 1
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(int(max_per_dim[i]), d_model)
+            for i in range(coords.shape[1])
+        ])
+
+    def forward(self, positions: Tensor) -> Tensor:
+        c = self.coords[positions]  # (T, N)
+        return sum(emb(c[:, i]) for i, emb in enumerate(self.embeddings))
+
+
 class PatchLM(nn.Module, Generic[A]):
     """LM wrapper with linear patch embedding.
 
@@ -28,7 +49,7 @@ class PatchLM(nn.Module, Generic[A]):
         backbone: nn.Module,
         embeddings: nn.Linear,
         lm_head: nn.Linear,
-        wpe: nn.Embedding | None = None,
+        wpe: nn.Module | None = None,
         patch_dim: int = 1,
         vocab_size: int = 256,
     ):
@@ -116,7 +137,7 @@ class CategoricalLM(nn.Module, Generic[A]):
         backbone: nn.Module,
         embeddings: nn.Embedding,
         lm_head: nn.Linear,
-        wpe: nn.Embedding | None = None,
+        wpe: nn.Module | None = None,
     ):
         super().__init__()
         self.backbone = backbone
