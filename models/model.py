@@ -79,19 +79,33 @@ def apply_rope_1d(q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tens
     return _apply_rope(q, freqs), _apply_rope(k, freqs)
 
 
-def apply_rope_2d(q: Tensor, k: Tensor, positions: Tensor, coords: Tensor) -> tuple[Tensor, Tensor]:
-    """2D RoPE using (x,y) coordinate lookup. coords: (block_size, 2) int tensor.
-    positions: (T,) int indices into coords. Splits head_dim in half for x and y."""
-    head_dim = q.shape[3]
-    half = head_dim // 2
-    max_coord = int(coords.max().item()) + 1
-    freqs_x = _rope_freqs(half, max_coord, q.device)
-    freqs_y = _rope_freqs(half, max_coord, q.device)
+def apply_rope_nd(q: Tensor, k: Tensor, positions: Tensor, coords: Tensor) -> tuple[Tensor, Tensor]:
+    """N-dimensional RoPE using coordinate lookup. coords: (block_size, N) int tensor.
+    positions: (T,) int indices into coords.
+    For N>=3, first N-1 dims (spatial) share pairs equally; last dim (channel) gets the
+    minimum nonzero pairs needed to make that work. For N<=2, pairs split equally."""
+    half = q.shape[3] // 2  # number of complex pairs
+    n_dims = coords.shape[1]
 
-    pos_coords = coords[positions]  # (T, 2)
-    fx = freqs_x[pos_coords[:, 0]].unsqueeze(0).unsqueeze(0)  # (1, 1, T, half//2)
-    fy = freqs_y[pos_coords[:, 1]].unsqueeze(0).unsqueeze(0)
-    freqs = torch.cat([fx, fy], dim=-1)  # (1, 1, T, head_dim//2)
+    # Compute per-dim pair counts
+    if n_dims >= 3:
+        n_spatial = n_dims - 1
+        # Minimum nonzero channel_pairs such that (half - channel_pairs) divides evenly by n_spatial
+        channel_pairs = half % n_spatial or n_spatial
+        spatial_pairs = (half - channel_pairs) // n_spatial
+        pairs = [spatial_pairs] * n_spatial + [channel_pairs]
+    else:
+        base = half // n_dims
+        pairs = [base] * n_dims
+        pairs[-1] += half - base * n_dims  # remainder to last
+
+    pos_coords = coords[positions]  # (T, N)
+    parts = []
+    for d in range(n_dims):
+        max_coord = int(pos_coords[:, d].max().item()) + 1
+        freqs = _rope_freqs(pairs[d] * 2, max_coord, q.device)  # (max_coord, pairs[d])
+        parts.append(freqs[pos_coords[:, d]].unsqueeze(0).unsqueeze(0))  # (1, 1, T, pairs[d])
+    freqs = torch.cat(parts, dim=-1)  # (1, 1, T, half)
 
     return _apply_rope(q, freqs), _apply_rope(k, freqs)
 

@@ -181,8 +181,15 @@ if overridable['pos_emb'] == 'rope_2d':
         coords_list = [_hilbert_d2xy(max(GRID_H, GRID_W), d) for d in range(GRID_H * GRID_W)]
     else:
         coords_list = [(i % GRID_W, i // GRID_W) for i in range(GRID_H * GRID_W)]
-    # Pad position 0 (BOS) with (0, 0)
-    pos_coords = torch.tensor([(0, 0)] + coords_list, dtype=torch.long, device=overridable['device'])
+    # Each spatial position expands to `tokens_per_pos` sequence positions.
+    # For categorical embedding this is patch_dim (one per channel); otherwise 1.
+    tokens_per_pos = patch_dim if overridable['embedding'] == 'categorical' else 1
+    # Add a channel coordinate so RoPE can distinguish sub-position tokens.
+    coords_expanded = [(0, 0, 0)]  # BOS
+    for x, y in coords_list:
+        for c in range(tokens_per_pos):
+            coords_expanded.append((x, y, c))
+    pos_coords = torch.tensor(coords_expanded, dtype=torch.long, device=overridable['device'])
 
 
 # -----------------------------------------------------------------------------#
@@ -428,10 +435,10 @@ def make_hnet(
         from models.model import apply_rope_1d
         rope_fn = apply_rope_1d
     elif pos_emb == 'rope_2d':
-        from models.model import apply_rope_2d
+        from models.model import apply_rope_nd
         assert pos_coords is not None, "pos_coords required for rope_2d"
         coords = pos_coords
-        rope_fn = lambda q, k, positions: apply_rope_2d(q, k, positions, coords)
+        rope_fn = lambda q, k, positions: apply_rope_nd(q, k, positions, coords)
 
     backbone, d_model = _build(parsed, block_size, n_head, bias, dropout, rope_fn, routing, detokenizer, inner_lr_ratio, detach_residual, residual_drop_fn, ratio_override_fn, detok_norm)
 
@@ -608,7 +615,7 @@ if mode == "resume" or mode == "from_scratch":
 else:
     def init_gen(device):
         if _embedding == 'linear':
-            return torch.zeros((1, 1, patch_dim), dtype=torch.float32, device=device)
+            return torch.full((1, 1, patch_dim), 0.5, dtype=torch.float32, device=device)
         else:
             return torch.zeros((1, 1), dtype=torch.long, device=device)
 
